@@ -1,0 +1,56 @@
+d usr 0755 root sys
+d usr/bin 0755 root sys
+f usr/bin/pcsc-spy 0755 root sys
+d usr/bin/amd64 0755 root sys
+f usr/bin/amd64/pcsc-spy 0755 root sys
+d usr/include 0755 root sys
+d usr/include/libusb-1.0 0755 root sys
+f usr/include/libusb-1.0/libusb.h 0644 root sys
+d usr/include/PCSC 0755 root sys
+f usr/include/PCSC/debuglog.h 0644 root sys
+f usr/include/PCSC/ifdhandler.h 0644 root sys
+f usr/include/PCSC/pcsclite.h 0644 root sys
+f usr/include/PCSC/reader.h 0644 root sys
+f usr/include/PCSC/winscard.h 0644 root sys
+f usr/include/PCSC/wintypes.h 0644 root sys
+d usr/sbin 0755 root sys
+d usr/sbin/amd64 0755 root sys
+f usr/sbin/amd64/pcscd 0755 root sys
+f usr/sbin/pcscd 0755 root sys
+f usr/sbin/yktool 0755 root sys
+f usr/sbin/yubihmac-bench 0755 root sys
+f usr/sbin/amd64/softtokend 0755 root sys
+d usr/lib 0755 root sys
+f usr/lib/libusb-1.0.so.0.1.0 0755 root sys
+s usr/lib/libusb-1.0.so.0=libusb-1.0.so.0.1.0
+s usr/lib/libusb-1.0.so=libusb-1.0.so.0.1.0
+f usr/lib/libpcsclite.so.1.0.0 0755 root sys
+s usr/lib/libpcsclite.so.1.0=libpcsclite.so.1.0.0
+s usr/lib/libpcsclite.so.1=libpcsclite.so.1.0.0
+s usr/lib/libpcsclite.so=libpcsclite.so.1.0.0
+d usr/lib/pcsc 0755 root sys
+d usr/lib/pcsc/drivers 0755 root sys
+d usr/lib/amd64 0755 root sys
+f usr/lib/amd64/libusb-1.0.so.0.1.0 0755 root sys
+s usr/lib/amd64/libusb-1.0.so.0=libusb-1.0.so.0.1.0
+s usr/lib/amd64/libusb-1.0.so=libusb-1.0.so.0.1.0
+f usr/lib/amd64/libpcsclite.so.1.0.0 0755 root sys
+s usr/lib/amd64/libpcsclite.so.1.0=libpcsclite.so.1.0.0
+s usr/lib/amd64/libpcsclite.so.1=libpcsclite.so.1.0.0
+s usr/lib/amd64/libpcsclite.so=libpcsclite.so.1.0.0
+d usr/lib/amd64/pcsc 0755 root sys
+d usr/lib/amd64/pcsc/drivers 0755 root sys
+d usr/lib/amd64/pcsc/drivers/ifd-ccid.bundle 0755 root sys
+d usr/lib/amd64/pcsc/drivers/ifd-ccid.bundle/Contents 0755 root sys
+f usr/lib/amd64/pcsc/drivers/ifd-ccid.bundle/Contents/Info.plist 0644 root sys
+d usr/lib/amd64/pcsc/drivers/ifd-ccid.bundle/Contents/Solaris 0755 root sys
+f usr/lib/amd64/pcsc/drivers/ifd-ccid.bundle/Contents/Solaris/libccid.so 0755 root sys
+d lib 0755 root bin
+d lib/svc 0755 root bin
+d lib/svc/manifest 0755 root sys
+d lib/svc/manifest/system 0755 root sys
+f lib/svc/manifest/system/pcscd.xml 0644 root sys
+d lib/svc/manifest/system/filesystem 0755 root sys
+f lib/svc/manifest/system/filesystem/unlock-rfd77-zfs.xml 0644 root sys
+d lib/svc/method 0755 root sys
+f lib/svc/method/unlock-rfd77-zfs 0755 root sys

@@ -1,0 +1,37 @@
+#!/bin/bash
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+
+#
+# Copyright (c) 2017, Joyent, Inc.
+#
+
+set -ex
+set -o pipefail
+
+. /lib/svc/share/smf_include.sh
+
+smf_is_globalzone || exit $SMF_EXIT_OK
+
+zfs list -p -H -o name,encryptionroot,rfd77:challenge,rfd77:slot,rfd77:serial | \
+    while read name encroot chal slot serial; do
+	if [[ "${name}" == "${encroot}" && "${chal}" != "-" ]]; then
+		if [[ "${slot}" == "-" ]]; then
+			slot="1"
+		fi
+		ykopts=""
+		if [[ "${serial}" != "-" ]]; then
+			ykopts="${ykargs} -s ${serial}"
+		fi
+		echo "$chal" | \
+		    openssl enc -base64 -d | \
+		    yktool ${ykopts} hmac ${slot} | \
+		    openssl dgst -sha256 -binary | \
+		    zfs load-key "${name}"
+	fi
+done
+
+exit $SMF_EXIT_OK
