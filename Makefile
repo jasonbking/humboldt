@@ -59,30 +59,27 @@ yubihmac-bench :	CFLAGS+=	$(YBENCH_CFLAGS)
 yubihmac-bench :	LIBS+=		$(YBENCH_LIBS)
 yubihmac-bench :	LDFLAGS+=	$(YBENCH_LDFLAGS)
 yubihmac-bench :	HEADERS=	$(YBENCH_HEADERS)
-yubihmac-bench :	DEPS=		$(YBENCH_DEPS:%=deps/%/.ac.install.stamp)
 
-yubihmac-bench: $(YBENCH_OBJS) $(DEPS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+yubihmac-bench: $(YBENCH_OBJS) $(YBENCH_DEPS:%=deps/%/.ac.install.stamp)
+	$(CC) $(LDFLAGS) -o $@ $(YBENCH_OBJS) $(LIBS)
 	$(ALTCTFCONVERT) $@
 
 yktool :		CFLAGS+=	$(YKTOOL_CFLAGS)
 yktool :		LIBS+=		$(YKTOOL_LIBS)
 yktool :		LDFLAGS+=	$(YKTOOL_LDFLAGS)
 yktool :		HEADERS=	$(YKTOOL_HEADERS)
-yktool :		DEPS=		$(YKTOOL_DEPS:%=deps/%/.ac.install.stamp)
 
-yktool: $(YKTOOL_OBJS) $(DEPS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+yktool: $(YKTOOL_OBJS) $(YKTOOL_DEPS:%=deps/%/.ac.install.stamp)
+	$(CC) $(LDFLAGS) -o $@ $(YKTOOL_OBJS) $(LIBS)
 	$(ALTCTFCONVERT) $@
 
 softtokend :		CFLAGS+=	$(TOKEN_CFLAGS)
 softtokend :		LIBS+=		$(TOKEN_LIBS)
 softtokend :		LDFLAGS+=	$(TOKEN_LDFLAGS)
 softtokend :		HEADERS=	$(TOKEN_HEADERS)
-softtokend :		DEPS=		$(TOKEN_DEPS:%=deps/%/.ac.install.stamp)
 
-softtokend: $(TOKEN_OBJS) $(DEPS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+softtokend: $(TOKEN_OBJS) $(TOKEN_DEPS:%=deps/%/.ac.install.stamp)
+	$(CC) $(LDFLAGS) -o $@ $(TOKEN_OBJS) $(LIBS)
 	$(ALTCTFCONVERT) $@
 
 %.o: %.c $(HEADERS)
