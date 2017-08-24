@@ -14,13 +14,19 @@
 #include <wintypes.h>
 #include <winscard.h>
 #include <string.h>
-#include <strings.h>
 #include <assert.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <sys/types.h>
 #include <errno.h>
 #include <sys/errno.h>
+#include <strings.h>
+
+#if !defined(__sun)
+typedef enum { B_FALSE = 0, B_TRUE = 1 } boolean_t;
+typedef unsigned int uint;
+#endif
 
 static boolean_t debug = B_FALSE;
 static boolean_t hex_out = B_FALSE;
@@ -76,7 +82,8 @@ const uint16_t CONFIG2_TOUCH = 0x08;
 
 enum iso_sw {
 	SW_NO_ERROR = 0x9000,
-	SW_CONDITIONS_NOT_SATISFIED = 0x6985
+	SW_CONDITIONS_NOT_SATISFIED = 0x6985,
+	SW_SECURITY_STATUS_NOT_SATISFIED = 0x6982
 };
 
 const uint8_t AID_YUBIOTP[] = {
@@ -112,6 +119,89 @@ struct yubikey {
 	boolean_t yk_intxn;
 	uint32_t yk_serial;
 };
+
+enum tkt_flag {
+	TKTFLAG_OATH_HOTP = 0x40,
+	TKTFLAG_CHAL_RESP = 0x40
+};
+
+enum cfg_flag {
+	CFGFLAG_CHAL_HMAC = 0x22,
+	CFGFLAG_HMAC_LT64 = 0x04,
+	CFGFLAG_CHAL_BTN_TRIG = 0x08
+};
+
+enum ext_flag {
+	EXTFLAG_SERIAL_USB_VISIBLE = 0x02,
+	EXTFLAG_SERIAL_API_VISIBLE = 0x04,
+	EXTFLAG_ALLOW_UPDATE = 0x20
+};
+
+struct slot_config {
+	uint8_t sc_fixed[16];
+	uint8_t sc_uid[6];
+	uint8_t sc_key[16];
+	uint8_t sc_nacc_code[6];
+	uint8_t sc_fixed_size;
+	uint8_t sc_ext_flags;
+	uint8_t sc_tkt_flags;
+	uint8_t sc_cfg_flags;
+	uint8_t sc_pad[2];
+	uint8_t sc_crc[2];
+	uint8_t sc_acc_code[6];
+};
+
+static uint16_t
+yubikey_crc16(const uint8_t *buf, int buf_size)
+{
+	uint16_t m_crc = 0xffff;
+
+	while (buf_size--) {
+		int i, j;
+		m_crc ^= (uint8_t) * buf++ & 0xFF;
+		for (i = 0; i < 8; i++) {
+			j = m_crc & 1;
+			m_crc >>= 1;
+			if (j)
+				m_crc ^= 0x8408;
+		}
+	}
+
+	return (m_crc);
+}
+
+static struct slot_config *
+make_hmac_config(const uint8_t *hmacKey, int len)
+{
+	struct slot_config *c = calloc(sizeof (struct slot_config), 1);
+	int j;
+	assert(len == 20);
+
+	j = 0;
+	bcopy(hmacKey, c->sc_key, sizeof (c->sc_key));
+	j += sizeof (c->sc_key);
+	len -= sizeof (c->sc_key);
+	assert(len <= sizeof (c->sc_uid));
+	bcopy(hmacKey + j, c->sc_uid, len);
+
+	c->sc_cfg_flags = CFGFLAG_CHAL_HMAC | CFGFLAG_HMAC_LT64;
+	c->sc_tkt_flags = TKTFLAG_CHAL_RESP;
+	c->sc_ext_flags = EXTFLAG_SERIAL_API_VISIBLE |
+	    EXTFLAG_SERIAL_USB_VISIBLE | EXTFLAG_ALLOW_UPDATE;
+
+	return (c);
+}
+
+static void
+set_config_crc(struct slot_config *c)
+{
+	uint16_t crc;
+
+	crc = yubikey_crc16((const uint8_t *)c,
+	    offsetof(struct slot_config, sc_crc));
+	c->sc_crc[0] = (crc & 0xff00) >> 8;
+	c->sc_crc[1] = crc & 0xff;
+}
 
 static void
 dump_hex(FILE *stream, const uint8_t *buf, int len)
@@ -431,7 +521,9 @@ parse_hex(const char *str, uint *outlen)
 {
 	const int len = strlen(str);
 	uint8_t *data = calloc(len / 2 + 1, 1);
-	int i, idx = 0, shift = 4;
+	int idx = 0;
+	int shift = 4;
+	int i;
 	for (i = 0; i < len; ++i) {
 		const char c = str[i];
 		boolean_t skip = B_FALSE;
@@ -481,7 +573,7 @@ read_stdin(uint limit, uint *outlen)
 
 	if (hex_in == B_TRUE) {
 		uint len;
-		uint8_t *pbuf = parse_hex(buf, &len);
+		uint8_t *pbuf = parse_hex((char *)buf, &len);
 		free(buf);
 		n = len;
 		buf = pbuf;
@@ -591,7 +683,6 @@ static void
 cmd_otp(SCARDCONTEXT ctx, int slot)
 {
 	struct apdu *apdu;
-	enum yk_cmd cmd;
 	int rv;
 
 	apdu = make_apdu(CLA_ISO, INS_OTP, slot - 1, 0);
@@ -631,23 +722,122 @@ cmd_otp(SCARDCONTEXT ctx, int slot)
 	}
 }
 
+static void
+cmd_program_hmac(SCARDCONTEXT ctx, int slot)
+{
+	struct apdu *apdu;
+	struct slot_config *conf;
+	enum yk_cmd cmd = CMD_SET_CONF_1;
+	uint8_t *key;
+	int rv;
+	uint len;
+
+	if (slot == 2)
+		cmd = CMD_SET_CONF_2;
+
+	key = read_stdin(20, &len);
+	conf = make_hmac_config(key, len);
+
+	if (acc_code != NULL) {
+		bcopy(acc_code, conf->sc_acc_code, sizeof (conf->sc_acc_code));
+		if (new_acc_code == NULL) {
+			bcopy(acc_code, conf->sc_nacc_code,
+			    sizeof (conf->sc_nacc_code));
+		}
+	}
+	if (new_acc_code != NULL) {
+		bcopy(new_acc_code, conf->sc_nacc_code,
+		    sizeof (conf->sc_nacc_code));
+	}
+	set_config_crc(conf);
+
+	apdu = make_apdu(CLA_ISO, INS_API_REQ, cmd, 0);
+	apdu->a_data = (uint8_t *)conf;
+	apdu->a_datalen = sizeof (struct slot_config);
+
+	yubikey_begin_txn(selyk);
+	rv = yubikey_select(selyk);
+	if (rv != 0) {
+		fprintf(stderr, "yubikey_select(%s) failed: %d\n",
+		    selyk->yk_rdrname, rv);
+		free_apdu(apdu);
+		exit(1);
+	}
+	rv = transceive_apdu(selyk, apdu);
+	if (rv != 0) {
+		fprintf(stderr, "transceive_apdu(%s) failed: %d\n",
+		    selyk->yk_rdrname, rv);
+		free_apdu(apdu);
+		exit(1);
+	}
+	yubikey_end_txn(selyk);
+
+	if (apdu->a_sw == SW_NO_ERROR) {
+		const uint8_t *reply = apdu->a_reply;
+		uint16_t mask = 0;
+
+		assert(selyk->yk_version[0] == reply[0]);
+		assert(selyk->yk_version[1] == reply[1]);
+		assert(selyk->yk_version[2] == reply[2]);
+
+		selyk->yk_touchlvl = reply[4] | (reply[5] << 8);
+
+		if (slot == 1)
+			mask = (selyk->yk_touchlvl & CONFIG1_VALID);
+		else if (slot == 2)
+			mask = (selyk->yk_touchlvl & CONFIG2_VALID);
+
+		const uint8_t pgmSeq = reply[3];
+
+		if (pgmSeq <= selyk->yk_pgmseq || mask == 0) {
+			fprintf(stderr, "error: Yubikey failed to write "
+			    "configuration in slot %d\n", slot);
+			exit(1);
+		}
+		selyk->yk_pgmseq = pgmSeq;
+
+		fprintf(stderr, "Programmed slot %d ok\n", slot);
+
+		free_apdu(apdu);
+	} else if (apdu->a_sw == SW_SECURITY_STATUS_NOT_SATISFIED) {
+		fprintf(stderr, "error: Yubikey slot %d is locked with an "
+		    "access code, please provide one with -c\n", slot);
+		exit(1);
+	} else {
+		fprintf(stderr, "error: Yubikey returned error while writing "
+		    "new configuration to slot %d: %04x\n", slot, apdu->a_sw);
+		exit(1);
+	}
+}
+
+static void
+cmd_program_otp(SCARDCONTEXT ctx, int slot)
+{
+	fprintf(stderr, "error: program otp not yet implemented\n");
+	exit(1);
+}
+
 void
 usage(void)
 {
 	fprintf(stderr,
 	    "usage: yktool [options] <operation>\n"
 	    "Available operations:\n"
-	    "  list               Lists Yubikeys present\n"
-	    "  hmac <slot #>      Computes an HMAC over data on stdin\n"
-	    "  otp <slot #>       Gets a one-time password\n"
+	    "  list                   Lists Yubikeys present\n"
+	    "  hmac <slot #>          Computes an HMAC over data on stdin\n"
+	    "  otp <slot #>           Gets a one-time password\n"
+	    "  program hmac <slot #>  Programs a slot for HMAC use\n"
+	    "                         (key on stdin)\n"
 	    "\n"
 	    "Options:\n"
-	    "  --hex-out|-x       Outputs on stdout are in hex\n"
-	    "  --hex-in|-X        Inputs on stdin are in hex\n"
-	    "  --serial|-s <#>    Select a specific Yubikey by serial #\n"
-	    "  --debug|-d         Spit out lots of debug info to stderr\n"
-	    "                     (incl. APDU trace)\n"
-	    "  --parseable|-p     Generate parseable output from 'list'\n");
+	    "  --hex-out|-x           Outputs on stdout are in hex\n"
+	    "  --hex-in|-X            Inputs on stdin are in hex\n"
+	    "  --serial|-s <#>        Select a specific Yubikey by serial #\n"
+	    "  --debug|-d             Spit out lots of debug info to stderr\n"
+	    "                         (incl. APDU trace)\n"
+	    "  --parseable|-p         Generate parseable output from 'list'\n"
+	    "  --acc-code|-c <..>     Provide access code for programming\n"
+	    "  --set-acc-code|-C <..> Set the slot access code\n");
 	exit(3);
 }
 
@@ -767,6 +957,36 @@ main(int argc, char *argv[])
 			exit(3);
 		}
 		cmd_otp(ctx, slot);
+
+	} else if (strcmp(op, "program") == 0) {
+		const char *mode;
+		int slot;
+
+		if (optind >= argc)
+			usage();
+		mode = argv[optind++];
+
+		if (optind >= argc)
+			usage();
+		slot = strtol(argv[optind++], NULL, 10);
+
+		if (optind < argc)
+			usage();
+
+		if (slot != 1 && slot != 2) {
+			fprintf(stderr, "error: invalid slot # (%d)\n", slot);
+			exit(3);
+		}
+
+		if (strcmp(mode, "hmac") == 0) {
+			cmd_program_hmac(ctx, slot);
+
+		} else if (strcmp(mode, "otp") == 0) {
+			cmd_program_otp(ctx, slot);
+
+		} else {
+			usage();
+		}
 
 	} else {
 		usage();
