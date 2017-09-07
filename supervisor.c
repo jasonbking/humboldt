@@ -85,7 +85,7 @@ make_slots(const char *zonename)
 }
 
 void
-supervisor_main(zoneid_t zid)
+supervisor_main(zoneid_t zid, int ctlfd)
 {
 	char zonename[ZONENAME_MAX];
 	char sockdir[PATH_MAX];

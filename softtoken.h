@@ -36,6 +36,6 @@ struct token_slot {
 
 extern struct token_slot *token_slots;
 
-void supervisor_main(zoneid_t zid);
+void supervisor_main(zoneid_t zid, int ctlfd);
 
 #endif

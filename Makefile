@@ -52,7 +52,8 @@ TOKEN_DEPS=		pcsclite64 libressl
 
 TOKEN_CFLAGS=		$(CFLAGS64) -I$(PROTO_AREA)/usr/include/PCSC -I$(OPENSSH_SOURCE)
 TOKEN_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64
-TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket -lpcsclite
+TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket -lpcsclite \
+			deps/libressl/crypto/.libs/libcrypto.a
 
 
 yubihmac-bench :	CFLAGS+=	$(YBENCH_CFLAGS)

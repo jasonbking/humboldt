@@ -61,7 +61,7 @@ start_supervisor(struct zone_state *forzone)
 	}
 	assert(fdwalk(fdwalk_assert_fd, forzone) == 0);
 
-	supervisor_main(forzone->zs_id);
+	supervisor_main(forzone->zs_id, forzone->zs_pipe[0]);
 	bunyan_log(ERROR, "supervisor_main returned!", NULL);
 	exit(1);
 }
@@ -162,6 +162,7 @@ main(int argc, char *argv[])
 	const char *channel = "com.sun:zones:status";
 	char subid[128];
 
+	bunyan_init();
 	bunyan_set_name("softtoken_mgr");
 	bunyan_log(INFO, "starting up", NULL);
 

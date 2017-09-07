@@ -29,7 +29,18 @@
 
 static const char *bunyan_name = NULL;
 static char *bunyan_hostname = NULL;
-static mutex_t bunyan_mutex;
+static mutex_t *bunyan_mutex = NULL;
+static void *bunyan_shmem = NULL;
+
+void
+bunyan_init(void)
+{
+	bunyan_shmem = mmap(0, sizeof (mutex_t), PROT_READ | PROT_WRITE,
+	    MAP_SHARED | MAP_ANON, -1, 0);
+	assert(bunyan_shmem != NULL);
+	bunyan_mutex = (mutex_t *)bunyan_shmem;
+	assert(mutex_init(bunyan_mutex, USYNC_PROCESS, NULL) == 0);
+}
 
 void
 bunyan_set_name(const char *name)
@@ -115,9 +126,9 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 	}
 	va_end(ap);
 
-	mutex_lock(&bunyan_mutex);
+	assert(mutex_lock(bunyan_mutex) == 0);
 	nvlist_print_json(stderr, nvl);
 	fprintf(stderr, "\n");
-	mutex_unlock(&bunyan_mutex);
+	assert(mutex_unlock(bunyan_mutex) == 0);
 	nvlist_free(nvl);
 }

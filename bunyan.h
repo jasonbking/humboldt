@@ -25,6 +25,7 @@ enum bunyan_arg_type {
 	BNY_NVLIST
 };
 
+void bunyan_init(void);
 void bunyan_set_name(const char *name);
 void bunyan_log(enum bunyan_log_level level, const char *msg, ...);
 
