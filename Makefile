@@ -38,18 +38,41 @@ YKTOOL_LDFLAGS=		-L$(PROTO_AREA)/usr/lib
 
 YKTOOL_DEPS=		pcsclite
 
+ED25519_SOURCES=		\
+	ed25519.c		\
+	fe25519.c		\
+	ge25519.c		\
+	sc25519.c		\
+	hash.c			\
+	blocks.c
+CHAPOLY_SOURCES=		\
+	chacha.c		\
+	poly1305.c
+
+LIBSSH_SOURCES=			\
+	sshbuf.c		\
+	sshkey.c		\
+	ssh-ed25519.c		\
+	ssh-ecdsa.c		\
+	ssh-rsa.c		\
+	cipher.c		\
+	digest-openssl.c	\
+	bcrypt-pbkdf.c		\
+	blowfish.c		\
+	rsa.c			\
+	base64.c		\
+	$(ED25519_SOURCES)	\
+	$(CHAPOLY_SOURCES)
 
 TOKEN_SOURCES=			\
 	softtoken_mgr.c		\
 	supervisor.c		\
 	bunyan.c		\
 	agent.c			\
-	sshbuf.c
+	$(LIBSSH_SOURCES)
 TOKEN_HEADERS=			\
 	softtoken.h		\
-	bunyan.h		\
-	sshbuf.h		\
-	ssherr.h
+	bunyan.h
 
 TOKEN_OBJS=		$(TOKEN_SOURCES:%.c=%.o)
 
