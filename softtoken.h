@@ -25,10 +25,22 @@ enum slot_algo {
 	ALGO_AES_128
 };
 
+enum ctl_cmd_type {
+	CMD_UNLOCK_KEY = 0xa0,
+	CMD_LOCK_KEY,
+	CMD_SHUTDOWN
+};
+
+struct ctl_cmd {
+	uint8_t cc_type;
+	uint8_t cc_p1;
+	uint8_t cc_p2;
+};
+
 struct token_slot {
 	enum slot_type ts_type;
 	enum slot_algo ts_algo;
-	const char *ts_name;
+	char *ts_name;
 	struct token_slot *ts_next;
 	char *ts_data;
 	nvlist_t *ts_nvl;
@@ -37,5 +49,6 @@ struct token_slot {
 extern struct token_slot *token_slots;
 
 void supervisor_main(zoneid_t zid, int ctlfd);
+void agent_main(int listensock, int ctlfd);
 
 #endif

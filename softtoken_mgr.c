@@ -44,7 +44,7 @@ static int
 fdwalk_assert_fd(void *p, int fd)
 {
 	struct zone_state *zs = (struct zone_state *)p;
-	assert(fd <= 2 || fd == zs->zs_pipe[0] || fd == zs->zs_pipe[1]);
+	assert(fd <= 2 || fd == zs->zs_pipe[1]);
 	return (0);
 }
 
@@ -57,11 +57,10 @@ start_supervisor(struct zone_state *forzone)
 
 	for (zs = zonest; zs != NULL; zs = zs->zs_next) {
 		assert(close(zs->zs_pipe[0]) == 0);
-		assert(close(zs->zs_pipe[1]) == 0);
 	}
 	assert(fdwalk(fdwalk_assert_fd, forzone) == 0);
 
-	supervisor_main(forzone->zs_id, forzone->zs_pipe[0]);
+	supervisor_main(forzone->zs_id, forzone->zs_pipe[1]);
 	bunyan_log(ERROR, "supervisor_main returned!", NULL);
 	exit(1);
 }
@@ -77,10 +76,12 @@ add_zone_unlocked(zoneid_t id)
 	pid_t kid = fork();
 	assert(kid != -1);
 	if (kid == 0) {
+		assert(close(zs->zs_pipe[0]) == 0);
 		start_supervisor(zs);
 		return;
 	}
 	zs->zs_child = kid;
+	assert(close(zs->zs_pipe[1]) == 0);
 
 	zs->zs_next = zonest;
 	zonest = zs;

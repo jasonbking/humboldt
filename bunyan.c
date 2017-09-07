@@ -22,6 +22,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <netdb.h>
+#include <strings.h>
 
 #include <sys/mman.h>
 #include <libnvpair.h>
@@ -30,8 +31,10 @@
 
 static const char *bunyan_name = NULL;
 static char *bunyan_hostname = NULL;
-static mutex_t *bunyan_mutex = NULL;
+static mutex_t bunyan_bmutex;
+static mutex_t *bunyan_wrmutex = NULL;
 static void *bunyan_shmem = NULL;
+static nvlist_t *bunyan_base = NULL;
 
 void
 bunyan_init(void)
@@ -39,8 +42,12 @@ bunyan_init(void)
 	bunyan_shmem = mmap(0, sizeof (mutex_t), PROT_READ | PROT_WRITE,
 	    MAP_SHARED | MAP_ANON, -1, 0);
 	assert(bunyan_shmem != NULL);
-	bunyan_mutex = (mutex_t *)bunyan_shmem;
-	assert(mutex_init(bunyan_mutex, USYNC_PROCESS, NULL) == 0);
+	bzero(bunyan_shmem, sizeof (mutex_t));
+	bunyan_wrmutex = (mutex_t *)bunyan_shmem;
+	assert(mutex_init(bunyan_wrmutex, USYNC_PROCESS, NULL) == 0);
+	assert(mutex_init(&bunyan_bmutex, USYNC_THREAD, NULL) == 0);
+	assert(nvlist_alloc(&bunyan_base, NV_UNIQUE_NAME, 0) == 0);
+	assert(nvlist_add_int32(bunyan_base, "v", 1) == 0);
 }
 
 void
@@ -76,6 +83,50 @@ bunyan_timestamp(char *buffer, size_t len)
 }
 
 void
+bunyan_set(const char *name1, enum bunyan_arg_type typ1, ...)
+{
+	const char *propname = name1;
+	enum bunyan_arg_type typ = typ1;
+	nvlist_t * const nvl = bunyan_base;
+	va_list ap;
+
+	va_start(ap, typ1);
+	while (1) {
+		const char *strval;
+		int intval;
+		nvlist_t *nvlval;
+
+		switch (typ) {
+		case BNY_STRING:
+			strval = va_arg(ap, const char *);
+			assert(mutex_lock(&bunyan_bmutex) == 0);
+			assert(nvlist_add_string(nvl, propname, strval) == 0);
+			assert(mutex_unlock(&bunyan_bmutex) == 0);
+			break;
+		case BNY_INT:
+			intval = va_arg(ap, int);
+			assert(mutex_lock(&bunyan_bmutex) == 0);
+			assert(nvlist_add_int32(nvl, propname, intval) == 0);
+			assert(mutex_unlock(&bunyan_bmutex) == 0);
+			break;
+		case BNY_NVLIST:
+			nvlval = va_arg(ap, nvlist_t *);
+			assert(mutex_lock(&bunyan_bmutex) == 0);
+			assert(nvlist_add_nvlist(nvl, propname, nvlval) == 0);
+			assert(mutex_unlock(&bunyan_bmutex) == 0);
+			break;
+		}
+
+		propname = va_arg(ap, const char *);
+		if (propname == NULL)
+			break;
+
+		typ = va_arg(ap, enum bunyan_arg_type);
+	}
+	va_end(ap);
+}
+
+void
 bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 {
 	nvlist_t *nvl;
@@ -84,8 +135,9 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 	const char *propname;
 	enum bunyan_arg_type typ;
 
-	assert(nvlist_alloc(&nvl, NV_UNIQUE_NAME, 0) == 0);
-	assert(nvlist_add_int32(nvl, "v", 1) == 0);
+	assert(mutex_lock(&bunyan_bmutex) == 0);
+	assert(nvlist_dup(bunyan_base, &nvl, 0) == 0);
+	assert(mutex_unlock(&bunyan_bmutex) == 0);
 	assert(nvlist_add_int32(nvl, "level", level) == 0);
 	assert(nvlist_add_string(nvl, "name", bunyan_name) == 0);
 	if (bunyan_hostname == NULL)
@@ -127,9 +179,9 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 	}
 	va_end(ap);
 
-	assert(mutex_lock(bunyan_mutex) == 0);
+	assert(mutex_lock(bunyan_wrmutex) == 0);
 	nvlist_print_json(stderr, nvl);
 	fprintf(stderr, "\n");
-	assert(mutex_unlock(bunyan_mutex) == 0);
+	assert(mutex_unlock(bunyan_wrmutex) == 0);
 	nvlist_free(nvl);
 }
