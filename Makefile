@@ -3,6 +3,7 @@ EXTRA_SOURCE=	$(PWD)/../../illumos-extra
 OPENSSH_SOURCE=	$(shell echo $(EXTRA_SOURCE)/openssh/openssh*-32)
 PROTO_AREA=	$(PWD)/../../../proto
 STRAP_AREA=	$(PWD)/../../../proto.strap
+DEPS=		$(ROOT)/deps
 
 CC=		$(STRAP_AREA)/usr/bin/gcc
 LD=		/usr/bin/ld
@@ -41,19 +42,25 @@ YKTOOL_DEPS=		pcsclite
 TOKEN_SOURCES=			\
 	softtoken_mgr.c		\
 	supervisor.c		\
-	bunyan.c
+	bunyan.c		\
+	agent.c			\
+	sshbuf.c
 TOKEN_HEADERS=			\
 	softtoken.h		\
-	bunyan.h
+	bunyan.h		\
+	sshbuf.h		\
+	ssherr.h
 
 TOKEN_OBJS=		$(TOKEN_SOURCES:%.c=%.o)
 
 TOKEN_DEPS=		pcsclite64 libressl
 
-TOKEN_CFLAGS=		$(CFLAGS64) -I$(PROTO_AREA)/usr/include/PCSC -I$(OPENSSH_SOURCE)
+TOKEN_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
+			-I$(DEPS)/libressl/include/ \
+			-fstack-protector-all $(CFLAGS64)
 TOKEN_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64
-TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket -lpcsclite \
-			deps/libressl/crypto/.libs/libcrypto.a
+TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket -lpcsclite -lssp \
+			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
 
 yubihmac-bench :	CFLAGS+=	$(YBENCH_CFLAGS)
@@ -74,7 +81,7 @@ yktool: $(YKTOOL_OBJS) $(YKTOOL_DEPS:%=deps/%/.ac.install.stamp)
 	$(CC) $(LDFLAGS) -o $@ $(YKTOOL_OBJS) $(LIBS)
 	$(ALTCTFCONVERT) $@
 
-softtokend :		CFLAGS+=	$(TOKEN_CFLAGS)
+softtokend :		CFLAGS=		$(TOKEN_CFLAGS)
 softtokend :		LIBS+=		$(TOKEN_LIBS)
 softtokend :		LDFLAGS+=	$(TOKEN_LDFLAGS)
 softtokend :		HEADERS=	$(TOKEN_HEADERS)
