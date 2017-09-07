@@ -23,6 +23,7 @@
 #include <time.h>
 #include <netdb.h>
 
+#include <sys/mman.h>
 #include <libnvpair.h>
 
 #include "bunyan.h"
