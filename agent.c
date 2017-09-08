@@ -212,6 +212,7 @@ client_reactor(void *arg)
 	char *buf = calloc(1, 4096);
 	int buflen = 4096;
 	int rv;
+	assert(buf != NULL);
 
 	while (1) {
 		rv = port_get(clport, &ev, NULL);
@@ -232,7 +233,7 @@ client_reactor(void *arg)
 			    sshbuf_len(cl->cs_out));
 			if (len == -1 && (errno == EAGAIN ||
 			    errno == EWOULDBLOCK || errno == EINTR)) {
-			    	cl->cs_events |= POLLOUT;
+				cl->cs_events |= POLLOUT;
 				goto rearm;
 			}
 			if (len <= 0) {
