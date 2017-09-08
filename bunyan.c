@@ -44,8 +44,10 @@ bunyan_init(void)
 	assert(bunyan_shmem != NULL);
 	bzero(bunyan_shmem, sizeof (mutex_t));
 	bunyan_wrmutex = (mutex_t *)bunyan_shmem;
-	assert(mutex_init(bunyan_wrmutex, USYNC_PROCESS, NULL) == 0);
-	assert(mutex_init(&bunyan_bmutex, USYNC_THREAD, NULL) == 0);
+	assert(mutex_init(bunyan_wrmutex, USYNC_PROCESS | LOCK_ERRORCHECK,
+	    NULL) == 0);
+	assert(mutex_init(&bunyan_bmutex, USYNC_THREAD | LOCK_ERRORCHECK,
+	    NULL) == 0);
 	assert(nvlist_alloc(&bunyan_base, NV_UNIQUE_NAME, 0) == 0);
 	assert(nvlist_add_int32(bunyan_base, "v", 1) == 0);
 }
@@ -99,21 +101,21 @@ bunyan_set(const char *name1, enum bunyan_arg_type typ1, ...)
 		switch (typ) {
 		case BNY_STRING:
 			strval = va_arg(ap, const char *);
-			assert(mutex_lock(&bunyan_bmutex) == 0);
+			mutex_enter(&bunyan_bmutex);
 			assert(nvlist_add_string(nvl, propname, strval) == 0);
-			assert(mutex_unlock(&bunyan_bmutex) == 0);
+			mutex_exit(&bunyan_bmutex);
 			break;
 		case BNY_INT:
 			intval = va_arg(ap, int);
-			assert(mutex_lock(&bunyan_bmutex) == 0);
+			mutex_enter(&bunyan_bmutex);
 			assert(nvlist_add_int32(nvl, propname, intval) == 0);
-			assert(mutex_unlock(&bunyan_bmutex) == 0);
+			mutex_exit(&bunyan_bmutex);
 			break;
 		case BNY_NVLIST:
 			nvlval = va_arg(ap, nvlist_t *);
-			assert(mutex_lock(&bunyan_bmutex) == 0);
+			mutex_enter(&bunyan_bmutex);
 			assert(nvlist_add_nvlist(nvl, propname, nvlval) == 0);
-			assert(mutex_unlock(&bunyan_bmutex) == 0);
+			mutex_exit(&bunyan_bmutex);
 			break;
 		}
 
@@ -135,9 +137,9 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 	const char *propname;
 	enum bunyan_arg_type typ;
 
-	assert(mutex_lock(&bunyan_bmutex) == 0);
+	mutex_enter(&bunyan_bmutex);
 	assert(nvlist_dup(bunyan_base, &nvl, 0) == 0);
-	assert(mutex_unlock(&bunyan_bmutex) == 0);
+	mutex_exit(&bunyan_bmutex);
 	assert(nvlist_add_int32(nvl, "level", level) == 0);
 	assert(nvlist_add_string(nvl, "name", bunyan_name) == 0);
 	if (bunyan_hostname == NULL)
@@ -179,9 +181,9 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 	}
 	va_end(ap);
 
-	assert(mutex_lock(bunyan_wrmutex) == 0);
+	mutex_enter(bunyan_wrmutex);
 	nvlist_print_json(stderr, nvl);
 	fprintf(stderr, "\n");
-	assert(mutex_unlock(bunyan_wrmutex) == 0);
+	mutex_exit(bunyan_wrmutex);
 	nvlist_free(nvl);
 }

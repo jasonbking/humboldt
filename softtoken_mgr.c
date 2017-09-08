@@ -95,10 +95,10 @@ check_add_zone(zoneid_t id)
 	if (id == GLOBAL_ZONEID)
 		return;
 
-	mutex_lock(&zonest_mutex);
+	mutex_enter(&zonest_mutex);
 	for (zs = zonest; zs != NULL; zs = zs->zs_next) {
 		if (zs->zs_id == id) {
-			mutex_unlock(&zonest_mutex);
+			mutex_exit(&zonest_mutex);
 			return;
 		}
 	}
@@ -106,7 +106,7 @@ check_add_zone(zoneid_t id)
 	bunyan_log(DEBUG, "adding zone to index",
 	    "zoneid", BNY_INT, id, NULL);
 	add_zone_unlocked(id);
-	mutex_unlock(&zonest_mutex);
+	mutex_exit(&zonest_mutex);
 }
 
 static void
@@ -146,14 +146,14 @@ sigchld_handler(int signo)
 	struct zone_state *zsp = NULL, *zs;
 
 	while ((kid = waitpid((pid_t)0, &kid_status, WNOHANG)) > 0) {
-		mutex_lock(&zonest_mutex);
+		mutex_enter(&zonest_mutex);
 		for (zs = zonest; zs != NULL; zsp = zs, zs = zs->zs_next) {
 			if (zs->zs_child == kid) {
 				zsp->zs_next = zs->zs_next;
 				break;
 			}
 		}
-		mutex_unlock(&zonest_mutex);
+		mutex_exit(&zonest_mutex);
 	}
 }
 
@@ -166,6 +166,9 @@ main(int argc, char *argv[])
 	bunyan_init();
 	bunyan_set_name("softtoken_mgr");
 	bunyan_log(INFO, "starting up", NULL);
+
+	assert(mutex_init(&zonest_mutex,
+	    USYNC_THREAD | LOCK_ERRORCHECK, NULL) == 0);
 
 	(void) signal(SIGCHLD, sigchld_handler);
 

@@ -50,6 +50,6 @@ struct token_slot {
 extern struct token_slot *token_slots;
 
 void supervisor_main(zoneid_t zid, int ctlfd);
-void agent_main(int listensock, int ctlfd);
+void agent_main(zoneid_t zid, int listensock, int ctlfd);
 
 #endif

@@ -225,7 +225,7 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	if (kid == 0) {
 		assert(close(kidpipe[0]) == 0);
 		assert(close(ctlfd) == 0);
-		agent_main(listensock, kidpipe[1]);
+		agent_main(zid, listensock, kidpipe[1]);
 		bunyan_log(ERROR, "agent_main returned", NULL);
 		exit(1);
 	}
