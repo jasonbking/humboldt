@@ -26,15 +26,16 @@ enum slot_algo {
 };
 
 enum ctl_cmd_type {
-	CMD_UNLOCK_KEY = 0xa0,
+	CMD_STATUS = 0xa0,
+	CMD_UNLOCK_KEY,
 	CMD_LOCK_KEY,
 	CMD_SHUTDOWN
 };
 
 struct ctl_cmd {
+	uint8_t cc_cookie;
 	uint8_t cc_type;
 	uint8_t cc_p1;
-	uint8_t cc_p2;
 };
 
 struct token_slot {

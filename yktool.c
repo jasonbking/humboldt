@@ -173,7 +173,7 @@ yubikey_crc16(const uint8_t *buf, int buf_size)
 static struct slot_config *
 make_hmac_config(const uint8_t *hmacKey, int len)
 {
-	struct slot_config *c = calloc(sizeof (struct slot_config), 1);
+	struct slot_config *c = calloc(1, sizeof (struct slot_config));
 	int j;
 	assert(len == 20);
 
@@ -216,7 +216,7 @@ dump_hex(FILE *stream, const uint8_t *buf, int len)
 static uint8_t *
 apdu_to_buffer(struct apdu *apdu, uint *outlen)
 {
-	uint8_t *buf = calloc(5 + apdu->a_datalen, 1);
+	uint8_t *buf = calloc(1, 5 + apdu->a_datalen);
 	buf[0] = apdu->a_cls;
 	buf[1] = apdu->a_ins;
 	buf[2] = apdu->a_p1;
@@ -236,7 +236,7 @@ apdu_to_buffer(struct apdu *apdu, uint *outlen)
 static struct apdu *
 make_apdu(enum iso_class cls, enum iso_ins ins, uint8_t p1, uint8_t p2)
 {
-	struct apdu *a = calloc(sizeof (struct apdu), 1);
+	struct apdu *a = calloc(1, sizeof (struct apdu));
 	a->a_cls = cls;
 	a->a_ins = ins;
 	a->a_p1 = p1;
@@ -259,7 +259,7 @@ transceive_apdu(struct yubikey *ykey, struct apdu *apdu)
 	int rv;
 	DWORD recvLength;
 	assert(ykey->yk_intxn == B_TRUE);
-	uint8_t *recvBuffer = calloc(MAX_APDU_SIZE, 1);
+	uint8_t *recvBuffer = calloc(1, MAX_APDU_SIZE);
 	uint8_t *cmd = apdu_to_buffer(apdu, &cmdLen);
 	if (cmd == NULL || cmdLen < 5)
 		return (ENOMEM);
@@ -459,7 +459,7 @@ find_all_yubikeys(SCARDCONTEXT ctx)
 		    pcsc_stringify_error(rv));
 		exit(1);
 	}
-	readers = calloc(readersLen, 1);
+	readers = calloc(1, readersLen);
 	rv = SCardListReaders(ctx, NULL, readers, &readersLen);
 	if (rv != SCARD_S_SUCCESS) {
 		fprintf(stderr, "SCardListReaders failed: %s\n",
@@ -483,7 +483,7 @@ find_all_yubikeys(SCARDCONTEXT ctx)
 			continue;
 		}
 
-		ykey = calloc(sizeof (struct yubikey), 1);
+		ykey = calloc(1, sizeof (struct yubikey));
 		ykey->yk_cardhdl = card;
 		ykey->yk_rdrname = thisrdr;
 		ykey->yk_proto = activeProtocol;
@@ -520,7 +520,7 @@ static uint8_t *
 parse_hex(const char *str, uint *outlen)
 {
 	const int len = strlen(str);
-	uint8_t *data = calloc(len / 2 + 1, 1);
+	uint8_t *data = calloc(1, len / 2 + 1);
 	int idx = 0;
 	int shift = 4;
 	int i;
@@ -561,7 +561,7 @@ parse_hex(const char *str, uint *outlen)
 static uint8_t *
 read_stdin(uint limit, uint *outlen)
 {
-	uint8_t *buf = calloc(limit * 3, 1);
+	uint8_t *buf = calloc(1, limit * 3);
 	size_t n;
 
 	n = fread(buf, 1, limit * 3 - 1, stdin);

@@ -70,7 +70,7 @@ make_slots(const char *zonename)
 			assert(fseek(f, 0L, SEEK_SET) == 0);
 			assert(sz < 1*1024*1024);
 
-			buf = calloc(sz, 1);
+			buf = calloc(1, sz);
 			assert(buf != NULL);
 
 			assert(fread(buf, sz, 1, f) == 1);
@@ -90,8 +90,8 @@ make_slots(const char *zonename)
 			assert(shm != NULL);
 			bzero(shm, sz);
 
-			ts = calloc(sizeof (struct token_slot), 1);
-			ts->ts_name = calloc(strlen(dp->d_name), 1);
+			ts = calloc(1, sizeof (struct token_slot));
+			ts->ts_name = calloc(1, strlen(dp->d_name));
 			strcpy(ts->ts_name, dp->d_name);
 			ts->ts_nvl = nvl;
 			ts->ts_data = shm;
@@ -150,6 +150,8 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 				    "type", BNY_INT, cmdtype, NULL);
 				continue;
 			}
+			assert(port_associate(portfd,
+			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL) == 0);
 		} else if (ev.portev_object == kidfd) {
 			assert(fread(&cmd, sizeof (cmd), 1, kid) == 1);
 			cmdtype = cmd.cc_type;
@@ -164,6 +166,8 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 				    "type", BNY_INT, cmdtype, NULL);
 				continue;
 			}
+			assert(port_associate(portfd,
+			    PORT_SOURCE_FD, kidfd, POLLIN, NULL) == 0);
 		} else {
 			assert(0);
 		}

@@ -68,7 +68,7 @@ start_supervisor(struct zone_state *forzone)
 static void
 add_zone_unlocked(zoneid_t id)
 {
-	struct zone_state *zs = calloc(sizeof (struct zone_state), 1);
+	struct zone_state *zs = calloc(1, sizeof (struct zone_state));
 	assert(zs != NULL);
 	zs->zs_id = id;
 	assert(pipe(zs->zs_pipe) == 0);
@@ -112,7 +112,7 @@ check_add_zone(zoneid_t id)
 static void
 add_all_zones(void)
 {
-	zoneid_t *ids = calloc(sizeof (zoneid_t), MAX_ZONEID);
+	zoneid_t *ids = calloc(MAX_ZONEID, sizeof (zoneid_t));
 	assert(ids != NULL);
 	uint_t count = MAX_ZONEID;
 	int i;

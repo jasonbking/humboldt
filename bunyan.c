@@ -59,7 +59,7 @@ bunyan_set_name(const char *name)
 static void
 bunyan_get_hostname(void)
 {
-	char *buf = calloc(MAXHOSTNAMELEN, 1);
+	char *buf = calloc(1, MAXHOSTNAMELEN);
 	assert(buf != NULL);
 	assert(gethostname(buf, MAXHOSTNAMELEN) == 0);
 	if (bunyan_hostname != NULL)
