@@ -24,13 +24,43 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/fork.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <port.h>
 
+#include <wintypes.h>
+#include <winscard.h>
+
 #include "softtoken.h"
 #include "bunyan.h"
+#include "sshkey.h"
+#include "ykccid.h"
 
 struct token_slot *token_slots = NULL;
+
+static void
+generate_keys(const char *zonename, const char *keydir)
+{
+	struct sshkey *authkey;
+	struct sshkey *certkey;
+	int rv;
+	SCARDCONTEXT ctx;
+	struct yubikey *yk;
+
+	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
+	assert(rv == SCARD_S_SUCCESS);
+	yk = ykc_find(ctx);
+
+	assert(yk != NULL);
+	assert(yk->yk_next == NULL);
+
+	rv = sshkey_generate(KEY_ED25519, 256, &authkey);
+	assert(rv != 0);
+
+	rv = sshkey_generate(KEY_RSA, 2048, &certkey);
+	assert(rv != 0);
+}
 
 static void
 make_slots(const char *zonename)
@@ -51,13 +81,14 @@ make_slots(const char *zonename)
 	 * key data file. These are formatted as a packed nvlist.
 	 */
 	snprintf(keydir, sizeof (keydir), "/zones/%s/keys", zonename);
+
+again:
 	if ((dirp = opendir(keydir)) == NULL)
 		return;
 
 	do {
 		if ((dp = readdir(dirp)) != NULL) {
-			if (dp->d_name[0] == '.' && (
-			    dp->d_name[1] == '\0' || dp->d_name[1] == '.')) {
+			if (dp->d_name[0] == '.') {
 				continue;
 			}
 			snprintf(fn, sizeof (fn), "%s/%s", keydir, dp->d_name);
@@ -102,6 +133,26 @@ make_slots(const char *zonename)
 	} while (dp != NULL);
 
 	closedir(dirp);
+
+	if (token_slots == NULL) {
+		pid_t kid, w;
+		int stat;
+
+		kid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
+		assert(kid != -1);
+		if (kid == 0) {
+			(void) mkdir(keydir, 0700);
+			generate_keys(zonename, keydir);
+			exit(0);
+		}
+
+		do {
+			w = waitpid(kid, &stat, 0);
+		} while (w == -1 && errno == EINTR);
+		assert(WIFEXITED(stat));
+		assert(WEXITSTATUS(stat) == 0);
+		goto again;
+	}
 }
 
 static void
@@ -220,7 +271,7 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	assert(pipe(kidpipe) == 0);
 
 	/* And create the actual agent process. */
-	kid = fork();
+	kid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
 	assert(kid != -1);
 	if (kid == 0) {
 		assert(close(kidpipe[0]) == 0);
