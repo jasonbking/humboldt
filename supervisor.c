@@ -26,28 +26,58 @@
 #include <sys/mman.h>
 #include <sys/fork.h>
 #include <sys/wait.h>
+#include <sys/debug.h>
 #include <dirent.h>
 #include <port.h>
 
 #include <wintypes.h>
 #include <winscard.h>
 
+#include <librename.h>
+#include <libnvpair.h>
+
 #include "softtoken.h"
 #include "bunyan.h"
 #include "sshkey.h"
 #include "ykccid.h"
 
+#include "sshkey.h"
+#include "cipher.h"
+#include "sshbuf.h"
+#include "crypto_api.h"
+
 struct token_slot *token_slots = NULL;
 
+static inline char
+hex_digit(char nybble)
+{
+	if (nybble >= 0xA)
+		return ('a' + (nybble - 0xA));
+	return ('0' + nybble);
+}
+
 static char *
-expand_key_and_replace(const char *input, size_t inlen, size_t outlen)
+hex_buffer(const char *buf, size_t len)
+{
+	char *obuf = calloc(1, len * 2 + 1);
+	size_t i, j;
+	for (i = 0, j = 0; i < len; ++i) {
+		obuf[j++] = hex_digit((buf[i] & 0xf0) >> 4);
+		obuf[j++] = hex_digit(buf[i] & 0x0f);
+	}
+	obuf[j++] = 0;
+	return (obuf);
+}
+
+static char *
+expand_key_and_replace(char *input, size_t inlen, size_t outlen)
 {
 	char *out;
 	size_t pos, len;
 	char buf[crypto_hash_sha512_BYTES];
 
 	out = calloc(1, outlen);
-	assert(out != NULL);
+	VERIFY3P(out, !=, NULL);
 
 	explicit_bzero(&buf, sizeof (buf));
 	crypto_hash_sha512(buf, input, inlen);
@@ -68,13 +98,14 @@ expand_key_and_replace(const char *input, size_t inlen, size_t outlen)
 }
 
 static void
-encrypt_and_write_key(struct sshkey *key, struct yubikey *yk, const char *dir,
-    const char *fn)
+encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
+    struct token_slot *info)
 {
 	int rv, i;
 	char *chal, *key, *iv, *encdata, *packdata;
 	size_t challen, keylen, keysz, ivlen, authlen, blocksz, enclen, packlen;
-	struct sshcipher_ctx *cipher, *cctx;
+	const struct sshcipher *cipher;
+	struct sshcipher_ctx *cctx;
 	nvlist_t *nv;
 	const char *ciphername = "chacha20-poly1305@openssh.com";
 	struct sshbuf *buf;
@@ -82,80 +113,83 @@ encrypt_and_write_key(struct sshkey *key, struct yubikey *yk, const char *dir,
 	FILE *f;
 
 	buf = sshbuf_new();
-	assert(buf != NULL);
+	VERIFY3P(buf, !=, NULL);
 
 	challen = 64;
 	chal = calloc(1, challen);
-	assert(chal != NULL);
+	VERIFY3P(chal, !=, NULL);
 	arc4random_buf(chal, challen);
 
 	cipher = cipher_by_name(ciphername);
-	assert(cipher != NULL);
+	VERIFY3P(cipher, !=, NULL);
 
 	authlen = cipher_authlen(cipher);
 	blocksz = cipher_blocksize(cipher);
 
 	ivlen = cipher_ivlen(cipher);
 	iv = calloc(1, ivlen);
-	assert(iv != NULL);
+	VERIFY3P(iv, !=, NULL);
 	arc4random_buf(iv, ivlen);
 
 	keysz = cipher_keylen(cipher);
 	key = calloc(1, keysz);
-	assert(key != NULL);
+	VERIFY3P(key, !=, NULL);
 
 	ykc_txn_begin(yk);
-	rv = ykc_select(yk);
-	assert(rv == 0);
+	VERIFY0(ykc_select(yk));
 	keylen = keysz;
-	rv = ykc_hmac(yk, 1, chal, challen, key, &keylen);
-	assert(rv == 0);
-	assert(keylen < keysz);
+	VERIFY0(ykc_hmac(yk, 1, chal, challen, key, &keylen));
+	VERIFY3U(keylen, <, keysz);
 	ykc_txn_end(yk);
 
 	if (keylen < keysz)
 		key = expand_key_and_replace(key, keylen, keysz);
 
 	rv = cipher_init(&cctx, cipher, key, keysz, iv, ivlen, 1);
-	assert(rv == 0);
+	VERIFY0(rv);
 
-	rv = sshkey_private_serialize(key, buf);
-	assert(rv == 0);
+	rv = sshkey_private_serialize(skey, buf);
+	VERIFY0(rv);
 	i = 0;
 	while (sshbuf_len(buf) % blocksz) {
 		rv = sshbuf_put_u8(buf, ++i & 0xff);
-		asset(rv == 0);
+		VERIFY0(rv);
 	}
 	enclen = sshbuf_len(buf) + authlen;
 	encdata = calloc(1, enclen);
-	rv = cipher_crypt(cctx, 0, encdata, sshbuf_ptr(buf), sshbuf_len(ptr),
+	rv = cipher_crypt(cctx, 0, encdata, sshbuf_ptr(buf), sshbuf_len(buf),
 	    0, authlen);
-	assert(rv == 0);
+	VERIFY0(rv);
 	sshbuf_reset(buf);
 	cipher_free(cctx);
 
-	assert(nvlist_alloc(&nv, NV_UNIQUE_NAME, 0) == 0);
-	assert(nvlist_add_uint8(nv, "version", 1) == 0);
-	assert(nvlist_add_string(nv, "algorithm", ciphername) == 0);
-	assert(nvlist_add_byte_array(nv, "encdata", encdata, enclen) == 0);
-	assert(nvlist_add_byte_array(nv, "challenge", chal, challen) == 0);
-	assert(nvlist_add_byte_array(nv, "iv", iv, ivlen) == 0);
-	assert(nvlist_add_uint32(nv, "yk_serial", yk->yk_serial) == 0);
-	assert(nvlist_add_uint8(nv, "yk_slot", 1) == 0);
+	VERIFY0(nvlist_alloc(&nv, NV_UNIQUE_NAME, 0));
+
+	VERIFY0(nvlist_add_uint8(nv, "version", 1));
+	VERIFY0(nvlist_add_uint8(nv, "algo", info->ts_algo));
+	VERIFY0(nvlist_add_uint8(nv, "type", info->ts_type));
+
+	VERIFY0(nvlist_add_byte_array(nv, "challenge", chal, challen));
+	VERIFY0(nvlist_add_uint32(nv, "yk_serial", yk->yk_serial));
+	VERIFY0(nvlist_add_uint8(nv, "yk_slot", 1));
+
+	VERIFY0(nvlist_add_string(nv, "encalgo", ciphername));
+	VERIFY0(nvlist_add_byte_array(nv, "encdata", encdata, enclen));
+	VERIFY0(nvlist_add_byte_array(nv, "iv", iv, ivlen));
 
 	packdata = NULL;
 	packlen = 0;
-	assert(nvlist_pack(nv, &packdata, &packlen, NV_ENCODE_XDR) == 0);
-	assert(packdata != NULL);
-	assert(packlen > 0);
+	VERIFY0(nvlist_pack(nv, &packdata, &packlen, NV_ENCODE_XDR, 0));
+	VERIFY3P(packdata, !=, NULL);
+	VERIFY3U(packlen, >, 0);
 
-	rv = librename_atomic_init(dir, fn, NULL, 0600, 0, &rast);
-	assert(rv == 0);
-	f = fdopen(librename_atomic_fd(rast));
-	assert(fwrite(packdata, packlen, 1, f) == 1);
-	assert(fflush(f) == 0);
+	rv = librename_atomic_init(dir, info->ts_name, NULL, 0600, 0, &rast);
+	VERIFY0(rv);
+	f = fdopen(librename_atomic_fd(rast), "w");
+	VERIFY3S(fwrite(packdata, packlen, 1, f), ==, 1);
+	VERIFY0(fflush(f));
 	rv = librename_atomic_commit(rast);
-	assert(rv == 0);
+	VERIFY0(rv);
 	librename_atomic_fini(rast);
 
 	explicit_bzero(key, keysz);
@@ -169,14 +203,99 @@ encrypt_and_write_key(struct sshkey *key, struct yubikey *yk, const char *dir,
 	sshbuf_free(buf);
 }
 
+static int
+lock_key(struct token_slot *slot)
+{
+	explicit_bzero(slot->ts_data, slot->ts_datasize);
+	return (0);
+}
+
+static int
+unlock_key(struct token_slot *slot)
+{
+	struct yubikey *ykb, *yk;
+	nvlist_t *nv = slot->ts_nvl;
+	int rv, i;
+	SCARDCONTEXT ctx;
+	uchar_t *chal, *key, *iv, *encdata;
+	uint_t challen, keysz, ivlen, authlen, blocksz, enclen;
+	size_t keylen;
+	const struct sshcipher *cipher;
+	struct sshcipher_ctx *cctx;
+	char *ciphername;
+	uint32_t serial;
+	uint8_t slotn;
+
+	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
+	assert(rv == SCARD_S_SUCCESS);
+
+	ykb = ykc_find(ctx);
+	assert(ykb != NULL);
+	yk = ykb;
+
+	VERIFY0(nvlist_lookup_uint32(nv, "yk_serial", &serial));
+	VERIFY0(nvlist_lookup_uint8(nv, "yk_slot", &slotn));
+	do {
+		const uint16_t mask =
+		    (slotn == 1 ? CONFIG1_VALID : CONFIG2_VALID);
+		if (yk->yk_serial == serial && (yk->yk_touchlvl & mask) != 0)
+			break;
+		yk = yk->yk_next;
+	} while (yk != NULL);
+	VERIFY3P(yk, !=, NULL);
+
+	VERIFY0(nvlist_lookup_string(nv, "encalgo", &ciphername));
+	cipher = cipher_by_name(ciphername);
+	VERIFY3P(cipher, !=, NULL);
+
+	authlen = cipher_authlen(cipher);
+	blocksz = cipher_blocksize(cipher);
+
+	VERIFY0(nvlist_lookup_byte_array(nv, "challenge", &chal, &challen));
+	VERIFY0(nvlist_lookup_byte_array(nv, "iv", &iv, &ivlen));
+	VERIFY3S(ivlen, ==, cipher_ivlen(cipher));
+
+	keysz = cipher_keylen(cipher);
+	key = calloc(1, keysz);
+	VERIFY3P(key, !=, NULL);
+
+	ykc_txn_begin(yk);
+	VERIFY0(ykc_select(yk));
+	keylen = keysz;
+	VERIFY0(ykc_hmac(yk, slotn, chal, challen, key, &keylen));
+	VERIFY3U(keylen, <, keysz);
+	ykc_txn_end(yk);
+
+	ykc_release(ykb);
+
+	if (keylen < keysz)
+		key = expand_key_and_replace(key, keylen, keysz);
+
+	VERIFY0(nvlist_lookup_byte_array(nv, "encdata", &encdata, &enclen));
+
+	VERIFY0(cipher_init(&cctx, cipher, key, keysz, iv, ivlen, 0));
+
+	slot->ts_data->tsd_len = enclen - authlen;
+	VERIFY0(cipher_crypt(cctx, 0, slot->ts_data->tsd_data, encdata,
+	    enclen - authlen, 0, authlen));
+
+	cipher_free(cctx);
+	explicit_bzero(key, keysz);
+	free(key);
+
+	return (0);
+}
+
 static void
 generate_keys(const char *zonename, const char *keydir)
 {
 	struct sshkey *authkey;
 	struct sshkey *certkey;
+	struct yubikey *yk;
 	int rv, i;
 	SCARDCONTEXT ctx;
-	char fn[PATH_MAX];
+	struct token_slot tpl;
+	bzero(&tpl, sizeof (tpl));
 
 	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
 	assert(rv == SCARD_S_SUCCESS);
@@ -186,16 +305,22 @@ generate_keys(const char *zonename, const char *keydir)
 	assert(yk->yk_next == NULL);
 
 	rv = sshkey_generate(KEY_ED25519, 256, &authkey);
-	assert(rv == 0);
-	snprintf(fn, sizeof (fn), "%s/auth.key", keydir);
-	encrypt_and_write_key(authkey, yk, fn);
+	VERIFY0(rv);
+	tpl.ts_type = SLOT_ASYM_AUTH;
+	tpl.ts_algo = ALGO_ED_25519;
+	tpl.ts_name = "auth.key";
+	encrypt_and_write_key(authkey, yk, keydir, &tpl);
 	sshkey_free(authkey);
 
 	rv = sshkey_generate(KEY_RSA, 2048, &certkey);
-	assert(rv == 0);
-	snprintf(fn, sizeof (fn), "%s/cert.key", keydir);
-	encrypt_and_write_key(certkey, yk, fn);
+	VERIFY0(rv);
+	tpl.ts_type = SLOT_ASYM_CERT_SIGN;
+	tpl.ts_algo = ALGO_RSA_2048;
+	tpl.ts_name = "cert.key";
+	encrypt_and_write_key(certkey, yk, keydir, &tpl);
 	sshkey_free(certkey);
+
+	ykc_release(yk);
 }
 
 static void
@@ -208,9 +333,10 @@ make_slots(const char *zonename)
 	struct dirent *dp;
 	FILE *f;
 	long sz;
-	char *buf;
+	char *buf, *name;
 	nvlist_t *nvl;
 	char *shm;
+	uint8_t val;
 
 	/*
 	 * Walk through the zone keys directory and interpret each file as a
@@ -219,60 +345,84 @@ make_slots(const char *zonename)
 	snprintf(keydir, sizeof (keydir), "/zones/%s/keys", zonename);
 
 again:
-	if ((dirp = opendir(keydir)) == NULL)
-		return;
+	if ((dirp = opendir(keydir)) != NULL) {
+		do {
+			if ((dp = readdir(dirp)) != NULL) {
+				if (dp->d_name[0] == '.') {
+					continue;
+				}
+				snprintf(fn, sizeof (fn), "%s/%s", keydir,
+				    dp->d_name);
+				bunyan_log(TRACE, "unpacking key file",
+				    "filename", BNY_STRING, dp->d_name, NULL);
 
-	do {
-		if ((dp = readdir(dirp)) != NULL) {
-			if (dp->d_name[0] == '.') {
-				continue;
+				f = fopen(fn, "r");
+				assert(f != NULL);
+
+				VERIFY0(fseek(f, 0L, SEEK_END));
+				sz = ftell(f);
+				VERIFY0(fseek(f, 0L, SEEK_SET));
+				assert(sz < 1*1024*1024);
+
+				buf = calloc(1, sz);
+				assert(buf != NULL);
+
+				assert(fread(buf, sz, 1, f) == 1);
+				fclose(f);
+
+				VERIFY0(nvlist_unpack(buf, sz, &nvl, 0));
+
+				free(buf);
+
+				VERIFY0(nvlist_lookup_uint8(nvl, "version",
+				    &val));
+				if (val != 1)
+					continue;
+
+				/*
+				 * The decrypted key data is always smaller than
+				 * the nvlist was, so we'll just allocate that
+				 * much shared memory for it.
+				 */
+				shm = mmap(0,
+				    sz + sizeof (struct token_slot_data),
+				    PROT_READ | PROT_WRITE,
+				    MAP_SHARED | MAP_ANON, -1, 0);
+				assert(shm != NULL);
+				explicit_bzero(shm, sz);
+
+				ts = calloc(1, sizeof (struct token_slot));
+				assert(ts != NULL);
+				name = calloc(1, strlen(dp->d_name));
+				assert(name != NULL);
+				strcpy(name, dp->d_name);
+				ts->ts_name = name;
+				ts->ts_nvl = nvl;
+				ts->ts_data = (struct token_slot_data *)shm;
+				ts->ts_datasize = sz;
+
+				VERIFY0(nvlist_lookup_uint8(nvl, "type", &val));
+				VERIFY3U(val, >, 0);
+				VERIFY3U(val, <, SLOT_MAX);
+				ts->ts_type = val;
+				VERIFY0(nvlist_lookup_uint8(nvl, "algo", &val));
+				VERIFY3U(val, >, 0);
+				VERIFY3U(val, <, ALGO_MAX);
+				ts->ts_algo = val;
+
+				ts->ts_next = token_slots;
+				token_slots = ts;
 			}
-			snprintf(fn, sizeof (fn), "%s/%s", keydir, dp->d_name);
+		} while (dp != NULL);
 
-			f = fopen(fn, "r");
-			assert(f != NULL);
-
-			assert(fseek(f, 0L, SEEK_END) == 0);
-			sz = ftell(f);
-			assert(fseek(f, 0L, SEEK_SET) == 0);
-			assert(sz < 1*1024*1024);
-
-			buf = calloc(1, sz);
-			assert(buf != NULL);
-
-			assert(fread(buf, sz, 1, f) == 1);
-			fclose(f);
-
-			assert(nvlist_unpack(buf, sz, &nvl, 0) == 0);
-
-			free(buf);
-
-			/*
-			 * The decrypted key data is always smaller than the
-			 * nvlist was, so we'll just allocate that much shared
-			 * memory for it.
-			 */
-			shm = mmap(0, sz, PROT_READ | PROT_WRITE,
-			    MAP_SHARED | MAP_ANON, -1, 0);
-			assert(shm != NULL);
-			bzero(shm, sz);
-
-			ts = calloc(1, sizeof (struct token_slot));
-			ts->ts_name = calloc(1, strlen(dp->d_name));
-			strcpy(ts->ts_name, dp->d_name);
-			ts->ts_nvl = nvl;
-			ts->ts_data = shm;
-
-			ts->ts_next = token_slots;
-			token_slots = ts;
-		}
-	} while (dp != NULL);
-
-	closedir(dirp);
+		closedir(dirp);
+	}
 
 	if (token_slots == NULL) {
 		pid_t kid, w;
 		int stat;
+
+		bunyan_log(INFO, "generating keys for zone", NULL);
 
 		kid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
 		assert(kid != -1);
@@ -313,17 +463,17 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 	portfd = port_create();
 	assert(portfd > 0);
 
-	assert(port_associate(portfd,
-	    PORT_SOURCE_FD, ctlfd, POLLIN, NULL) == 0);
-	assert(port_associate(portfd,
-	    PORT_SOURCE_FD, kidfd, POLLIN, NULL) == 0);
+	VERIFY0(port_associate(portfd,
+	    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
+	VERIFY0(port_associate(portfd,
+	    PORT_SOURCE_FD, kidfd, POLLIN, NULL));
 
 	while (1) {
 		rv = port_get(portfd, &ev, NULL);
 		if (rv == -1 && errno == EINTR) {
 			continue;
 		} else {
-			assert(rv == 0);
+			VERIFY0(rv);
 		}
 		if (ev.portev_object == ctlfd) {
 			assert(fread(&cmd, sizeof (cmd), 1, ctl) == 1);
@@ -337,8 +487,8 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 				    "type", BNY_INT, cmdtype, NULL);
 				continue;
 			}
-			assert(port_associate(portfd,
-			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL) == 0);
+			VERIFY0(port_associate(portfd,
+			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
 		} else if (ev.portev_object == kidfd) {
 			assert(fread(&cmd, sizeof (cmd), 1, kid) == 1);
 			cmdtype = cmd.cc_type;
@@ -353,8 +503,8 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 				    "type", BNY_INT, cmdtype, NULL);
 				continue;
 			}
-			assert(port_associate(portfd,
-			    PORT_SOURCE_FD, kidfd, POLLIN, NULL) == 0);
+			VERIFY0(port_associate(portfd,
+			    PORT_SOURCE_FD, kidfd, POLLIN, NULL));
 		} else {
 			assert(0);
 		}
@@ -393,7 +543,7 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	snprintf(addr.sun_path, sizeof (addr.sun_path) - 1,
 	    "/var/zonecontrol/%s/token.sock", zonename);
 	(void) unlink(addr.sun_path);
-	assert(bind(listensock, (struct sockaddr *)&addr, sizeof (addr)) == 0);
+	VERIFY0(bind(listensock, (struct sockaddr *)&addr, sizeof (addr)));
 
 	bunyan_set("zoneid", BNY_INT, zid,
 	    "zonename", BNY_STRING, zonename, NULL);
@@ -404,19 +554,19 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	/* Now open up our key files and establish the shared pages. */
 	make_slots(zonename);
 
-	assert(pipe(kidpipe) == 0);
+	VERIFY0(pipe(kidpipe));
 
 	/* And create the actual agent process. */
 	kid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
 	assert(kid != -1);
 	if (kid == 0) {
-		assert(close(kidpipe[0]) == 0);
-		assert(close(ctlfd) == 0);
+		VERIFY0(close(kidpipe[0]));
+		VERIFY0(close(ctlfd));
 		agent_main(zid, listensock, kidpipe[1]);
 		bunyan_log(ERROR, "agent_main returned", NULL);
 		exit(1);
 	}
-	assert(close(kidpipe[1]) == 0);
+	VERIFY0(close(kidpipe[1]));
 
 	supervisor_loop(ctlfd, kidpipe[0], listensock);
 }

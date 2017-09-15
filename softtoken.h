@@ -14,15 +14,19 @@
 #include <libnvpair.h>
 
 enum slot_type {
-	SLOT_ASYM_AUTH,
-	SLOT_ASYM_CERT_SIGN,
-	SLOT_SYM_HSM
+	SLOT_ASYM_AUTH = 0x01,
+	SLOT_ASYM_CERT_SIGN = 0x02,
+	SLOT_SYM_HSM = 0x03,
+
+	SLOT_MAX
 };
 
 enum slot_algo {
-	ALGO_ED_25519,
-	ALGO_RSA_2048,
-	ALGO_AES_128
+	ALGO_ED_25519 = 0x01,
+	ALGO_RSA_2048 = 0x02,
+	ALGO_CHACHA20 = 0x03,
+
+	ALGO_MAX
 };
 
 enum ctl_cmd_type {
@@ -41,10 +45,16 @@ struct ctl_cmd {
 struct token_slot {
 	enum slot_type ts_type;
 	enum slot_algo ts_algo;
-	char *ts_name;
+	const char *ts_name;
 	struct token_slot *ts_next;
-	char *ts_data;
+	struct token_slot_data *ts_data;
+	size_t ts_datasize;
 	nvlist_t *ts_nvl;
+};
+
+struct token_slot_data {
+	uint32_t tsd_len;
+	char tsd_data[1];
 };
 
 extern struct token_slot *token_slots;

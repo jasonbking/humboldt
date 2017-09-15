@@ -128,6 +128,8 @@ struct slot_config {
  * yk_next to find the rest).
  */
 struct yubikey *ykc_find(SCARDCONTEXT ctx);
+/* Release handles and free the given set of yubikeys. */
+void ykc_release(struct yubikey *yk);
 
 /* Make slot configurations for use with ykc_program() */
 struct slot_config *ykc_config_make_hmac(const uint8_t *hmacKey, int len);

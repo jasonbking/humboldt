@@ -25,6 +25,7 @@
 
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/debug.h>
 
 #include "bunyan.h"
 #include "softtoken.h"
@@ -44,7 +45,8 @@ static int
 fdwalk_assert_fd(void *p, int fd)
 {
 	struct zone_state *zs = (struct zone_state *)p;
-	assert(fd <= 2 || fd == zs->zs_pipe[1]);
+	if (fd != zs->zs_pipe[1])
+		VERIFY3S(fd, <=, 2);
 	return (0);
 }
 
@@ -52,13 +54,13 @@ static void
 start_supervisor(struct zone_state *forzone)
 {
 	struct zone_state *zs;
-	assert(sysevent_evc_unbind(evchan) == 0);
+	VERIFY0(sysevent_evc_unbind(evchan));
 	(void) signal(SIGCHLD, SIG_DFL);
 
 	for (zs = zonest; zs != NULL; zs = zs->zs_next) {
-		assert(close(zs->zs_pipe[0]) == 0);
+		VERIFY0(close(zs->zs_pipe[0]));
 	}
-	assert(fdwalk(fdwalk_assert_fd, forzone) == 0);
+	VERIFY0(fdwalk(fdwalk_assert_fd, forzone));
 
 	supervisor_main(forzone->zs_id, forzone->zs_pipe[1]);
 	bunyan_log(ERROR, "supervisor_main returned!", NULL);
@@ -69,19 +71,19 @@ static void
 add_zone_unlocked(zoneid_t id)
 {
 	struct zone_state *zs = calloc(1, sizeof (struct zone_state));
-	assert(zs != NULL);
+	VERIFY3P(zs, !=, NULL);
 	zs->zs_id = id;
-	assert(pipe(zs->zs_pipe) == 0);
+	VERIFY0(pipe(zs->zs_pipe));
 
 	pid_t kid = fork();
-	assert(kid != -1);
+	VERIFY3S(kid, !=, -1);
 	if (kid == 0) {
-		assert(close(zs->zs_pipe[0]) == 0);
+		VERIFY0(close(zs->zs_pipe[0]));
 		start_supervisor(zs);
 		return;
 	}
 	zs->zs_child = kid;
-	assert(close(zs->zs_pipe[1]) == 0);
+	VERIFY0(close(zs->zs_pipe[1]));
 
 	zs->zs_next = zonest;
 	zonest = zs;
@@ -113,10 +115,10 @@ static void
 add_all_zones(void)
 {
 	zoneid_t *ids = calloc(MAX_ZONEID, sizeof (zoneid_t));
-	assert(ids != NULL);
+	VERIFY3P(ids, !=, NULL);
 	uint_t count = MAX_ZONEID;
 	int i;
-	assert(zone_list(ids, &count) == 0);
+	VERIFY0(zone_list(ids, &count));
 	bunyan_log(INFO, "found zones",
 	    "count", BNY_INT, count, NULL);
 	for (i = 0; i < count; ++i) {
@@ -130,7 +132,7 @@ sysevc_handler(sysevent_t *ev, void *cookie)
 	nvlist_t *nvl;
 	int zid;
 
-	assert(sysevent_get_attr_list(ev, &nvl) == 0);
+	VERIFY0(sysevent_get_attr_list(ev, &nvl));
 	if (nvlist_lookup_int32(nvl, "zoneid", &zid) != 0)
 		return (0);
 
@@ -162,20 +164,21 @@ main(int argc, char *argv[])
 {
 	const char *channel = "com.sun:zones:status";
 	char subid[128];
+	int rv;
 
 	bunyan_init();
 	bunyan_set_name("softtoken_mgr");
 	bunyan_log(INFO, "starting up", NULL);
 
-	assert(mutex_init(&zonest_mutex,
-	    USYNC_THREAD | LOCK_ERRORCHECK, NULL) == 0);
+	VERIFY0(mutex_init(&zonest_mutex,
+	    USYNC_THREAD | LOCK_ERRORCHECK, NULL));
 
 	(void) signal(SIGCHLD, sigchld_handler);
 
-	assert(sysevent_evc_bind(channel, &evchan, 0) == 0);
-	snprintf(subid, sizeof (subid), "softtokend-%ld", getpid());
-	assert(sysevent_evc_subscribe(evchan, subid, EC_ALL, sysevc_handler,
-	    (void *)channel, 0) == 0);
+	VERIFY0(sysevent_evc_bind(channel, &evchan, 0));
+	snprintf(subid, sizeof (subid), "softtoken%ld", getpid());
+	VERIFY0(sysevent_evc_subscribe(evchan, subid, EC_ALL, sysevc_handler,
+	    (void *)channel, 0));
 
 	add_all_zones();
 

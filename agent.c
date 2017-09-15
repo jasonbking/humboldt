@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/debug.h>
 #include <dirent.h>
 #include <port.h>
 
@@ -101,7 +102,7 @@ close_client(struct client_state *cl)
 		clients = cl->cs_next;
 	mutex_exit(&clients_mtx);
 
-	assert(close(cl->cs_fd) == 0);
+	VERIFY0(close(cl->cs_fd));
 	cl->cs_events = 0;
 	sshbuf_free(cl->cs_in);
 	sshbuf_free(cl->cs_out);
@@ -120,9 +121,9 @@ enum msg_err {
 static void
 send_status(struct client_state *cl, boolean_t success)
 {
-	assert(sshbuf_put_u32(cl->cs_out, 1) == 0);
-	assert(sshbuf_put_u8(cl->cs_out, success ?
-	    SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE) == 0);
+	VERIFY0(sshbuf_put_u32(cl->cs_out, 1));
+	VERIFY0(sshbuf_put_u8(cl->cs_out, success ?
+	    SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE));
 }
 
 static int
@@ -149,9 +150,9 @@ try_process_message(struct client_state *cl)
 
 	sshbuf_reset(cl->cs_req);
 	rv = sshbuf_get_stringb(cl->cs_in, cl->cs_req);
-	assert(rv == 0);
+	VERIFY0(rv);
 	rv = sshbuf_get_u8(cl->cs_req, &type);
-	assert(rv == 0);
+	VERIFY0(rv);
 
 	bunyan_set(
 	    "client_pid", BNY_INT, (int)ucred_getpid(cl->cs_ucred),
@@ -231,8 +232,7 @@ client_reactor(void *arg)
 				close_client(cl);
 				continue;
 			}
-			rv = sshbuf_consume(cl->cs_out, len);
-			assert(rv == 0);
+			VERIFY0(sshbuf_consume(cl->cs_out, len));
 			if (sshbuf_len(cl->cs_out) > 0)
 				cl->cs_events |= POLLOUT;
 		}
@@ -247,8 +247,7 @@ client_reactor(void *arg)
 				close_client(cl);
 				continue;
 			}
-			rv = sshbuf_put(cl->cs_in, buf, len);
-			assert(rv == 0);
+			VERIFY0(sshbuf_put(cl->cs_in, buf, len));
 			explicit_bzero(buf, len);
 			rv = try_process_message(cl);
 			if (rv == ERR_BADMSG)
@@ -258,8 +257,8 @@ client_reactor(void *arg)
 		}
 
 rearm:
-		assert(port_associate(clport,
-		    PORT_SOURCE_FD, cl->cs_fd, cl->cs_events, cl) == 0);
+		VERIFY0(port_associate(clport,
+		    PORT_SOURCE_FD, cl->cs_fd, cl->cs_events, cl));
 	}
 }
 
@@ -281,7 +280,7 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 
 	bunyan_set_name("agent");
 
-	assert(listen(listensock, 10) == 0);
+	VERIFY0(listen(listensock, 10));
 
 	portfd = port_create();
 	assert(portfd > 0);
@@ -289,26 +288,25 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	clport = port_create();
 	assert(clport > 0);
 
-	assert(mutex_init(&clients_mtx, USYNC_THREAD | LOCK_ERRORCHECK,
-	    NULL) == 0);
+	VERIFY0(mutex_init(&clients_mtx, USYNC_THREAD | LOCK_ERRORCHECK,
+	    NULL));
 
 	for (i = 0; i < N_THREADS; ++i) {
-		rv = thr_create(NULL, 0, client_reactor, NULL, 0,
-		    &reactor_threads[i]);
-		assert(rv == 0);
+		VERIFY0(thr_create(NULL, 0, client_reactor, NULL, 0,
+		    &reactor_threads[i]));
 	}
 
-	assert(port_associate(portfd,
-	    PORT_SOURCE_FD, listensock, POLLIN, NULL) == 0);
-	assert(port_associate(portfd,
-	    PORT_SOURCE_FD, ctlfd, POLLIN, NULL) == 0);
+	VERIFY0(port_associate(portfd,
+	    PORT_SOURCE_FD, listensock, POLLIN, NULL));
+	VERIFY0(port_associate(portfd,
+	    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
 
 	while (1) {
 		rv = port_get(portfd, &ev, NULL);
 		if (rv == -1 && errno == EINTR) {
 			continue;
 		} else {
-			assert(rv == 0);
+			VERIFY0(rv);
 		}
 		if (ev.portev_object == ctlfd) {
 			assert(fread(&cmd, sizeof (cmd), 1, ctl) == 1);
@@ -324,8 +322,8 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 				    "type", BNY_INT, cmdtype, NULL);
 				break;
 			}
-			assert(port_associate(portfd,
-			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL) == 0);
+			VERIFY0(port_associate(portfd,
+			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
 
 		} else if (ev.portev_object == listensock) {
 			raddrlen = sizeof (raddr);
@@ -351,7 +349,7 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 				    "zoneid of client doesn't match server",
 				    "client_zoneid", BNY_INT, theirzid, NULL);
 				free(cl);
-				assert(close(sockfd) == 0);
+				VERIFY0(close(sockfd));
 				goto rearmlisten;
 			}
 			cl->cs_fd = sockfd;
@@ -370,11 +368,11 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 			clients = cl;
 			mutex_exit(&clients_mtx);
 
-			assert(port_associate(clport,
-			    PORT_SOURCE_FD, cl->cs_fd, cl->cs_events, cl) == 0);
+			VERIFY0(port_associate(clport,
+			    PORT_SOURCE_FD, cl->cs_fd, cl->cs_events, cl));
 rearmlisten:
-			assert(port_associate(portfd,
-			    PORT_SOURCE_FD, listensock, POLLIN, NULL) == 0);
+			VERIFY0(port_associate(portfd,
+			    PORT_SOURCE_FD, listensock, POLLIN, NULL));
 
 		} else {
 			assert(0);

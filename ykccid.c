@@ -151,14 +151,8 @@ ykc_txn_begin(struct yubikey *ykey)
 void
 ykc_txn_end(struct yubikey *ykey)
 {
-	assert(ykey->yk_intxn == B_TRUE);
 	LONG rv;
-	rv = SCardEndTransaction(ykey->yk_cardhdl, SCARD_LEAVE_CARD);
-	if (rv != SCARD_S_SUCCESS) {
-		fprintf(stderr, "SCardEndTransaction(%s) failed: %s\n",
-		    ykey->yk_rdrname, pcsc_stringify_error(rv));
-		abort();
-	}
+	(void) SCardEndTransaction(ykey->yk_cardhdl, SCARD_LEAVE_CARD);
 	ykey->yk_intxn = B_FALSE;
 }
 
@@ -290,6 +284,19 @@ ykc_read_status(struct yubikey *ykey)
 	}
 }
 
+void
+ykc_release(struct yubikey *yk)
+{
+	struct yubikey *next;
+	while (yk != NULL) {
+		assert(yk->yk_intxn == B_FALSE);
+		(void) SCardDisconnect(yk->yk_cardhdl, SCARD_LEAVE_CARD);
+		next = yk->yk_next;
+		free(yk);
+		yk = next;
+	}
+}
+
 struct yubikey *
 ykc_find(SCARDCONTEXT ctx)
 {
@@ -379,20 +386,16 @@ ykc_hmac(struct yubikey *yk, int slot, const char *input, size_t inputLen,
 	apdu->a_data = (char *)input;
 	apdu->a_datalen = inputLen;
 
-	ykc_txn_begin(yk);
 	rv = ykc_select(yk);
 	if (rv != 0) {
-		ykc_txn_end(yk);
 		ykc_apdu_free(apdu);
 		return (rv);
 	}
 	rv = ykc_apdu_transceive(yk, apdu);
 	if (rv != 0) {
-		ykc_txn_end(yk);
 		ykc_apdu_free(apdu);
 		return (rv);
 	}
-	ykc_txn_end(yk);
 
 	if (apdu->a_sw == SW_NO_ERROR && apdu->a_replylen > 0) {
 		size_t len = *outputLen;
@@ -435,20 +438,16 @@ ykc_program(struct yubikey *yk, int slot, struct slot_config *config)
 	apdu->a_data = (uint8_t *)config;
 	apdu->a_datalen = sizeof (struct slot_config);
 
-	ykc_txn_begin(yk);
 	rv = ykc_select(yk);
 	if (rv != 0) {
-		ykc_txn_end(yk);
 		ykc_apdu_free(apdu);
 		return (rv);
 	}
 	rv = ykc_apdu_transceive(yk, apdu);
 	if (rv != 0) {
-		ykc_txn_end(yk);
 		ykc_apdu_free(apdu);
 		return (rv);
 	}
-	ykc_txn_end(yk);
 
 	if (apdu->a_sw == SW_NO_ERROR) {
 		const uint8_t *reply = apdu->a_reply;

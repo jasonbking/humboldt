@@ -9,7 +9,8 @@ CC=		$(STRAP_AREA)/usr/bin/gcc
 LD=		/usr/bin/ld
 CSTYLE=		$(KERNEL_SOURCE)/usr/src/tools/scripts/cstyle
 
-CFLAGS+=	-gdwarf-2 -I$(PROTO_AREA)/usr/include
+BASE_CFLAGS=	-gdwarf-2 -I$(PROTO_AREA)/usr/include
+CFLAGS+=	$(BASE_CFLAGS)
 CFLAGS64=	-m64 -msave-args
 LDFLAGS+=	-L$(PROTO_AREA)/usr/lib
 
@@ -82,10 +83,10 @@ TOKEN_DEPS=		pcsclite64 libressl
 
 TOKEN_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
 			-I$(DEPS)/libressl/include/ \
-			-fstack-protector-all $(CFLAGS64)
+			-fstack-protector-all $(BASE_CFLAGS) $(CFLAGS64)
 TOKEN_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64
 TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket -lpcsclite -lssp \
-			-lumem \
+			-lumem -lrename \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
 
