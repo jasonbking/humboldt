@@ -47,6 +47,7 @@
 #include "crypto_api.h"
 
 struct token_slot *token_slots = NULL;
+size_t slot_n = 0;
 
 static inline char
 hex_digit(char nybble)
@@ -103,7 +104,9 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 {
 	int rv, i;
 	char *chal, *key, *iv, *encdata, *packdata;
-	size_t challen, keylen, keysz, ivlen, authlen, blocksz, enclen, packlen;
+	u_char *pubblob;
+	size_t challen, keylen, keysz, ivlen, authlen, blocksz, enclen;
+	size_t packlen, publen;
 	const struct sshcipher *cipher;
 	struct sshcipher_ctx *cctx;
 	nvlist_t *nv;
@@ -111,6 +114,11 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 	struct sshbuf *buf;
 	librename_atomic_t *rast;
 	FILE *f;
+	struct sshkey *pubkey;
+
+	VERIFY0(sshkey_demote(skey, &pubkey));
+	VERIFY0(sshkey_to_blob(pubkey, &pubblob, &publen));
+	sshkey_free(pubkey);
 
 	buf = sshbuf_new();
 	VERIFY3P(buf, !=, NULL);
@@ -177,6 +185,8 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 	VERIFY0(nvlist_add_byte_array(nv, "encdata", encdata, enclen));
 	VERIFY0(nvlist_add_byte_array(nv, "iv", iv, ivlen));
 
+	VERIFY0(nvlist_add_byte_array(nv, "pubkey", pubblob, publen));
+
 	packdata = NULL;
 	packlen = 0;
 	VERIFY0(nvlist_pack(nv, &packdata, &packlen, NV_ENCODE_XDR, 0));
@@ -192,6 +202,7 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 	VERIFY0(rv);
 	librename_atomic_fini(rast);
 
+	free(pubblob);
 	explicit_bzero(key, keysz);
 	free(key);
 	explicit_bzero(chal, challen);
@@ -221,6 +232,8 @@ unlock_key(struct token_slot *slot)
 	uint_t challen, keysz, ivlen, authlen, blocksz, enclen;
 	size_t keylen;
 	const struct sshcipher *cipher;
+	struct sshbuf *buf;
+	struct sshkey *pkey, *pubkey;
 	struct sshcipher_ctx *cctx;
 	char *ciphername;
 	uint32_t serial;
@@ -276,12 +289,20 @@ unlock_key(struct token_slot *slot)
 	VERIFY0(cipher_init(&cctx, cipher, key, keysz, iv, ivlen, 0));
 
 	slot->ts_data->tsd_len = enclen - authlen;
-	VERIFY0(cipher_crypt(cctx, 0, slot->ts_data->tsd_data, encdata,
-	    enclen - authlen, 0, authlen));
+	VERIFY0(cipher_crypt(cctx, 0, (u_char *)slot->ts_data->tsd_data,
+	    encdata, enclen - authlen, 0, authlen));
 
 	cipher_free(cctx);
 	explicit_bzero(key, keysz);
 	free(key);
+
+	buf = sshbuf_from((const void *)slot->ts_data->tsd_data,
+	    slot->ts_data->tsd_len);
+	VERIFY3P(buf, !=, NULL);
+	VERIFY0(sshkey_private_deserialize(buf, &pkey));
+	VERIFY3S(sshkey_equal_public(pkey, slot->ts_public), ==, 1);
+	sshkey_free(pkey);
+	sshbuf_free(buf);
 
 	return (0);
 }
@@ -334,6 +355,8 @@ make_slots(const char *zonename)
 	FILE *f;
 	long sz;
 	char *buf, *name;
+	uchar_t *pubkey;
+	uint_t publen;
 	nvlist_t *nvl;
 	char *shm;
 	uint8_t val;
@@ -410,8 +433,17 @@ again:
 				VERIFY3U(val, <, ALGO_MAX);
 				ts->ts_algo = val;
 
+				VERIFY0(nvlist_lookup_byte_array(nvl, "pubkey",
+				    &pubkey, &publen));
+				VERIFY0(sshkey_from_blob(pubkey, publen,
+				    &ts->ts_public));
+
+				bunyan_log(TRACE, "unpack ok",
+				    "filename", BNY_STRING, dp->d_name, NULL);
+
 				ts->ts_next = token_slots;
 				token_slots = ts;
+				ts->ts_id = (++slot_n);
 			}
 		} while (dp != NULL);
 
@@ -441,6 +473,45 @@ again:
 	}
 }
 
+void
+read_cmd(int fd, struct ctl_cmd *cmd)
+{
+	size_t off = 0, rem = sizeof (*cmd);
+	int rv;
+	bzero(cmd, sizeof (*cmd));
+	do {
+		rv = read(fd, ((char *)cmd) + off, rem);
+		if (rv > 0) {
+			off += rv;
+			rem -= rv;
+		}
+	} while ((rv != -1 || errno == EINTR || errno == EAGAIN) && rem > 0);
+	bunyan_log(TRACE, "received cmd",
+	    "cookie", BNY_INT, cmd->cc_cookie,
+	    "type", BNY_INT, cmd->cc_type,
+	    "p1", BNY_INT, cmd->cc_p1,
+	    NULL);
+}
+
+void
+write_cmd(int fd, const struct ctl_cmd *cmd)
+{
+	size_t off = 0, rem = sizeof (*cmd);
+	int rv;
+	bunyan_log(TRACE, "sending cmd",
+	    "cookie", BNY_INT, cmd->cc_cookie,
+	    "type", BNY_INT, cmd->cc_type,
+	    "p1", BNY_INT, cmd->cc_p1,
+	    NULL);
+	do {
+		rv = write(fd, ((const char *)cmd) + off, rem);
+		if (rv > 0) {
+			off += rv;
+			rem -= rv;
+		}
+	} while ((rv != -1 || errno == EINTR || errno == EAGAIN) && rem > 0);
+}
+
 static void
 supervisor_loop(int ctlfd, int kidfd, int listensock)
 {
@@ -448,15 +519,11 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 	port_event_t ev;
 	timespec_t to;
 	int rv;
-	struct ctl_cmd cmd;
+	struct ctl_cmd cmd, rcmd;
 	size_t len;
 	enum ctl_cmd_type cmdtype;
-	FILE *ctl, *kid;
-
-	ctl = fdopen(ctlfd, "r+");
-	assert(ctl != NULL);
-	kid = fdopen(kidfd, "r+");
-	assert(kid != NULL);
+	int idx;
+	struct token_slot *ts;
 
 	bzero(&to, sizeof (to));
 
@@ -476,7 +543,7 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 			VERIFY0(rv);
 		}
 		if (ev.portev_object == ctlfd) {
-			assert(fread(&cmd, sizeof (cmd), 1, ctl) == 1);
+			read_cmd(ctlfd, &cmd);
 			cmdtype = cmd.cc_type;
 			switch (cmdtype) {
 			case CMD_SHUTDOWN:
@@ -489,13 +556,38 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 			}
 			VERIFY0(port_associate(portfd,
 			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
+
 		} else if (ev.portev_object == kidfd) {
-			assert(fread(&cmd, sizeof (cmd), 1, kid) == 1);
+			read_cmd(kidfd, &cmd);
 			cmdtype = cmd.cc_type;
 			switch (cmdtype) {
 			case CMD_UNLOCK_KEY:
-				break;
 			case CMD_LOCK_KEY:
+				for (ts = token_slots; ts != NULL;
+				    ts = ts->ts_next) {
+					if (ts->ts_id == cmd.cc_p1)
+						break;
+				}
+				if (ts != NULL) {
+					if (cmdtype == CMD_UNLOCK_KEY)
+						rv = unlock_key(ts);
+					else
+						rv = lock_key(ts);
+					if (rv == 0) {
+						bzero(&rcmd, sizeof (rcmd));
+						rcmd.cc_cookie = cmd.cc_cookie;
+						rcmd.cc_type = CMD_STATUS;
+						rcmd.cc_p1 = STATUS_OK;
+						write_cmd(kidfd, &rcmd);
+						break;
+					}
+				}
+
+				bzero(&rcmd, sizeof (rcmd));
+				rcmd.cc_cookie = cmd.cc_cookie;
+				rcmd.cc_type = CMD_STATUS;
+				rcmd.cc_p1 = STATUS_ERROR;
+				write_cmd(kidfd, &rcmd);
 				break;
 			default:
 				bunyan_log(ERROR,
@@ -505,6 +597,7 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 			}
 			VERIFY0(port_associate(portfd,
 			    PORT_SOURCE_FD, kidfd, POLLIN, NULL));
+
 		} else {
 			assert(0);
 		}
@@ -521,6 +614,7 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	ssize_t len;
 	pid_t kid;
 	int kidpipe[2];
+	struct token_slot *slot;
 
 	bunyan_set_name("supervisor");
 

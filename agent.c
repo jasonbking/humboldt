@@ -71,6 +71,10 @@
 #define	SSH_AGENT_RSA_SHA2_256			0x02
 #define	SSH_AGENT_RSA_SHA2_512			0x04
 
+enum port_events {
+	EVENT_WANT_UNLOCK = 1
+};
+
 struct client_state {
 	int cs_fd;
 	struct sockaddr_un cs_peer;
@@ -82,6 +86,16 @@ struct client_state {
 	struct client_state *cs_next;
 	struct client_state *cs_prev;
 };
+
+struct agent_slot {
+	mutex_t as_mtx;
+	uint8_t as_cookie;
+	boolean_t as_unlocked;
+	cond_t as_unlock;
+};
+
+static int mport;
+static uint8_t last_cookie;
 
 static mutex_t clients_mtx;
 static struct client_state *clients;
@@ -126,6 +140,108 @@ send_status(struct client_state *cl, boolean_t success)
 	    SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE));
 }
 
+static void
+process_request_identities(struct client_state *cl)
+{
+	struct sshbuf *msg;
+	struct token_slot *slot;
+
+	msg = sshbuf_new();
+	VERIFY3P(msg, !=, NULL);
+
+	VERIFY0(sshbuf_put_u8(msg, SSH2_AGENT_IDENTITIES_ANSWER));
+	VERIFY0(sshbuf_put_u32(msg, slot_n));
+
+	for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
+		u_char *blob;
+		size_t blen;
+
+		VERIFY0(sshkey_to_blob(slot->ts_public, &blob, &blen));
+		VERIFY0(sshbuf_put_string(msg, blob, blen));
+		free(blob);
+
+		VERIFY0(sshbuf_put_cstring(msg, slot->ts_name));
+	}
+	VERIFY0(sshbuf_put_stringb(cl->cs_out, msg));
+	sshbuf_free(msg);
+}
+
+static void
+process_sign_request(struct client_state *cl)
+{
+	struct sshbuf *msg, *kbuf;
+	struct sshkey *key;
+	struct sshkey *privkey;
+	struct token_slot *slot;
+	u_char *blob, *data, *sig = NULL;
+	size_t blen, dlen, slen = 0;
+	int rv;
+	uint32_t flags, compat = 0;
+	struct agent_slot *a;
+	const char *alg = NULL;
+
+	VERIFY0(sshbuf_get_string(cl->cs_req, &blob, &blen));
+	VERIFY0(sshbuf_get_string(cl->cs_req, &data, &dlen));
+	VERIFY0(sshbuf_get_u32(cl->cs_req, &flags));
+
+	/*if (flags & SSH_AGENT_OLD_SIGNATURE)
+		compat = SSH_BUG_SIGBLOB;*/
+
+	VERIFY0(sshkey_from_blob(blob, blen, &key));
+	for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
+		if (sshkey_equal_public(key, slot->ts_public))
+			break;
+	}
+	if (slot == NULL) {
+		send_status(cl, B_FALSE);
+		goto out;
+	}
+
+	a = slot->ts_agent;
+	mutex_enter(&a->as_mtx);
+	if (!a->as_unlocked && a->as_cookie == 0) {
+		a->as_cookie = (++last_cookie);
+		VERIFY0(port_send(mport, EVENT_WANT_UNLOCK, slot));
+	}
+	if (!a->as_unlocked) {
+		do {
+			rv = cond_wait(&a->as_unlock, &a->as_mtx);
+		} while (rv == EINTR);
+		VERIFY0(rv);
+	}
+	VERIFY3U(a->as_unlocked, ==, B_TRUE);
+	VERIFY3U(slot->ts_data->tsd_len, >, 0);
+	mutex_exit(&a->as_mtx);
+
+	kbuf = sshbuf_from((const void *)slot->ts_data->tsd_data,
+	    slot->ts_data->tsd_len);
+	VERIFY3P(kbuf, !=, NULL);
+	VERIFY0(sshkey_private_deserialize(kbuf, &privkey));
+	sshbuf_free(kbuf);
+
+	if (privkey->type == KEY_RSA) {
+		if (flags & SSH_AGENT_RSA_SHA2_256)
+			alg = "rsa-sha2-256";
+		else if (flags & SSH_AGENT_RSA_SHA2_512)
+			alg = "rsa-sha2-512";
+	}
+	VERIFY0(sshkey_sign(privkey, &sig, &slen, data, dlen, alg, compat));
+	sshkey_free(privkey);
+
+	msg = sshbuf_new();
+	VERIFY3P(msg, !=, NULL);
+
+	VERIFY0(sshbuf_put_u8(msg, SSH2_AGENT_SIGN_RESPONSE));
+	VERIFY0(sshbuf_put_string(msg, sig, slen));
+	VERIFY0(sshbuf_put_stringb(cl->cs_out, msg));
+
+	sshbuf_free(msg);
+out:
+	free(blob);
+	free(data);
+	sshkey_free(key);
+}
+
 static int
 try_process_message(struct client_state *cl)
 {
@@ -164,10 +280,10 @@ try_process_message(struct client_state *cl)
 
 	switch (type) {
 	case SSH2_AGENTC_SIGN_REQUEST:
-		//process_sign_request2(e);
+		process_sign_request(cl);
 		break;
 	case SSH2_AGENTC_REQUEST_IDENTITIES:
-		//process_request_identities(e, 2);
+		process_request_identities(cl);
 		break;
 	case SSH_AGENTC_LOCK:
 	case SSH_AGENTC_UNLOCK:
@@ -213,6 +329,7 @@ client_reactor(void *arg)
 		} else {
 			assert(rv == 0);
 		}
+
 		cl = (struct client_state *)ev.portev_user;
 		assert(cl != NULL);
 		assert(cl->cs_fd == ev.portev_object);
@@ -268,7 +385,6 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	int portfd;
 	struct ctl_cmd cmd;
 	enum ctl_cmd_type cmdtype;
-	FILE *ctl;
 	port_event_t ev;
 	timespec_t to;
 	int sockfd;
@@ -277,6 +393,8 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	struct client_state *cl;
 	int i, rv;
 	zoneid_t theirzid;
+	struct token_slot *slot;
+	struct agent_slot *as;
 
 	bunyan_set_name("agent");
 
@@ -284,12 +402,21 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 
 	portfd = port_create();
 	assert(portfd > 0);
+	mport = portfd;
 
 	clport = port_create();
 	assert(clport > 0);
 
 	VERIFY0(mutex_init(&clients_mtx, USYNC_THREAD | LOCK_ERRORCHECK,
 	    NULL));
+
+	for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
+		slot->ts_agent = calloc(1, sizeof (struct agent_slot));
+		VERIFY3P(slot->ts_agent, !=, NULL);
+		VERIFY0(mutex_init(&slot->ts_agent->as_mtx,
+		    USYNC_THREAD | LOCK_ERRORCHECK, NULL));
+		VERIFY0(cond_init(&slot->ts_agent->as_unlock, USYNC_THREAD, 0));
+	}
 
 	for (i = 0; i < N_THREADS; ++i) {
 		VERIFY0(thr_create(NULL, 0, client_reactor, NULL, 0,
@@ -308,11 +435,43 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 		} else {
 			VERIFY0(rv);
 		}
-		if (ev.portev_object == ctlfd) {
-			assert(fread(&cmd, sizeof (cmd), 1, ctl) == 1);
+		if (ev.portev_source == PORT_SOURCE_USER) {
+			switch (ev.portev_events) {
+			case EVENT_WANT_UNLOCK:
+				bzero(&cmd, sizeof (cmd));
+				slot = (struct token_slot *)ev.portev_user;
+				cmd.cc_type = CMD_UNLOCK_KEY;
+				mutex_enter(&slot->ts_agent->as_mtx);
+				cmd.cc_cookie = slot->ts_agent->as_cookie;
+				mutex_exit(&slot->ts_agent->as_mtx);
+				cmd.cc_p1 = slot->ts_id;
+				write_cmd(ctlfd, &cmd);
+				break;
+			default:
+				VERIFY0(ev.portev_events);
+			}
+
+		} else if (ev.portev_object == ctlfd) {
+			read_cmd(ctlfd, &cmd);
 			cmdtype = cmd.cc_type;
 			switch (cmdtype) {
 			case CMD_STATUS:
+				for (slot = token_slots; slot != NULL;
+				    slot = slot->ts_next) {
+					as = slot->ts_agent;
+					mutex_enter(&as->as_mtx);
+					if (as->as_cookie == cmd.cc_cookie) {
+						VERIFY3U(slot->ts_data->tsd_len,
+						    >, 0);
+						as->as_cookie = 0;
+						as->as_unlocked = B_TRUE;
+						VERIFY0(cond_broadcast(
+						    &as->as_unlock));
+						mutex_exit(&as->as_mtx);
+						break;
+					}
+					mutex_exit(&as->as_mtx);
+				}
 				break;
 			case CMD_SHUTDOWN:
 				break;

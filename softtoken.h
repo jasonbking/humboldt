@@ -12,6 +12,7 @@
 
 #include <zone.h>
 #include <libnvpair.h>
+#include "sshkey.h"
 
 enum slot_type {
 	SLOT_ASYM_AUTH = 0x01,
@@ -36,6 +37,11 @@ enum ctl_cmd_type {
 	CMD_SHUTDOWN
 };
 
+enum ctl_cmd_status {
+	STATUS_OK = 0xc0,
+	STATUS_ERROR = 0xc1,
+};
+
 struct ctl_cmd {
 	uint8_t cc_cookie;
 	uint8_t cc_type;
@@ -43,23 +49,30 @@ struct ctl_cmd {
 };
 
 struct token_slot {
+	uint8_t ts_id;
 	enum slot_type ts_type;
 	enum slot_algo ts_algo;
 	const char *ts_name;
 	struct token_slot *ts_next;
 	struct token_slot_data *ts_data;
 	size_t ts_datasize;
+	struct sshkey *ts_public;
 	nvlist_t *ts_nvl;
+	struct agent_slot *ts_agent;
 };
 
 struct token_slot_data {
-	uint32_t tsd_len;
-	char tsd_data[1];
+	volatile uint32_t tsd_len;
+	volatile char tsd_data[1];
 };
 
+extern size_t slot_n;
 extern struct token_slot *token_slots;
 
 void supervisor_main(zoneid_t zid, int ctlfd);
 void agent_main(zoneid_t zid, int listensock, int ctlfd);
+
+void read_cmd(int fd, struct ctl_cmd *cmd);
+void write_cmd(int fd, const struct ctl_cmd *cmd);
 
 #endif
