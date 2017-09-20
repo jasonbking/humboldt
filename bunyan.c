@@ -25,6 +25,7 @@
 #include <strings.h>
 
 #include <sys/mman.h>
+#include <sys/debug.h>
 #include <libnvpair.h>
 
 #include "bunyan.h"
@@ -36,6 +37,120 @@ static mutex_t *bunyan_wrmutex = NULL;
 static void *bunyan_shmem = NULL;
 static nvlist_t *bunyan_base = NULL;
 
+struct bunyan_timers {
+	struct timer_block *bt_first;
+	struct timer_block *bt_last;
+	struct timespec bt_current;
+};
+
+#define	TBLOCK_N	16
+struct timer_block {
+	struct timespec tb_timers[TBLOCK_N];
+	const char *tb_names[TBLOCK_N];
+	size_t tb_pos;
+	struct timer_block *tb_next;
+};
+
+#define	NS_PER_S	1000000000ULL
+
+void
+tspec_subtract(struct timespec *result, const struct timespec *x,
+    const struct timespec *y)
+{
+	struct timespec xcarry;
+	bcopy(x, &xcarry, sizeof (xcarry));
+	if (xcarry.tv_nsec < y->tv_nsec) {
+		xcarry.tv_sec -= 1;
+		xcarry.tv_nsec += NS_PER_S;
+	}
+	result->tv_sec = xcarry.tv_sec - y->tv_sec;
+	result->tv_nsec = xcarry.tv_nsec - y->tv_nsec;
+}
+
+static int
+bny_timers_to_nvl(struct bunyan_timers *tms, nvlist_t *nvl)
+{
+	struct timer_block *b;
+	size_t idx;
+	uint64_t usec;
+	int rv;
+
+	for (b = tms->bt_first; b != NULL; b = b->tb_next) {
+		for (idx = 0; idx < b->tb_pos; ++idx) {
+			usec = b->tb_timers[idx].tv_nsec / 1000;
+			usec += b->tb_timers[idx].tv_sec * 1000000;
+			if ((rv = nvlist_add_uint64(nvl,
+			    b->tb_names[idx], usec))) {
+				return (rv);
+			}
+		}
+	}
+	return (0);
+}
+
+struct bunyan_timers *
+bny_timers_new(void)
+{
+	struct bunyan_timers *tms;
+	tms = calloc(1, sizeof (struct bunyan_timers));
+	if (tms == NULL)
+		return (NULL);
+	tms->bt_first = calloc(1, sizeof (struct timer_block));
+	if (tms->bt_first == NULL) {
+		free(tms);
+		return (NULL);
+	}
+	tms->bt_last = tms->bt_first;
+	return (tms);
+}
+
+int
+bny_timer_begin(struct bunyan_timers *tms)
+{
+	if (clock_gettime(CLOCK_MONOTONIC, &tms->bt_current))
+		return (errno);
+	return (0);
+}
+
+int
+bny_timer_next(struct bunyan_timers *tms, const char *name)
+{
+	struct timespec now;
+	size_t idx;
+	struct timer_block *b;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now))
+		return (errno);
+	b = tms->bt_last;
+	b->tb_names[b->tb_pos] = name;
+	tspec_subtract(&b->tb_timers[b->tb_pos], &now, &tms->bt_current);
+	if (++b->tb_pos >= TBLOCK_N) {
+		b = calloc(1, sizeof (struct timer_block));
+		if (b == NULL) {
+			tms->bt_last->tb_pos--;
+			return (ENOMEM);
+		}
+		tms->bt_last->tb_next = b;
+		tms->bt_last = b;
+		if (clock_gettime(CLOCK_MONOTONIC, &tms->bt_current))
+			return (errno);
+	} else {
+		bcopy(&now, &tms->bt_current, sizeof (struct timespec));
+	}
+	return (0);
+}
+
+void
+bny_timers_free(struct bunyan_timers *tms)
+{
+	struct timer_block *b, *nb;
+	for (b = tms->bt_first; b != NULL; b = nb) {
+		nb = b->tb_next;
+		free(b);
+	}
+	free(tms);
+}
+
 void
 bunyan_init(void)
 {
@@ -44,12 +159,12 @@ bunyan_init(void)
 	assert(bunyan_shmem != NULL);
 	bzero(bunyan_shmem, sizeof (mutex_t));
 	bunyan_wrmutex = (mutex_t *)bunyan_shmem;
-	assert(mutex_init(bunyan_wrmutex, USYNC_PROCESS | LOCK_ERRORCHECK,
-	    NULL) == 0);
-	assert(mutex_init(&bunyan_bmutex, USYNC_THREAD | LOCK_ERRORCHECK,
-	    NULL) == 0);
-	assert(nvlist_alloc(&bunyan_base, NV_UNIQUE_NAME, 0) == 0);
-	assert(nvlist_add_int32(bunyan_base, "v", 1) == 0);
+	VERIFY0(mutex_init(bunyan_wrmutex, USYNC_PROCESS | LOCK_ERRORCHECK,
+	    NULL));
+	VERIFY0(mutex_init(&bunyan_bmutex, USYNC_THREAD | LOCK_ERRORCHECK,
+	    NULL));
+	VERIFY0(nvlist_alloc(&bunyan_base, NV_UNIQUE_NAME, 0));
+	VERIFY0(nvlist_add_int32(bunyan_base, "v", 1));
 }
 
 void
@@ -63,7 +178,7 @@ bunyan_get_hostname(void)
 {
 	char *buf = calloc(1, MAXHOSTNAMELEN);
 	assert(buf != NULL);
-	assert(gethostname(buf, MAXHOSTNAMELEN) == 0);
+	VERIFY0(gethostname(buf, MAXHOSTNAMELEN));
 	if (bunyan_hostname != NULL)
 		free(bunyan_hostname);
 	bunyan_hostname = buf;
@@ -75,7 +190,7 @@ bunyan_timestamp(char *buffer, size_t len)
 	struct timespec ts;
 	struct tm *info;
 
-	assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+	VERIFY0(clock_gettime(CLOCK_REALTIME, &ts));
 	info = gmtime(&ts.tv_sec);
 	assert(info != NULL);
 
@@ -102,19 +217,19 @@ bunyan_set(const char *name1, enum bunyan_arg_type typ1, ...)
 		case BNY_STRING:
 			strval = va_arg(ap, const char *);
 			mutex_enter(&bunyan_bmutex);
-			assert(nvlist_add_string(nvl, propname, strval) == 0);
+			VERIFY0(nvlist_add_string(nvl, propname, strval));
 			mutex_exit(&bunyan_bmutex);
 			break;
 		case BNY_INT:
 			intval = va_arg(ap, int);
 			mutex_enter(&bunyan_bmutex);
-			assert(nvlist_add_int32(nvl, propname, intval) == 0);
+			VERIFY0(nvlist_add_int32(nvl, propname, intval));
 			mutex_exit(&bunyan_bmutex);
 			break;
 		case BNY_NVLIST:
 			nvlval = va_arg(ap, nvlist_t *);
 			mutex_enter(&bunyan_bmutex);
-			assert(nvlist_add_nvlist(nvl, propname, nvlval) == 0);
+			VERIFY0(nvlist_add_nvlist(nvl, propname, nvlval));
 			mutex_exit(&bunyan_bmutex);
 			break;
 		}
@@ -131,32 +246,34 @@ bunyan_set(const char *name1, enum bunyan_arg_type typ1, ...)
 void
 bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 {
-	nvlist_t *nvl;
+	nvlist_t *nvl, *nnvl;
 	char time[128];
 	va_list ap;
 	const char *propname;
 	enum bunyan_arg_type typ;
 
 	mutex_enter(&bunyan_bmutex);
-	assert(nvlist_dup(bunyan_base, &nvl, 0) == 0);
+	VERIFY0(nvlist_dup(bunyan_base, &nvl, 0));
 	mutex_exit(&bunyan_bmutex);
-	assert(nvlist_add_int32(nvl, "level", level) == 0);
-	assert(nvlist_add_string(nvl, "name", bunyan_name) == 0);
+	VERIFY0(nvlist_add_int32(nvl, "level", level));
+	VERIFY0(nvlist_add_string(nvl, "name", bunyan_name));
 	if (bunyan_hostname == NULL)
 		bunyan_get_hostname();
-	assert(nvlist_add_string(nvl, "hostname", bunyan_hostname) == 0);
-	assert(nvlist_add_int32(nvl, "pid", getpid()) == 0);
+	VERIFY0(nvlist_add_string(nvl, "hostname", bunyan_hostname));
+	VERIFY0(nvlist_add_int32(nvl, "pid", getpid()));
 
 	bunyan_timestamp(time, sizeof (time));
-	assert(nvlist_add_string(nvl, "time", time) == 0);
+	VERIFY0(nvlist_add_string(nvl, "time", time));
 
-	assert(nvlist_add_string(nvl, "msg", msg) == 0);
+	VERIFY0(nvlist_add_string(nvl, "msg", msg));
 
 	va_start(ap, msg);
 	while (1) {
 		const char *strval;
 		int intval;
+		size_t szval;
 		nvlist_t *nvlval;
+		struct bunyan_timers *tsval;
 
 		propname = va_arg(ap, const char *);
 		if (propname == NULL)
@@ -167,16 +284,24 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 		switch (typ) {
 		case BNY_STRING:
 			strval = va_arg(ap, const char *);
-			assert(nvlist_add_string(nvl, propname, strval) == 0);
+			VERIFY0(nvlist_add_string(nvl, propname, strval));
 			break;
 		case BNY_INT:
 			intval = va_arg(ap, int);
-			assert(nvlist_add_int32(nvl, propname, intval) == 0);
+			VERIFY0(nvlist_add_int32(nvl, propname, intval));
 			break;
 		case BNY_NVLIST:
 			nvlval = va_arg(ap, nvlist_t *);
-			assert(nvlist_add_nvlist(nvl, propname, nvlval) == 0);
+			VERIFY0(nvlist_add_nvlist(nvl, propname, nvlval));
 			break;
+		case BNY_TIMERS:
+			tsval = va_arg(ap, struct bunyan_timers *);
+			VERIFY0(nvlist_alloc(&nnvl, NV_UNIQUE_NAME, 0));
+			VERIFY0(bny_timers_to_nvl(tsval, nnvl));
+			VERIFY0(nvlist_add_nvlist(nvl, propname, nnvl));
+			break;
+		default:
+			assert(0);
 		}
 	}
 	va_end(ap);

@@ -218,6 +218,8 @@ static int
 lock_key(struct token_slot *slot)
 {
 	explicit_bzero(slot->ts_data, slot->ts_datasize);
+	bunyan_log(DEBUG, "locked key",
+	    "keyname", BNY_STRING, slot->ts_name, NULL);
 	return (0);
 }
 
@@ -238,13 +240,22 @@ unlock_key(struct token_slot *slot)
 	char *ciphername;
 	uint32_t serial;
 	uint8_t slotn;
+	struct bunyan_timers *tms;
+
+	tms = bny_timers_new();
+	VERIFY3P(tms, !=, NULL);
+	VERIFY0(bny_timer_begin(tms));
 
 	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
 	assert(rv == SCARD_S_SUCCESS);
 
+	VERIFY0(bny_timer_next(tms, "scard_establish"));
+
 	ykb = ykc_find(ctx);
 	assert(ykb != NULL);
 	yk = ykb;
+
+	VERIFY0(bny_timer_next(tms, "find_yubikeys"));
 
 	VERIFY0(nvlist_lookup_uint32(nv, "yk_serial", &serial));
 	VERIFY0(nvlist_lookup_uint8(nv, "yk_slot", &slotn));
@@ -284,6 +295,8 @@ unlock_key(struct token_slot *slot)
 	if (keylen < keysz)
 		key = expand_key_and_replace(key, keylen, keysz);
 
+	VERIFY0(bny_timer_next(tms, "hmac_kd"));
+
 	VERIFY0(nvlist_lookup_byte_array(nv, "encdata", &encdata, &enclen));
 
 	VERIFY0(cipher_init(&cctx, cipher, key, keysz, iv, ivlen, 0));
@@ -296,6 +309,8 @@ unlock_key(struct token_slot *slot)
 	explicit_bzero(key, keysz);
 	free(key);
 
+	VERIFY0(bny_timer_next(tms, "decrypt"));
+
 	buf = sshbuf_from((const void *)slot->ts_data->tsd_data,
 	    slot->ts_data->tsd_len);
 	VERIFY3P(buf, !=, NULL);
@@ -303,6 +318,13 @@ unlock_key(struct token_slot *slot)
 	VERIFY3S(sshkey_equal_public(pkey, slot->ts_public), ==, 1);
 	sshkey_free(pkey);
 	sshbuf_free(buf);
+
+	VERIFY0(bny_timer_next(tms, "verify"));
+
+	bunyan_log(DEBUG, "unlocked key",
+	    "keyname", BNY_STRING, slot->ts_name,
+	    "timers", BNY_TIMERS, tms, NULL);
+	bny_timers_free(tms);
 
 	return (0);
 }

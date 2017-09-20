@@ -72,7 +72,8 @@
 #define	SSH_AGENT_RSA_SHA2_512			0x04
 
 enum port_events {
-	EVENT_WANT_UNLOCK = 1
+	EVENT_WANT_UNLOCK = 1,
+	EVENT_WANT_LOCK
 };
 
 struct client_state {
@@ -87,11 +88,19 @@ struct client_state {
 	struct client_state *cs_prev;
 };
 
+enum as_state {
+	AS_UNLOCKED,
+	AS_LOCKING,
+	AS_LOCKED,
+	AS_UNLOCKING
+};
 struct agent_slot {
 	mutex_t as_mtx;
 	uint8_t as_cookie;
-	boolean_t as_unlocked;
-	cond_t as_unlock;
+	enum as_state as_state;
+	cond_t as_stchg;
+	struct timespec as_lastused;
+	size_t as_ref;
 };
 
 static int mport;
@@ -103,6 +112,9 @@ static int clport;
 
 #define	N_THREADS	8
 static thread_t reactor_threads[N_THREADS];
+
+extern void tspec_subtract(struct timespec *result, const struct timespec *x,
+    const struct timespec *y);
 
 static void
 close_client(struct client_state *cl)
@@ -199,17 +211,21 @@ process_sign_request(struct client_state *cl)
 
 	a = slot->ts_agent;
 	mutex_enter(&a->as_mtx);
-	if (!a->as_unlocked && a->as_cookie == 0) {
-		a->as_cookie = (++last_cookie);
-		VERIFY0(port_send(mport, EVENT_WANT_UNLOCK, slot));
-	}
-	if (!a->as_unlocked) {
+	++a->as_ref;
+	VERIFY0(clock_gettime(CLOCK_MONOTONIC, &a->as_lastused));
+	while (a->as_state != AS_UNLOCKED) {
+		if (a->as_state == AS_LOCKED) {
+			a->as_cookie = (++last_cookie);
+			a->as_state = AS_UNLOCKING;
+			VERIFY0(port_send(mport, EVENT_WANT_UNLOCK, slot));
+			VERIFY0(cond_broadcast(&a->as_stchg));
+		}
 		do {
-			rv = cond_wait(&a->as_unlock, &a->as_mtx);
+			rv = cond_wait(&a->as_stchg, &a->as_mtx);
 		} while (rv == EINTR);
 		VERIFY0(rv);
 	}
-	VERIFY3U(a->as_unlocked, ==, B_TRUE);
+	VERIFY3U(a->as_state, ==, AS_UNLOCKED);
 	VERIFY3U(slot->ts_data->tsd_len, >, 0);
 	mutex_exit(&a->as_mtx);
 
@@ -218,6 +234,10 @@ process_sign_request(struct client_state *cl)
 	VERIFY3P(kbuf, !=, NULL);
 	VERIFY0(sshkey_private_deserialize(kbuf, &privkey));
 	sshbuf_free(kbuf);
+
+	mutex_enter(&a->as_mtx);
+	--a->as_ref;
+	mutex_exit(&a->as_mtx);
 
 	if (privkey->type == KEY_RSA) {
 		if (flags & SSH_AGENT_RSA_SHA2_256)
@@ -395,6 +415,7 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	zoneid_t theirzid;
 	struct token_slot *slot;
 	struct agent_slot *as;
+	struct timespec tout, now, delta;
 
 	bunyan_set_name("agent");
 
@@ -407,6 +428,9 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	clport = port_create();
 	assert(clport > 0);
 
+	bzero(&tout, sizeof (tout));
+	tout.tv_sec = 2;
+
 	VERIFY0(mutex_init(&clients_mtx, USYNC_THREAD | LOCK_ERRORCHECK,
 	    NULL));
 
@@ -415,7 +439,8 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 		VERIFY3P(slot->ts_agent, !=, NULL);
 		VERIFY0(mutex_init(&slot->ts_agent->as_mtx,
 		    USYNC_THREAD | LOCK_ERRORCHECK, NULL));
-		VERIFY0(cond_init(&slot->ts_agent->as_unlock, USYNC_THREAD, 0));
+		VERIFY0(cond_init(&slot->ts_agent->as_stchg, USYNC_THREAD, 0));
+		slot->ts_agent->as_state = AS_LOCKED;
 	}
 
 	for (i = 0; i < N_THREADS; ++i) {
@@ -429,9 +454,11 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
 
 	while (1) {
-		rv = port_get(portfd, &ev, NULL);
+		rv = port_get(portfd, &ev, &tout);
 		if (rv == -1 && errno == EINTR) {
 			continue;
+		} else if (rv == -1 && errno == ETIME) {
+			goto checklock;
 		} else {
 			VERIFY0(rv);
 		}
@@ -441,6 +468,16 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 				bzero(&cmd, sizeof (cmd));
 				slot = (struct token_slot *)ev.portev_user;
 				cmd.cc_type = CMD_UNLOCK_KEY;
+				mutex_enter(&slot->ts_agent->as_mtx);
+				cmd.cc_cookie = slot->ts_agent->as_cookie;
+				mutex_exit(&slot->ts_agent->as_mtx);
+				cmd.cc_p1 = slot->ts_id;
+				write_cmd(ctlfd, &cmd);
+				break;
+			case EVENT_WANT_LOCK:
+				bzero(&cmd, sizeof (cmd));
+				slot = (struct token_slot *)ev.portev_user;
+				cmd.cc_type = CMD_LOCK_KEY;
 				mutex_enter(&slot->ts_agent->as_mtx);
 				cmd.cc_cookie = slot->ts_agent->as_cookie;
 				mutex_exit(&slot->ts_agent->as_mtx);
@@ -461,12 +498,23 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 					as = slot->ts_agent;
 					mutex_enter(&as->as_mtx);
 					if (as->as_cookie == cmd.cc_cookie) {
-						VERIFY3U(slot->ts_data->tsd_len,
-						    >, 0);
 						as->as_cookie = 0;
-						as->as_unlocked = B_TRUE;
+						VERIFY3U(cmd.cc_p1, ==,
+						    STATUS_OK);
+						switch (as->as_state) {
+						case AS_UNLOCKING:
+							as->as_state =
+							    AS_UNLOCKED;
+							break;
+						case AS_LOCKING:
+							as->as_state =
+							    AS_LOCKED;
+							break;
+						default:
+							assert(0);
+						}
 						VERIFY0(cond_broadcast(
-						    &as->as_unlock));
+						    &as->as_stchg));
 						mutex_exit(&as->as_mtx);
 						break;
 					}
@@ -535,6 +583,30 @@ rearmlisten:
 
 		} else {
 			assert(0);
+		}
+checklock:
+		VERIFY0(clock_gettime(CLOCK_MONOTONIC, &now));
+		for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
+			as = slot->ts_agent;
+			mutex_enter(&as->as_mtx);
+			if (as->as_state != AS_UNLOCKED || as->as_ref > 0) {
+				mutex_exit(&as->as_mtx);
+				continue;
+			}
+			tspec_subtract(&delta, &now, &as->as_lastused);
+			if (delta.tv_sec >= 5) {
+				bunyan_log(TRACE,
+				    "key has been idle, locking",
+				    "keyname", BNY_STRING, slot->ts_name,
+				    "idle_sec", BNY_INT, (int)delta.tv_sec,
+				    NULL);
+				as->as_cookie = (++last_cookie);
+				as->as_state = AS_LOCKING;
+				VERIFY0(port_send(mport, EVENT_WANT_LOCK,
+				    slot));
+				VERIFY0(cond_broadcast(&as->as_stchg));
+			}
+			mutex_exit(&as->as_mtx);
 		}
 	}
 }
