@@ -36,6 +36,37 @@
 #include "sshbuf.h"
 #include "sshkey.h"
 
+/*
+ * This is the "agent" process in the soft-token. It is forked off by the
+ * "supervisor" process and is responsible for listening for clients on the
+ * UNIX socket the supervisor bound inside the zone, dealing with clients, and
+ * performing crypto operations for the clients inside the zone.
+ *
+ * Key material is provided to the agent by the supervisor on an as-needed
+ * basis, by decrypting it and placing into shared pages. When the agent is
+ * done using the key material, the supervisor clears the pages again. We get
+ * the addresses of the allocated shared pages by looking in the "token_slots"
+ * global linked list, which the supervisor built up before forking to create
+ * us.
+ *
+ * The agent is multi-threaded in order to deal with multiple clients
+ * effectively. We start up a pool of threads (currently fixed size) that all
+ * loop in port_get() handling clients. Whichever thread finishes reading in
+ * an entire command from the client does the crypto operations associated with
+ * it, begins to write out the reply, and then returns to port_get().
+ *
+ * The other thing the supervisor provides us with after forking is one end of
+ * a pipe() that we use to communicate with it. We can send commands on the
+ * pipe to ask the supervisor to lock and unlock keys (and populate or zero the
+ * shared memory segments associated). We currently manage the use of this
+ * pipe through the main thread which also handles accept()ing new connections.
+ *
+ * The protocol we speak to clients of the UDS is the OpenSSH agent protocol.
+ * We re-use a lot of code from OpenSSH here, and you'll see similarities in the
+ * overall approach we take to dealing with data and crypto. "ssh-agent.c" is
+ * a good place to cross-reference to understand the protocol and operations.
+ */
+
 #define SSH_AGENTC_REQUEST_RSA_IDENTITIES	1
 #define SSH_AGENT_RSA_IDENTITIES_ANSWER		2
 #define SSH_AGENTC_RSA_CHALLENGE		3
