@@ -713,6 +713,11 @@ supervisor_main(zoneid_t zid, int ctlfd)
 
 	bunyan_set_name("supervisor");
 
+	/*
+	 * Early drop of privs before we fork our child or do any work.
+	 * We have to keep quite a bit of stuff here, but we can let go of
+	 * some of it later after we've forked.
+	 */
 	pset = priv_allocset();
 	assert(pset != NULL);
 
@@ -722,10 +727,11 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	VERIFY0(priv_delset(pset, PRIV_PROC_INFO));
 	VERIFY0(priv_delset(pset, PRIV_PROC_SESSION));
 	VERIFY0(priv_delset(pset, PRIV_FILE_LINK_ANY));
-
+	/* We need these for dealing with the socket and key files. */
 	VERIFY0(priv_addset(pset, PRIV_FILE_DAC_READ));
 	VERIFY0(priv_addset(pset, PRIV_FILE_DAC_WRITE));
 	VERIFY0(priv_addset(pset, PRIV_FILE_DAC_SEARCH));
+	/* Our child will need these to do mlockall() and drop privs. */
 	VERIFY0(priv_addset(pset, PRIV_PROC_LOCK_MEMORY));
 	VERIFY0(priv_addset(pset, PRIV_PROC_CHROOT));
 	VERIFY0(priv_addset(pset, PRIV_PROC_SETID));
@@ -741,6 +747,11 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	    "zoneid", BNY_INT, zid,
 	    "zonename", BNY_STRING, zonename, NULL);
 
+	/*
+	 * Lock all our memory into RAM so it can't be swapped out. We're
+	 * going to be doing crypto operations and dealing with key material,
+	 * so we don't want anything to be swappable.
+	 */
 	VERIFY0(mlockall(MCL_CURRENT | MCL_FUTURE));
 
 	/* Open the socket directory and make our listen socket. */
@@ -779,12 +790,17 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	}
 	VERIFY0(close(kidpipe[1]));
 
+	/*
+	 * Now that we've finished forking we can give up the privs we only
+	 * kept to give to our child.
+	 */
 	VERIFY0(priv_delset(pset, PRIV_PROC_FORK));
 	VERIFY0(priv_delset(pset, PRIV_PROC_LOCK_MEMORY));
 	VERIFY0(priv_delset(pset, PRIV_PROC_CHROOT));
 	VERIFY0(priv_delset(pset, PRIV_PROC_SETID));
 	/* We still need this for PCSCd */
 	/*VERIFY0(priv_delset(pset, PRIV_NET_ACCESS));*/
+
 	VERIFY0(setppriv(PRIV_SET, PRIV_PERMITTED, pset));
 	VERIFY0(setppriv(PRIV_SET, PRIV_EFFECTIVE, pset));
 	priv_freeset(pset);

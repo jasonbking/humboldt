@@ -444,16 +444,33 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 
 	bunyan_set_name("agent");
 
+	/*
+	 * Lock all our memory into RAM so it can't be swapped out. We're
+	 * going to be doing crypto operations and dealing with key material,
+	 * so we don't want anything to be swappable.
+	 */
 	VERIFY0(mlockall(MCL_CURRENT | MCL_FUTURE));
 
+	/* Start listening on our UNIX socket inside the zone. */
 	VERIFY0(listen(listensock, 10));
 
+	/*
+	 * We use this port for events on this thread, including new clients
+	 * we need to accept(), messages from parent processes, and requests
+	 * to communicate with the parent (e.g. asking it to unlock a key).
+	 */
 	portfd = port_create();
 	assert(portfd > 0);
 	mport = portfd;
 
+	/*
+	 * This port is for client connections. We'll create a thread pool
+	 * shortly that loops in port_get() on it.
+	 */
 	clport = port_create();
 	assert(clport > 0);
+
+	/* Now that we've made our ports and are listening, drop privs. */
 
 	(void) mkdir(TOKEN_CHROOT_DIR, 0700);
 	VERIFY0(chroot(TOKEN_CHROOT_DIR));
@@ -465,8 +482,11 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	pset = priv_allocset();
 	assert(pset != NULL);
 
+	/*
+	 * We drop everything we can here; we don't need to open any new
+	 * sockets or files in this process from now on.
+	 */
 	priv_basicset(pset);
-
 	VERIFY0(priv_delset(pset, PRIV_PROC_EXEC));
 	VERIFY0(priv_delset(pset, PRIV_PROC_INFO));
 	VERIFY0(priv_delset(pset, PRIV_PROC_FORK));
@@ -481,12 +501,14 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 
 	priv_freeset(pset);
 
-	bzero(&tout, sizeof (tout));
-	tout.tv_sec = 2;
-
+	/*
+	 * This protects the list of client state structs (one per incoming UDS
+	 * connection from inside the zone).
+	 */
 	VERIFY0(mutex_init(&clients_mtx, USYNC_THREAD | LOCK_ERRORCHECK,
 	    NULL));
 
+	/* Finish setting up our key slots. */
 	for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
 		/*
 		 * Set all the shared pages to PROT_NONE until we unlock the
@@ -506,10 +528,18 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 		slot->ts_agent->as_state = AS_LOCKED;
 	}
 
+	/*
+	 * Open up our worker thread pool. These will sit in port_get() on the
+	 * clport event port we created above, waiting for client work to do.
+	 */
 	for (i = 0; i < N_THREADS; ++i) {
 		VERIFY0(thr_create(NULL, 0, client_reactor, NULL, 0,
 		    &reactor_threads[i]));
 	}
+
+	/* Timeout for port_get() */
+	bzero(&tout, sizeof (tout));
+	tout.tv_sec = 2;
 
 	VERIFY0(port_associate(portfd,
 	    PORT_SOURCE_FD, listensock, POLLIN, NULL));
