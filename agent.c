@@ -27,6 +27,7 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/debug.h>
+#include <sys/param.h>
 #include <dirent.h>
 #include <port.h>
 
@@ -211,8 +212,27 @@ process_sign_request(struct client_state *cl)
 
 	a = slot->ts_agent;
 	mutex_enter(&a->as_mtx);
-	++a->as_ref;
+
+	/*
+	 * The shared pages are mapped PROT_NONE on our side until the data is
+	 * in use. While the refcount > 0, we change it to PROT_READ. Whichever
+	 * thread is responsible for decrementing the refcnt to 0 changes it
+	 * back to PROT_NONE.
+	 *
+	 * This way while the key material is waiting to be re-locked (during
+	 * the 5-sec timeout period), it's not trivially readable in this
+	 * process.
+	 */
+	if (++a->as_ref == 1) {
+		VERIFY0(mprotect(slot->ts_data, slot->ts_datasize, PROT_READ));
+	}
+
 	VERIFY0(clock_gettime(CLOCK_MONOTONIC, &a->as_lastused));
+
+	/*
+	 * Wait until the key is unlocked. Send the message to the main thread
+	 * to request the unlock if necessary.
+	 */
 	while (a->as_state != AS_UNLOCKED) {
 		if (a->as_state == AS_LOCKED) {
 			a->as_cookie = (++last_cookie);
@@ -227,6 +247,7 @@ process_sign_request(struct client_state *cl)
 	}
 	VERIFY3U(a->as_state, ==, AS_UNLOCKED);
 	VERIFY3U(slot->ts_data->tsd_len, >, 0);
+
 	mutex_exit(&a->as_mtx);
 
 	kbuf = sshbuf_from((const void *)slot->ts_data->tsd_data,
@@ -235,8 +256,11 @@ process_sign_request(struct client_state *cl)
 	VERIFY0(sshkey_private_deserialize(kbuf, &privkey));
 	sshbuf_free(kbuf);
 
+	/* We're done with the shared memory now, so we can release it. */
 	mutex_enter(&a->as_mtx);
-	--a->as_ref;
+	if (--a->as_ref == 0) {
+		VERIFY0(mprotect(slot->ts_data, slot->ts_datasize, PROT_NONE));
+	}
 	mutex_exit(&a->as_mtx);
 
 	if (privkey->type == KEY_RSA) {
@@ -416,8 +440,11 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	struct token_slot *slot;
 	struct agent_slot *as;
 	struct timespec tout, now, delta;
+	priv_set_t *pset;
 
 	bunyan_set_name("agent");
+
+	VERIFY0(mlockall(MCL_CURRENT | MCL_FUTURE));
 
 	VERIFY0(listen(listensock, 10));
 
@@ -428,6 +455,32 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	clport = port_create();
 	assert(clport > 0);
 
+	(void) mkdir(TOKEN_CHROOT_DIR, 0700);
+	VERIFY0(chroot(TOKEN_CHROOT_DIR));
+
+	VERIFY0(setgroups(0, NULL));
+	VERIFY0(setgid(GID_NOBODY));
+	VERIFY0(seteuid(UID_NOBODY));
+
+	pset = priv_allocset();
+	assert(pset != NULL);
+
+	priv_basicset(pset);
+
+	VERIFY0(priv_delset(pset, PRIV_PROC_EXEC));
+	VERIFY0(priv_delset(pset, PRIV_PROC_INFO));
+	VERIFY0(priv_delset(pset, PRIV_PROC_FORK));
+	VERIFY0(priv_delset(pset, PRIV_PROC_SESSION));
+	VERIFY0(priv_delset(pset, PRIV_FILE_LINK_ANY));
+	VERIFY0(priv_delset(pset, PRIV_FILE_READ));
+	VERIFY0(priv_delset(pset, PRIV_FILE_WRITE));
+	VERIFY0(priv_delset(pset, PRIV_NET_ACCESS));
+
+	VERIFY0(setppriv(PRIV_SET, PRIV_PERMITTED, pset));
+	VERIFY0(setppriv(PRIV_SET, PRIV_EFFECTIVE, pset));
+
+	priv_freeset(pset);
+
 	bzero(&tout, sizeof (tout));
 	tout.tv_sec = 2;
 
@@ -435,6 +488,16 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	    NULL));
 
 	for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
+		/*
+		 * Set all the shared pages to PROT_NONE until we unlock the
+		 * keys.
+		 */
+		VERIFY0(mprotect(slot->ts_data, slot->ts_datasize, PROT_NONE));
+
+		/*
+		 * Allocate the local agent-side state about each key and
+		 * initialise it.
+		 */
 		slot->ts_agent = calloc(1, sizeof (struct agent_slot));
 		VERIFY3P(slot->ts_agent, !=, NULL);
 		VERIFY0(mutex_init(&slot->ts_agent->as_mtx,
@@ -463,6 +526,7 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 			VERIFY0(rv);
 		}
 		if (ev.portev_source == PORT_SOURCE_USER) {
+			/* Commands coming from other threads */
 			switch (ev.portev_events) {
 			case EVENT_WANT_UNLOCK:
 				bzero(&cmd, sizeof (cmd));
@@ -489,39 +553,52 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 			}
 
 		} else if (ev.portev_object == ctlfd) {
+			/*
+			 * Commands (or responses) coming from the parent (the
+			 * soft-token supervisor)
+			 */
 			read_cmd(ctlfd, &cmd);
 			cmdtype = cmd.cc_type;
 			switch (cmdtype) {
 			case CMD_STATUS:
+				/*
+				 * A response to a previous command. This is
+				 * either a resonse to a LOCK or an UNLOCK
+				 * command, so find the slot it was for.
+				 */
+				as = NULL;
 				for (slot = token_slots; slot != NULL;
 				    slot = slot->ts_next) {
 					as = slot->ts_agent;
 					mutex_enter(&as->as_mtx);
 					if (as->as_cookie == cmd.cc_cookie) {
-						as->as_cookie = 0;
-						VERIFY3U(cmd.cc_p1, ==,
-						    STATUS_OK);
-						switch (as->as_state) {
-						case AS_UNLOCKING:
-							as->as_state =
-							    AS_UNLOCKED;
-							break;
-						case AS_LOCKING:
-							as->as_state =
-							    AS_LOCKED;
-							break;
-						default:
-							assert(0);
-						}
-						VERIFY0(cond_broadcast(
-						    &as->as_stchg));
-						mutex_exit(&as->as_mtx);
+						/* NOTE: no mutex_exit */
 						break;
 					}
 					mutex_exit(&as->as_mtx);
 				}
+				if (as != NULL) {
+					as->as_cookie = 0;
+					VERIFY3U(cmd.cc_p1, ==, STATUS_OK);
+					switch (as->as_state) {
+					case AS_UNLOCKING:
+						as->as_state = AS_UNLOCKED;
+						break;
+					case AS_LOCKING:
+						as->as_state = AS_LOCKED;
+						break;
+					default:
+						assert(0);
+					}
+					VERIFY0(cond_broadcast(&as->as_stchg));
+					mutex_exit(&as->as_mtx);
+				}
 				break;
 			case CMD_SHUTDOWN:
+				/*
+				 * Parent is asking us to wind up and stop
+				 * operation.
+				 */
 				break;
 			default:
 				bunyan_log(ERROR,
@@ -533,6 +610,7 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
 
 		} else if (ev.portev_object == listensock) {
+			/* A new connection has arrived. */
 			raddrlen = sizeof (raddr);
 			bzero(&raddr, sizeof (raddr));
 			sockfd = accept(listensock, (struct sockaddr *)&raddr,
@@ -584,6 +662,15 @@ rearmlisten:
 		} else {
 			assert(0);
 		}
+
+		/*
+		 * After each event we handle (or every 1sec), we want to check
+		 * through all the unlocked keys and see if any have been
+		 * unused for >=5sec.
+		 *
+		 * If they're an idle key, we should lock them so they're no
+		 * longer present in memory.
+		 */
 checklock:
 		VERIFY0(clock_gettime(CLOCK_MONOTONIC, &now));
 		for (slot = token_slots; slot != NULL; slot = slot->ts_next) {

@@ -14,6 +14,11 @@
 #include <libnvpair.h>
 #include "sshkey.h"
 
+#define	TOKEN_CHROOT_DIR	"/var/run/softtokend"
+#define	TOKEN_SOCKET_DIR	"/var/zonecontrol/%s"
+#define	TOKEN_SOCKET_PATH	TOKEN_SOCKET_DIR "/token.sock"
+#define	TOKEN_KEYS_DIR		"/zones/%s/keys"
+
 enum slot_type {
 	SLOT_ASYM_AUTH = 0x01,
 	SLOT_ASYM_CERT_SIGN = 0x02,

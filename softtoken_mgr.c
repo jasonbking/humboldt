@@ -146,17 +146,33 @@ sigchld_handler(int signo)
 	pid_t kid;
 	int kid_status;
 	struct zone_state *zsp = NULL, *zs;
+	zoneid_t zid;
 
 	while ((kid = waitpid((pid_t)0, &kid_status, WNOHANG)) > 0) {
 		mutex_enter(&zonest_mutex);
 		for (zs = zonest; zs != NULL; zsp = zs, zs = zs->zs_next) {
 			if (zs->zs_child == kid) {
+				zid = zs->zs_id;
+				bunyan_log(WARN,
+				    "per-zone child died unexpectedly",
+				    "zoneid", BNY_INT, (int)zid,
+				    "pid", BNY_INT, (int)kid,
+				    NULL);
 				zsp->zs_next = zs->zs_next;
+				VERIFY0(close(zs->zs_pipe[0]));
+				free(zs);
+				add_zone_unlocked(zid);
 				break;
 			}
 		}
 		mutex_exit(&zonest_mutex);
 	}
+}
+
+const char *
+_umem_debug_init()
+{
+	return ("guards");
 }
 
 int
