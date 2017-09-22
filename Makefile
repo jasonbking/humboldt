@@ -83,9 +83,12 @@ TOKEN_DEPS=		pcsclite64 libressl
 
 TOKEN_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
 			-I$(DEPS)/libressl/include/ \
-			-fstack-protector-all $(BASE_CFLAGS) $(CFLAGS64)
+			-fstack-protector-all \
+			-D_REENTRANT \
+			$(BASE_CFLAGS) $(CFLAGS64)
 TOKEN_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
-			-Wl,-z -Wl,aslr
+			-Wl,-z -Wl,aslr \
+			-D_REENTRANT
 TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket -lpcsclite -lssp \
 			-lumem -lrename \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a

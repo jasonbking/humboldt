@@ -567,45 +567,6 @@ again:
 	}
 }
 
-void
-read_cmd(int fd, struct ctl_cmd *cmd)
-{
-	size_t off = 0, rem = sizeof (*cmd);
-	int rv;
-	bzero(cmd, sizeof (*cmd));
-	do {
-		rv = read(fd, ((char *)cmd) + off, rem);
-		if (rv > 0) {
-			off += rv;
-			rem -= rv;
-		}
-	} while ((rv != -1 || errno == EINTR || errno == EAGAIN) && rem > 0);
-	bunyan_log(TRACE, "received cmd",
-	    "cookie", BNY_INT, cmd->cc_cookie,
-	    "type", BNY_INT, cmd->cc_type,
-	    "p1", BNY_INT, cmd->cc_p1,
-	    NULL);
-}
-
-void
-write_cmd(int fd, const struct ctl_cmd *cmd)
-{
-	size_t off = 0, rem = sizeof (*cmd);
-	int rv;
-	bunyan_log(TRACE, "sending cmd",
-	    "cookie", BNY_INT, cmd->cc_cookie,
-	    "type", BNY_INT, cmd->cc_type,
-	    "p1", BNY_INT, cmd->cc_p1,
-	    NULL);
-	do {
-		rv = write(fd, ((const char *)cmd) + off, rem);
-		if (rv > 0) {
-			off += rv;
-			rem -= rv;
-		}
-	} while ((rv != -1 || errno == EINTR || errno == EAGAIN) && rem > 0);
-}
-
 static void
 supervisor_loop(int ctlfd, int kidfd, int listensock)
 {
@@ -637,7 +598,7 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 			VERIFY0(rv);
 		}
 		if (ev.portev_object == ctlfd) {
-			read_cmd(ctlfd, &cmd);
+			VERIFY0(read_cmd(ctlfd, &cmd));
 			cmdtype = cmd.cc_type;
 			switch (cmdtype) {
 			case CMD_SHUTDOWN:
@@ -652,7 +613,7 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
 
 		} else if (ev.portev_object == kidfd) {
-			read_cmd(kidfd, &cmd);
+			VERIFY0(read_cmd(kidfd, &cmd));
 			cmdtype = cmd.cc_type;
 			switch (cmdtype) {
 			case CMD_UNLOCK_KEY:
@@ -672,7 +633,8 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 						rcmd.cc_cookie = cmd.cc_cookie;
 						rcmd.cc_type = CMD_STATUS;
 						rcmd.cc_p1 = STATUS_OK;
-						write_cmd(kidfd, &rcmd);
+						VERIFY0(write_cmd(kidfd,
+						    &rcmd));
 						break;
 					}
 				}
@@ -681,7 +643,7 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 				rcmd.cc_cookie = cmd.cc_cookie;
 				rcmd.cc_type = CMD_STATUS;
 				rcmd.cc_p1 = STATUS_ERROR;
-				write_cmd(kidfd, &rcmd);
+				VERIFY0(write_cmd(kidfd, &rcmd));
 				break;
 			default:
 				bunyan_log(ERROR,

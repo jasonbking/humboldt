@@ -584,6 +584,9 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 		} else if (rv == -1 && errno == ETIME) {
 			goto checklock;
 		} else {
+			bunyan_log(ERROR, "port_get returned error",
+			    "errno", BNY_INT, errno,
+			    "strerror", BNY_STRING, strerror(errno), NULL);
 			VERIFY0(rv);
 		}
 		if (ev.portev_source == PORT_SOURCE_USER) {
@@ -597,7 +600,7 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 				cmd.cc_cookie = slot->ts_agent->as_cookie;
 				mutex_exit(&slot->ts_agent->as_mtx);
 				cmd.cc_p1 = slot->ts_id;
-				write_cmd(ctlfd, &cmd);
+				VERIFY0(write_cmd(ctlfd, &cmd));
 				break;
 			case EVENT_WANT_LOCK:
 				bzero(&cmd, sizeof (cmd));
@@ -607,7 +610,7 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 				cmd.cc_cookie = slot->ts_agent->as_cookie;
 				mutex_exit(&slot->ts_agent->as_mtx);
 				cmd.cc_p1 = slot->ts_id;
-				write_cmd(ctlfd, &cmd);
+				VERIFY0(write_cmd(ctlfd, &cmd));
 				break;
 			default:
 				VERIFY0(ev.portev_events);
@@ -618,7 +621,7 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 			 * Commands (or responses) coming from the parent (the
 			 * soft-token supervisor)
 			 */
-			read_cmd(ctlfd, &cmd);
+			VERIFY0(read_cmd(ctlfd, &cmd));
 			cmdtype = cmd.cc_type;
 			switch (cmdtype) {
 			case CMD_STATUS:

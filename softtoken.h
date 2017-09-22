@@ -44,7 +44,7 @@ enum ctl_cmd_type {
 
 enum ctl_cmd_status {
 	STATUS_OK = 0xc0,
-	STATUS_ERROR = 0xc1,
+	STATUS_ERROR = 0xc1
 };
 
 struct ctl_cmd {
@@ -77,7 +77,7 @@ extern struct token_slot *token_slots;
 void supervisor_main(zoneid_t zid, int ctlfd);
 void agent_main(zoneid_t zid, int listensock, int ctlfd);
 
-void read_cmd(int fd, struct ctl_cmd *cmd);
-void write_cmd(int fd, const struct ctl_cmd *cmd);
+int read_cmd(int fd, struct ctl_cmd *cmd);
+int write_cmd(int fd, const struct ctl_cmd *cmd);
 
 #endif

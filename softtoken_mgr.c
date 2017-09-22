@@ -35,6 +35,8 @@ struct zone_state {
 	struct zone_state *zs_next;
 	pid_t zs_child;
 	int zs_pipe[2];
+	uint8_t zs_cookie;
+	boolean_t zs_unwanted;
 };
 static struct zone_state *zonest = NULL;
 static mutex_t zonest_mutex;
@@ -73,6 +75,7 @@ add_zone_unlocked(zoneid_t id)
 	struct zone_state *zs = calloc(1, sizeof (struct zone_state));
 	VERIFY3P(zs, !=, NULL);
 	zs->zs_id = id;
+	zs->zs_unwanted = B_FALSE;
 	VERIFY0(pipe(zs->zs_pipe));
 
 	pid_t kid = fork();
@@ -111,6 +114,82 @@ check_add_zone(zoneid_t id)
 	mutex_exit(&zonest_mutex);
 }
 
+int
+read_cmd(int fd, struct ctl_cmd *cmd)
+{
+	size_t off = 0, rem = sizeof (*cmd);
+	int rv;
+	bzero(cmd, sizeof (*cmd));
+	do {
+		rv = read(fd, ((char *)cmd) + off, rem);
+		if (rv > 0) {
+			VERIFY3U(rv, <=, rem);
+			off += rv;
+			rem -= rv;
+		}
+	} while ((rv != -1 || errno == EINTR || errno == EAGAIN) && rem > 0);
+	if (rv == -1)
+		return (errno);
+	bunyan_log(TRACE, "received cmd",
+	    "cookie", BNY_INT, cmd->cc_cookie,
+	    "type", BNY_INT, cmd->cc_type,
+	    "p1", BNY_INT, cmd->cc_p1,
+	    NULL);
+	return (0);
+}
+
+int
+write_cmd(int fd, const struct ctl_cmd *cmd)
+{
+	size_t off = 0, rem = sizeof (*cmd);
+	int rv;
+	bunyan_log(TRACE, "sending cmd",
+	    "cookie", BNY_INT, cmd->cc_cookie,
+	    "type", BNY_INT, cmd->cc_type,
+	    "p1", BNY_INT, cmd->cc_p1,
+	    NULL);
+	do {
+		rv = write(fd, ((const char *)cmd) + off, rem);
+		if (rv > 0) {
+			VERIFY3U(rv, <=, rem);
+			off += rv;
+			rem -= rv;
+		}
+	} while ((rv != -1 || errno == EINTR || errno == EAGAIN) && rem > 0);
+	if (rv == -1)
+		return (errno);
+	return (0);
+}
+
+static void
+stop_zone(zoneid_t id)
+{
+	struct zone_state *zs;
+	struct ctl_cmd cmd;
+
+	if (id == GLOBAL_ZONEID)
+		return;
+
+	mutex_enter(&zonest_mutex);
+	for (zs = zonest; zs != NULL; zs = zs->zs_next) {
+		if (zs->zs_id == id) {
+			break;
+		}
+	}
+
+	if (zs != NULL) {
+		zs->zs_unwanted = B_TRUE;
+
+		bzero(&cmd, sizeof (cmd));
+		cmd.cc_cookie = (++zs->zs_cookie);
+		cmd.cc_type = CMD_SHUTDOWN;
+		VERIFY0(write_cmd(zs->zs_pipe[0], &cmd));
+		bunyan_log(DEBUG, "sending shutdown command to zone",
+		    "zoneid", BNY_INT, (int)id, NULL);
+	}
+	mutex_exit(&zonest_mutex);
+}
+
 static void
 add_all_zones(void)
 {
@@ -131,12 +210,24 @@ sysevc_handler(sysevent_t *ev, void *cookie)
 {
 	nvlist_t *nvl;
 	int zid;
+	char *nstate;
 
 	VERIFY0(sysevent_get_attr_list(ev, &nvl));
 	if (nvlist_lookup_int32(nvl, "zoneid", &zid) != 0)
 		return (0);
+	if (nvlist_lookup_string(nvl, "newstate", &nstate) != 0)
+		return (0);
 
-	check_add_zone(zid);
+	bunyan_log(TRACE, "got sysevent", "event", BNY_NVLIST, nvl, NULL);
+
+	if (strcmp(nstate, "initialized") == 0 ||
+	    strcmp(nstate, "ready") == 0) {
+		check_add_zone(zid);
+
+	} else if (strcmp(nstate, "shutting_down") == 0 ||
+	    strcmp(nstate, "uninitialized") == 0) {
+		stop_zone(zid);
+	}
 	return (0);
 }
 
@@ -160,8 +251,9 @@ sigchld_handler(int signo)
 				    NULL);
 				zsp->zs_next = zs->zs_next;
 				VERIFY0(close(zs->zs_pipe[0]));
+				if (!zs->zs_unwanted)
+					add_zone_unlocked(zid);
 				free(zs);
-				add_zone_unlocked(zid);
 				break;
 			}
 		}
