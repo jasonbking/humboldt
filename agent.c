@@ -584,9 +584,6 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 		} else if (rv == -1 && errno == ETIME) {
 			goto checklock;
 		} else {
-			bunyan_log(ERROR, "port_get returned error",
-			    "errno", BNY_INT, errno,
-			    "strerror", BNY_STRING, strerror(errno), NULL);
 			VERIFY0(rv);
 		}
 		if (ev.portev_source == PORT_SOURCE_USER) {
