@@ -67,6 +67,8 @@
 struct token_slot *token_slots = NULL;
 size_t slot_n = 0;
 
+static pid_t agent_pid;
+
 static inline char
 hex_digit(char nybble)
 {
@@ -579,6 +581,7 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 	enum ctl_cmd_type cmdtype;
 	int idx;
 	struct token_slot *ts;
+	pid_t w;
 
 	bzero(&to, sizeof (to));
 
@@ -602,6 +605,23 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 			cmdtype = cmd.cc_type;
 			switch (cmdtype) {
 			case CMD_SHUTDOWN:
+				bzero(&rcmd, sizeof (rcmd));
+				rcmd.cc_cookie = cmd.cc_cookie;
+				rcmd.cc_type = CMD_SHUTDOWN;
+				VERIFY0(write_cmd(kidfd, &rcmd));
+				do {
+					w = waitpid(agent_pid, &rv, 0);
+				} while (w == -1 && errno == EINTR);
+				for (ts = token_slots; ts != NULL;
+				    ts = ts->ts_next) {
+					(void) lock_key(ts);
+				}
+				bunyan_log(INFO, "agent child stopped",
+				    "exit_status", BNY_INT, WEXITSTATUS(rv),
+				    NULL);
+				assert(WIFEXITED(rv));
+				assert(WEXITSTATUS(rv) == 0);
+				exit(0);
 				break;
 			default:
 				bunyan_log(ERROR,
@@ -668,7 +688,6 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	struct sockaddr_un addr;
 	int listensock;
 	ssize_t len;
-	pid_t kid;
 	int kidpipe[2];
 	struct token_slot *slot;
 	priv_set_t *pset;
@@ -741,9 +760,9 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	VERIFY0(pipe(kidpipe));
 
 	/* And create the actual agent process. */
-	kid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
-	assert(kid != -1);
-	if (kid == 0) {
+	agent_pid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
+	assert(agent_pid != -1);
+	if (agent_pid == 0) {
 		VERIFY0(close(kidpipe[0]));
 		VERIFY0(close(ctlfd));
 		agent_main(zid, listensock, kidpipe[1]);

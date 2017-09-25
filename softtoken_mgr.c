@@ -127,9 +127,13 @@ read_cmd(int fd, struct ctl_cmd *cmd)
 			off += rv;
 			rem -= rv;
 		}
-	} while ((rv != -1 || errno == EINTR || errno == EAGAIN) && rem > 0);
+	} while (!(rv == 0 ||
+	    (rv == -1 && !(errno == EINTR || errno == EAGAIN)) ||
+	    rem <= 0));
 	if (rv == -1)
 		return (errno);
+	if (rv == 0)
+		return (ENOENT);
 	bunyan_log(TRACE, "received cmd",
 	    "cookie", BNY_INT, cmd->cc_cookie,
 	    "type", BNY_INT, cmd->cc_type,
@@ -180,12 +184,13 @@ stop_zone(zoneid_t id)
 	if (zs != NULL) {
 		zs->zs_unwanted = B_TRUE;
 
+		bunyan_log(DEBUG, "sending shutdown command to zone",
+		    "zoneid", BNY_INT, (int)id, NULL);
+
 		bzero(&cmd, sizeof (cmd));
 		cmd.cc_cookie = (++zs->zs_cookie);
 		cmd.cc_type = CMD_SHUTDOWN;
 		VERIFY0(write_cmd(zs->zs_pipe[0], &cmd));
-		bunyan_log(DEBUG, "sending shutdown command to zone",
-		    "zoneid", BNY_INT, (int)id, NULL);
 	}
 	mutex_exit(&zonest_mutex);
 }
@@ -218,8 +223,6 @@ sysevc_handler(sysevent_t *ev, void *cookie)
 	if (nvlist_lookup_string(nvl, "newstate", &nstate) != 0)
 		return (0);
 
-	bunyan_log(TRACE, "got sysevent", "event", BNY_NVLIST, nvl, NULL);
-
 	if (strcmp(nstate, "initialized") == 0 ||
 	    strcmp(nstate, "ready") == 0) {
 		check_add_zone(zid);
@@ -243,19 +246,34 @@ sigchld_handler(int signo)
 		mutex_enter(&zonest_mutex);
 		for (zs = zonest; zs != NULL; zsp = zs, zs = zs->zs_next) {
 			if (zs->zs_child == kid) {
-				zid = zs->zs_id;
+				break;
+			}
+		}
+		if (zs != NULL) {
+			zid = zs->zs_id;
+			bunyan_log(TRACE,
+			    "zone supervisor stopped",
+			    "zoneid", BNY_INT, (int)zid,
+			    "pid", BNY_INT, (int)kid,
+			    "exit_status", BNY_INT,
+			    (int)WEXITSTATUS(kid_status),
+			    NULL);
+			if (zsp != NULL) {
+				zsp->zs_next = zs->zs_next;
+			} else {
+				VERIFY3P(zonest, ==, zs);
+				zonest = zs->zs_next;
+			}
+			VERIFY0(close(zs->zs_pipe[0]));
+			if (!zs->zs_unwanted) {
 				bunyan_log(WARN,
-				    "per-zone child died unexpectedly",
+				    "restarting zone supervisor",
 				    "zoneid", BNY_INT, (int)zid,
 				    "pid", BNY_INT, (int)kid,
 				    NULL);
-				zsp->zs_next = zs->zs_next;
-				VERIFY0(close(zs->zs_pipe[0]));
-				if (!zs->zs_unwanted)
-					add_zone_unlocked(zid);
-				free(zs);
-				break;
+				add_zone_unlocked(zid);
 			}
+			free(zs);
 		}
 		mutex_exit(&zonest_mutex);
 	}

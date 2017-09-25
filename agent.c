@@ -105,7 +105,8 @@
 
 enum port_events {
 	EVENT_WANT_UNLOCK = 1,
-	EVENT_WANT_LOCK
+	EVENT_WANT_LOCK,
+	EVENT_STOP
 };
 
 struct client_state {
@@ -405,6 +406,14 @@ client_reactor(void *arg)
 			assert(rv == 0);
 		}
 
+		if (ev.portev_source == PORT_SOURCE_USER) {
+			if (ev.portev_events == EVENT_STOP) {
+				return (NULL);
+			}
+			VERIFY0(ev.portev_events);
+			continue;
+		}
+
 		cl = (struct client_state *)ev.portev_user;
 		assert(cl != NULL);
 		assert(cl->cs_fd == ev.portev_object);
@@ -452,6 +461,8 @@ rearm:
 		VERIFY0(port_associate(clport,
 		    PORT_SOURCE_FD, cl->cs_fd, cl->cs_events, cl));
 	}
+
+	return (NULL);
 }
 
 void
@@ -660,6 +671,16 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 				 * Parent is asking us to wind up and stop
 				 * operation.
 				 */
+				bunyan_log(TRACE, "posting stop events", NULL);
+				for (i = 0; i < N_THREADS; ++i) {
+					VERIFY0(port_send(clport,
+					    EVENT_STOP, NULL));
+				}
+				for (i = 0; i < N_THREADS; ++i) {
+					VERIFY0(thr_join(reactor_threads[i],
+					    NULL, NULL));
+				}
+				exit(0);
 				break;
 			default:
 				bunyan_log(ERROR,
