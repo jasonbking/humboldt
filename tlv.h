@@ -108,4 +108,10 @@ tlv_buf(const struct tlv_state *ts)
 	return (ts->ts_buf);
 }
 
+static inline uint8_t *
+tlv_ptr(const struct tlv_state *ts)
+{
+	return (&ts->ts_buf[ts->ts_offset]);
+}
+
 #endif

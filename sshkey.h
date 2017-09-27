@@ -179,6 +179,8 @@ int	sshkey_parse_private_fileblob(struct sshbuf *buffer,
 int	sshkey_parse_private_fileblob_type(struct sshbuf *blob, int type,
     const char *passphrase, struct sshkey **keyp, char **commentp);
 
+int	sshkey_from_evp_pkey(EVP_PKEY *pk, int type, struct sshkey **keyp);
+
 #ifdef SSHKEY_INTERNAL
 int ssh_rsa_sign(const struct sshkey *key,
     u_char **sigp, size_t *lenp, const u_char *data, size_t datalen,

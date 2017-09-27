@@ -877,6 +877,8 @@ sshkey_fingerprint_raw(const struct sshkey *k, int dgst_alg,
 	return r;
 }
 
+#undef b64_ntop
+
 static char *
 fingerprint_b64(const char *alg, u_char *dgst_raw, size_t dgst_raw_len)
 {
@@ -3653,6 +3655,72 @@ sshkey_parse_private_rsa1(struct sshbuf *blob, const char *passphrase,
 	return r;
 }
 #endif /* WITH_SSH1 */
+
+int
+sshkey_from_evp_pkey(EVP_PKEY *pk, int type, struct sshkey **keyp)
+{
+	struct sshkey *prv = NULL;
+	int r;
+
+	if (pk->type == EVP_PKEY_RSA &&
+	    (type == KEY_UNSPEC || type == KEY_RSA)) {
+		if ((prv = sshkey_new(KEY_UNSPEC)) == NULL) {
+			r = SSH_ERR_ALLOC_FAIL;
+			goto out;
+		}
+		prv->rsa = EVP_PKEY_get1_RSA(pk);
+		prv->type = KEY_RSA;
+#ifdef DEBUG_PK
+		RSA_print_fp(stderr, prv->rsa, 8);
+#endif
+		if (RSA_blinding_on(prv->rsa, NULL) != 1) {
+			r = SSH_ERR_LIBCRYPTO_ERROR;
+			goto out;
+		}
+	} else if (pk->type == EVP_PKEY_DSA &&
+	    (type == KEY_UNSPEC || type == KEY_DSA)) {
+		if ((prv = sshkey_new(KEY_UNSPEC)) == NULL) {
+			r = SSH_ERR_ALLOC_FAIL;
+			goto out;
+		}
+		prv->dsa = EVP_PKEY_get1_DSA(pk);
+		prv->type = KEY_DSA;
+#ifdef DEBUG_PK
+		DSA_print_fp(stderr, prv->dsa, 8);
+#endif
+	} else if (pk->type == EVP_PKEY_EC &&
+	    (type == KEY_UNSPEC || type == KEY_ECDSA)) {
+		if ((prv = sshkey_new(KEY_UNSPEC)) == NULL) {
+			r = SSH_ERR_ALLOC_FAIL;
+			goto out;
+		}
+		prv->ecdsa = EVP_PKEY_get1_EC_KEY(pk);
+		prv->type = KEY_ECDSA;
+		prv->ecdsa_nid = sshkey_ecdsa_key_to_nid(prv->ecdsa);
+		if (prv->ecdsa_nid == -1 ||
+		    sshkey_curve_nid_to_name(prv->ecdsa_nid) == NULL ||
+		    sshkey_ec_validate_public(EC_KEY_get0_group(prv->ecdsa),
+		    EC_KEY_get0_public_key(prv->ecdsa)) != 0) {
+			r = SSH_ERR_INVALID_FORMAT;
+			goto out;
+		}
+# ifdef DEBUG_PK
+		if (prv != NULL && prv->ecdsa != NULL)
+			sshkey_dump_ec_key(prv->ecdsa);
+# endif
+	} else {
+		r = SSH_ERR_INVALID_FORMAT;
+		goto out;
+	}
+	r = 0;
+	if (keyp != NULL) {
+		*keyp = prv;
+		prv = NULL;
+	}
+ out:
+	sshkey_free(prv);
+	return r;
+}
 
 static int
 sshkey_parse_private_pem_fileblob(struct sshbuf *blob, int type,

@@ -23,6 +23,11 @@
 #include <sys/errno.h>
 #include <strings.h>
 
+#include "sshkey.h"
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
 #include "tlv.h"
 
 boolean_t debug = B_FALSE;
@@ -125,6 +130,14 @@ struct apdu {
 	uint a_replylen;
 };
 
+struct pivcert {
+	struct pivcert *pc_next;
+	uint8_t pc_slot;
+	X509 *pc_x509;
+	const char *pc_subj;
+	struct sshkey *pc_pubkey;
+};
+
 struct pivkey {
 	struct pivkey *pk_next;
 	const char *pk_rdrname;
@@ -136,6 +149,8 @@ struct pivkey {
 	uint8_t pk_guid[16];
 	enum piv_alg pk_algs[32];
 	size_t pk_alg_count;
+
+	struct pivcert *pk_certs;
 };
 
 static void
@@ -231,76 +246,18 @@ transceive_apdu(struct pivkey *key, struct apdu *apdu)
 }
 
 static int
-piv_test_cert(struct pivkey *pk, uint slotid)
-{
-	int rv;
-	struct apdu *apdu;
-	struct tlv_state *tlv;
-
-	assert(pk->pk_intxn == B_TRUE);
-
-	tlv = tlv_init_write();
-	tlv_push(tlv, 0x5C);
-	switch (slotid) {
-	case 0x9A:
-		tlv_write_uint(tlv, PIV_TAG_CERT_9A);
-		break;
-	case 0x9C:
-		tlv_write_uint(tlv, PIV_TAG_CERT_9C);
-		break;
-	case 0x9D:
-		tlv_write_uint(tlv, PIV_TAG_CERT_9D);
-		break;
-	case 0x9E:
-		tlv_write_uint(tlv, PIV_TAG_CERT_9E);
-		break;
-	default:
-		assert(0);
-	}
-	tlv_pop(tlv);
-
-	apdu = make_apdu(CLA_ISO, INS_GET_DATA, 0x3F, 0xFF);
-	apdu->a_data = tlv_buf(tlv);
-	apdu->a_datalen = tlv_len(tlv);
-
-	rv = transceive_apdu(pk, apdu);
-	if (rv != 0) {
-		fprintf(stderr, "transceive_apdu(%s) failed: %d\n",
-		    pk->pk_rdrname, rv);
-		tlv_free(tlv);
-		free_apdu(apdu);
-		return (1);
-	}
-
-	tlv_free(tlv);
-
-	if (apdu->a_sw == SW_NO_ERROR ||
-	    (apdu->a_sw & 0xFF00) == SW_BYTES_REMAINING_00) {
-		rv = 0;
-	} else if (apdu->a_sw == SW_FILE_NOT_FOUND) {
-		rv = ENOENT;
-	} else {
-		if (debug == B_TRUE) {
-			fprintf(stderr, "card in %s returned sw = %04x to "
-			    "INS_GET_DATA\n", pk->pk_rdrname, apdu->a_sw);
-		}
-		rv = 1;
-	}
-
-	free_apdu(apdu);
-
-	return (rv);
-}
-
-static int
-piv_read_cert(struct pivkey *pk, uint slotid, char **dest, size_t *len)
+piv_read_cert(struct pivkey *pk, uint slotid)
 {
 	int rv;
 	struct apdu *apdu;
 	struct tlv_state *tlv;
 	uint tag, idx;
-	char *buf;
+	uint8_t *buf;
 	size_t bufptr = 0;
+	uint8_t *ptr;
+	X509 *cert;
+	struct pivcert *pc;
+	EVP_PKEY *pkey;
 
 	buf = calloc(1, MAX_APDU_SIZE);
 	assert(buf != NULL);
@@ -347,7 +304,7 @@ piv_read_cert(struct pivkey *pk, uint slotid, char **dest, size_t *len)
 		bcopy(apdu->a_reply, buf + bufptr, apdu->a_replylen);
 		bufptr += apdu->a_replylen;
 
-		apdu_free(apdu);
+		free_apdu(apdu);
 		apdu = make_apdu(CLA_ISO, INS_CONTINUE, 0, 0);
 		rv = transceive_apdu(pk, apdu);
 		if (rv != 0) {
@@ -370,15 +327,63 @@ piv_read_cert(struct pivkey *pk, uint slotid, char **dest, size_t *len)
 				fprintf(stderr, "card in %s returned tag "
 				    " to INS_GET_DATA\n", pk->pk_rdrname);
 			}
+			tlv_skip(tlv);
+			tlv_free(tlv);
 			free_apdu(apdu);
 			return (1);
 		}
-		*len = tlv_rem(tlv);
-		*dest = calloc(1, *len);
-		assert(*dest != NULL);
-		*len = tlv_read(tlv, *dest, 0, *len);
-		tlv_end(tlv);
+		while (!tlv_at_end(tlv)) {
+			tag = tlv_read_tag(tlv);
+			if (tag == 0x70)
+				break;
+			tlv_skip(tlv);
+		}
+		assert(tag == 0x70);
+
+		ptr = tlv_ptr(tlv);
+		cert = d2i_X509(NULL, &ptr, tlv_rem(tlv));
+		if (cert == NULL) {
+			char errbuf[128];
+			unsigned long err = ERR_peek_last_error();
+			ERR_load_crypto_strings();
+			ERR_error_string(err, errbuf);
+			fprintf(stderr, "openssl: %s\n", errbuf);
+			tlv_skip(tlv);
+			tlv_skip(tlv);
+			tlv_free(tlv);
+			free_apdu(apdu);
+			return (1);
+		}
+		assert(tlv_rem(tlv) == (ptr - tlv_ptr(tlv)));
+		tlv_skip(tlv);
+
+		tlv_skip(tlv);
 		tlv_free(tlv);
+
+		for (pc = pk->pk_certs; pc != NULL; pc = pc->pc_next) {
+			if (pc->pc_slot == slotid)
+				break;
+		}
+		if (pc == NULL) {
+			pc = calloc(1, sizeof (struct pivcert));
+			assert(pc != NULL);
+			pc->pc_next = pk->pk_certs;
+			pk->pk_certs = pc;
+		} else {
+			fprintf(stderr, "got existing slot, freeing data\n");
+			OPENSSL_free(pc->pc_subj);
+			X509_free(pc->pc_x509);
+			sshkey_free(pc->pc_pubkey);
+		}
+		pc->pc_slot = slotid;
+		pc->pc_x509 = cert;
+		pc->pc_subj = X509_NAME_oneline(
+		    X509_get_subject_name(cert), NULL, 0);
+		pkey = X509_get_pubkey(cert);
+		assert(pkey != NULL);
+		assert(sshkey_from_evp_pkey(pkey, KEY_UNSPEC,
+		    &pc->pc_pubkey) == 0);
+
 		rv = 0;
 	} else {
 		if (debug == B_TRUE) {
@@ -723,10 +728,21 @@ read_stdin(uint limit, uint *outlen)
 }
 
 static void
+read_all_certs(struct pivkey *pk)
+{
+	piv_read_cert(pk, 0x9A);
+	piv_read_cert(pk, 0x9C);
+	piv_read_cert(pk, 0x9D);
+	piv_read_cert(pk, 0x9E);
+}
+
+static void
 cmd_list(SCARDCONTEXT ctx)
 {
 	struct pivkey *pk;
+	struct pivcert *cert;
 	int i;
+
 	for (pk = ks; pk != NULL; pk = pk->pk_next) {
 		printf("PIV card in '%s': guid = ",
 		    pk->pk_rdrname);
@@ -764,15 +780,13 @@ cmd_list(SCARDCONTEXT ctx)
 			printf("\n");
 		}
 		piv_begin_txn(pk);
-		if (piv_test_cert(pk, 0x9A) == 0)
-			printf("  * cert in slot 9A\n");
-		if (piv_test_cert(pk, 0x9C) == 0)
-			printf("  * cert in slot 9C\n");
-		if (piv_test_cert(pk, 0x9D) == 0)
-			printf("  * cert in slot 9D\n");
-		if (piv_test_cert(pk, 0x9E) == 0)
-			printf("  * cert in slot 9E\n");
+		read_all_certs(pk);
 		piv_end_txn(pk);
+		for (cert = pk->pk_certs; cert != NULL; cert = cert->pc_next) {
+			printf("  * slot %02X: %s (%s %d)\n", cert->pc_slot,
+			    cert->pc_subj, sshkey_type(cert->pc_pubkey),
+			    sshkey_size(cert->pc_pubkey));
+		}
 	}
 }
 
