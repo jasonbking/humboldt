@@ -195,6 +195,7 @@ apdu_to_buffer(struct apdu *apdu, uint *outlen)
 		*outlen = 5;
 		return (buf);
 	} else {
+		/* TODO: maybe look at handling ext APDUs? */
 		assert(d->b_len < 256 && d->b_len > 0);
 		buf[4] = d->b_len;
 		bcopy(d->b_data + d->b_offset, buf + 5, d->b_len);
@@ -283,6 +284,11 @@ transceive_apdu(struct pivkey *key, struct apdu *apdu)
 	return (0);
 }
 
+/*
+ * Transceives a long APDU as a series of chained APDU commands and responses.
+ *
+ * Handles both send-side (command) chaining and response-side chaining.
+ */
 static int
 transceive_apdu_chain(struct pivkey *pk, struct apdu *apdu)
 {
@@ -292,8 +298,10 @@ transceive_apdu_chain(struct pivkey *pk, struct apdu *apdu)
 
 	assert(pk->pk_intxn == B_TRUE);
 
+	/* First, send the command. */
 	rem = apdu->a_cmd.b_len;
 	while (rem > 0) {
+		/* Is there another block needed in the chain? */
 		if (rem > 0xFF) {
 			apdu->a_cls |= CLA_CHAIN;
 			apdu->a_cmd.b_len = 0xFF;
@@ -311,10 +319,18 @@ transceive_apdu_chain(struct pivkey *pk, struct apdu *apdu)
 			apdu->a_cmd.b_offset += apdu->a_cmd.b_len;
 			rem -= apdu->a_cmd.b_len;
 		} else {
+			/*
+			 * Return any other error straight away -- we can
+			 * only get response chaining on BYTES_REMAINING
+			 */
 			return (0);
 		}
 	}
 
+	/*
+	 * We keep the original reply offset so we can calculate how much
+	 * data we actually received later.
+	 */
 	offset = apdu->a_reply.b_offset;
 
 	while ((apdu->a_sw & 0xFF00) == SW_BYTES_REMAINING_00) {
@@ -331,6 +347,7 @@ transceive_apdu_chain(struct pivkey *pk, struct apdu *apdu)
 			return (rv);
 	}
 
+	/* Work out the total length of all the segments we recieved. */
 	apdu->a_reply.b_len += apdu->a_reply.b_offset - offset;
 	apdu->a_reply.b_offset = offset;
 
@@ -348,6 +365,10 @@ piv_sign_hash(struct pivkey *pk, uint slotid, uint8_t *hash, size_t hashlen,
 	struct pivcert *pc;
 	uint8_t *buf;
 
+	/*
+	 * Find the pk_certs entry for this slot. We need this to figure out
+	 * what algorithm to ask for.
+	 */
 	for (pc = pk->pk_certs; pc != NULL; pc = pc->pc_next) {
 		if (pc->pc_slot == slotid)
 			break;
@@ -359,8 +380,10 @@ piv_sign_hash(struct pivkey *pk, uint slotid, uint8_t *hash, size_t hashlen,
 
 	tlv = tlv_init_write();
 	tlv_pushl(tlv, 0x7C, hashlen + 16);
+	/* Push an empty RESPONSE tag to say that's what we're asking for. */
 	tlv_push(tlv, GA_TAG_RESPONSE);
 	tlv_pop(tlv);
+	/* And now push the data we're providing (the CHALLENGE). */
 	tlv_pushl(tlv, GA_TAG_CHALLENGE, hashlen);
 	tlv_write(tlv, hash, 0, hashlen);
 	tlv_pop(tlv);
@@ -508,6 +531,7 @@ piv_read_cert(struct pivkey *pk, uint slotid)
 		}
 		tlv_end(tlv);
 
+		/* See the NIST PIV spec. This bit should always be zero. */
 		if ((certinfo & PIV_CI_X509) != 0) {
 			if (debug == B_TRUE) {
 				fprintf(stderr, "cert in slot %02X of PIV card "
@@ -519,6 +543,7 @@ piv_read_cert(struct pivkey *pk, uint slotid)
 			return (1);
 		}
 
+		/* TODO: gzip support */
 		if ((certinfo & PIV_CI_COMPTYPE) != PIV_COMP_NONE) {
 			if (debug == B_TRUE) {
 				fprintf(stderr, "cert in slot %02X of PIV card "
@@ -532,6 +557,7 @@ piv_read_cert(struct pivkey *pk, uint slotid)
 
 		cert = d2i_X509(NULL, &ptr, len);
 		if (cert == NULL) {
+			/* Getting error codes out of OpenSSL is weird. */
 			char errbuf[128];
 			unsigned long err = ERR_peek_last_error();
 			if (debug == B_TRUE) {
@@ -556,7 +582,6 @@ piv_read_cert(struct pivkey *pk, uint slotid)
 			pc->pc_next = pk->pk_certs;
 			pk->pk_certs = pc;
 		} else {
-			fprintf(stderr, "got existing slot, freeing data\n");
 			OPENSSL_free(pc->pc_subj);
 			X509_free(pc->pc_x509);
 			sshkey_free(pc->pc_pubkey);
@@ -741,15 +766,10 @@ piv_select(struct pivkey *pk)
 			tag = tlv_read_tag(tlv);
 			switch (tag) {
 			case PIV_TAG_AID:
-				tlv_skip(tlv);
-				break;
 			case PIV_TAG_AUTHORITY:
-				tlv_skip(tlv);
-				break;
 			case PIV_TAG_APP_LABEL:
-				tlv_skip(tlv);
-				break;
 			case PIV_TAG_URI:
+				/* TODO: validate/store these maybe? */
 				tlv_skip(tlv);
 				break;
 			case PIV_TAG_ALGS:
@@ -1112,9 +1132,20 @@ cmd_sign(uint slotid)
 
 	assert(ssh_digest_final(hctx, buf, dglen) == 0);
 
+	/*
+	 * If it's an RSA signature, we have to generate the PKCS#1 style
+	 * padded signing blob around the hash.
+	 *
+	 * ECDSA is so much nicer than this. Why can't we just use it? Oh,
+	 * because Java ruined everything. Right.
+	 */
 	if (cert->pc_alg == PIV_ALG_RSA1024 ||
 	    cert->pc_alg == PIV_ALG_RSA2048) {
 		int nid;
+		/*
+		 * Roll up your sleeves, folks, we're going in (to the dank
+		 * and musty corners of OpenSSL where few dare tread)
+		 */
 		X509_SIG digestInfo;
 		X509_ALGOR algor;
 		ASN1_TYPE parameter;
@@ -1125,6 +1156,10 @@ cmd_sign(uint slotid)
 		assert(tmp != NULL);
 		out = NULL;
 
+		/*
+		 * XXX: I thought this should be sha256WithRSAEncryption?
+		 *      but that doesn't work lol
+		 */
 		nid = NID_sha256;
 		bcopy(buf, tmp, dglen);
 		digestInfo.algor = &algor;
@@ -1137,8 +1172,13 @@ cmd_sign(uint slotid)
 		digestInfo.digest->length = (int)dglen;
 		nread = i2d_X509_SIG(&digestInfo, &out);
 
+		/*
+		 * There is another undocumented openssl function that does
+		 * this padding bit, but eh.
+		 */
 		memset(buf, 0xFF, inplen);
 		buf[0] = 0x00;
+		/* The second byte is the block type -- 0x01 here means 0xFF */
 		buf[1] = 0x01;
 		buf[inplen - nread - 1] = 0x00;
 		bcopy(out, buf + (inplen - nread), nread);
