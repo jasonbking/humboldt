@@ -36,6 +36,7 @@
 boolean_t debug = B_FALSE;
 static boolean_t parseable = B_FALSE;
 static uint8_t *guid = NULL;
+static const char *pin = NULL;
 
 static struct pivkey *ks = NULL;
 static struct pivkey *selk = NULL;
@@ -76,6 +77,7 @@ enum iso_sw {
 	SW_WARNING_NO_CHANGE_00 = 0x6200,
 	SW_WARNING_00 = 0x6300,
 	SW_FILE_NOT_FOUND = 0x6A82,
+	SW_INCORRECT_PIN = 0x63C0,
 };
 
 enum piv_sel_tag {
@@ -165,10 +167,12 @@ struct pivkey {
 	DWORD pk_proto;
 	SCARD_IO_REQUEST pk_sendpci;
 	boolean_t pk_intxn;
+	boolean_t pk_reset;
 
 	uint8_t pk_guid[16];
 	enum piv_alg pk_algs[32];
 	size_t pk_alg_count;
+	uint pk_pinretries;
 
 	struct pivcert *pk_certs;
 };
@@ -359,6 +363,55 @@ transceive_apdu_chain(struct pivkey *pk, struct apdu *apdu)
 }
 
 static int
+piv_verify_pin(struct pivkey *pk, const char *pin)
+{
+	int rv;
+	struct apdu *apdu;
+	char pinbuf[8];
+	size_t i;
+
+	memset(pinbuf, 0xFF, sizeof (pinbuf));
+	for (i = 0; i < 8, pin[i] != 0; ++i)
+		pinbuf[i] = pin[i];
+	if (pin[i] != 0) {
+		fprintf(stderr, "error: maximum PIN length is 8\n");
+		exit(3);
+	}
+
+	apdu = make_apdu(CLA_ISO, INS_VERIFY, 0x00, 0x80);
+	apdu->a_cmd.b_data = pinbuf;
+	apdu->a_cmd.b_len = 8;
+
+	rv = transceive_apdu(pk, apdu);
+	if (rv != 0) {
+		fprintf(stderr, "transceive_apdu(%s) failed: %d\n",
+		    pk->pk_rdrname, rv);
+		free_apdu(apdu);
+		return (1);
+	}
+
+	if (apdu->a_sw == SW_NO_ERROR) {
+		rv = 0;
+		pk->pk_reset = B_TRUE;
+
+	} else if ((apdu->a_sw & 0xFFF0) == SW_INCORRECT_PIN) {
+		pk->pk_pinretries = (apdu->a_sw & 0x000F);
+		rv = EACCES;
+
+	} else {
+		if (debug == B_TRUE) {
+			fprintf(stderr, "card in %s returned sw = %04x to "
+			    "INS_VERIFY\n", pk->pk_rdrname, apdu->a_sw);
+		}
+		rv = EINVAL;
+	}
+
+	free_apdu(apdu);
+
+	return (rv);
+}
+
+static int
 piv_ecdh(struct pivkey *pk, uint slotid, struct sshkey *othpub,
     uint8_t **secret, size_t *seclen)
 {
@@ -449,6 +502,10 @@ piv_ecdh(struct pivkey *pk, uint slotid, struct sshkey *othpub,
 		tlv_free(tlv);
 
 		rv = 0;
+
+	} else if (apdu->a_sw == SW_SECURITY_STATUS_NOT_SATISFIED) {
+		rv = EPERM;
+
 	} else {
 		if (debug == B_TRUE) {
 			fprintf(stderr, "card in %s returned sw = %04x to "
@@ -546,6 +603,10 @@ piv_sign_hash(struct pivkey *pk, uint slotid, uint8_t *hash, size_t hashlen,
 		tlv_free(tlv);
 
 		rv = 0;
+
+	} else if (apdu->a_sw = SW_SECURITY_STATUS_NOT_SATISFIED) {
+		rv = EPERM;
+
 	} else {
 		if (debug == B_TRUE) {
 			fprintf(stderr, "card in %s returned sw = %04x to "
@@ -939,13 +1000,15 @@ piv_end_txn(struct pivkey *key)
 {
 	assert(key->pk_intxn == B_TRUE);
 	LONG rv;
-	rv = SCardEndTransaction(key->pk_cardhdl, SCARD_LEAVE_CARD);
+	rv = SCardEndTransaction(key->pk_cardhdl,
+	    key->pk_reset ? SCARD_RESET_CARD : SCARD_LEAVE_CARD);
 	if (rv != SCARD_S_SUCCESS) {
 		fprintf(stderr, "SCardEndTransaction(%s) failed: %s\n",
 		    key->pk_rdrname, pcsc_stringify_error(rv));
 		exit(1);
 	}
 	key->pk_intxn = B_FALSE;
+	key->pk_reset = B_FALSE;
 }
 
 static void
@@ -1080,6 +1143,23 @@ read_stdin(uint limit, uint *outlen)
 
 	*outlen = n;
 	return (buf);
+}
+
+static void
+assert_pin(struct pivkey *pk)
+{
+	int rv;
+	if (pin != NULL) {
+		rv = piv_verify_pin(selk, pin);
+		if (rv == EACCES) {
+			fprintf(stderr, "error: invalid PIN code (%d attempts "
+			    "remaining)\n", pk->pk_pinretries);
+			exit(3);
+		} else if (rv != 0) {
+			fprintf(stderr, "error: failed to verify PIN\n");
+			exit(3);
+		}
+	}
 }
 
 static void
@@ -1296,9 +1376,14 @@ cmd_sign(uint slotid)
 	}
 
 	piv_begin_txn(selk);
+	assert_pin(selk);
 	rv = piv_sign_hash(selk, slotid, buf, inplen, &sig, &siglen);
 	piv_end_txn(selk);
-	if (rv != 0) {
+	if (rv == EPERM) {
+		fprintf(stderr, "error: key in slot %02X requires PIN\n",
+		    slotid);
+		exit(1);
+	} else if (rv != 0) {
 		fprintf(stderr, "error: piv_sign_hash returned %d\n", rv);
 		exit(1);
 	}
@@ -1375,9 +1460,14 @@ cmd_ecdh(uint slotid)
 	}
 
 	piv_begin_txn(selk);
+	assert_pin(selk);
 	rv = piv_ecdh(selk, slotid, pubkey, &secret, &seclen);
 	piv_end_txn(selk);
-	if (rv != 0) {
+	if (rv == EPERM) {
+		fprintf(stderr, "error: key in slot %02X requires PIN\n",
+		    slotid);
+		exit(1);
+	} else if (rv != 0) {
 		fprintf(stderr, "error: piv_ecdh returned %d\n", rv);
 		exit(1);
 	}
@@ -1399,14 +1489,16 @@ usage(void)
 	    "  ecdh <slot>            Do ECDH with pubkey on stdin\n"
 	    "\n"
 	    "Options:\n"
+	    "  --pin|-p               PIN code to authenticate with\n"
 	    "  --debug|-d             Spit out lots of debug info to stderr\n"
 	    "                         (incl. APDU trace)\n"
-	    "  --parseable|-p         Generate parseable output from 'list'\n"
+	    "  --parseable|-P         Generate parseable output from 'list'\n"
 	    "  --guid|-g              GUID of the PIV token to use\n");
 	exit(3);
 }
 
-const char *optstring = "d(debug)p(parseable)g:(guid)";
+//const char *optstring = "d(debug)P(parseable)g:(guid)p:(pin)";
+const char *optstring = "dPg:p:";
 
 int
 main(int argc, char *argv[])
@@ -1440,13 +1532,18 @@ main(int argc, char *argv[])
 			}
 			break;
 		case 'p':
+			pin = optarg;
+			break;
+		case 'P':
 			parseable = B_TRUE;
 			break;
 		}
 	}
 
-	if (optind >= argc)
+	if (optind >= argc) {
+		fprintf(stderr, "error: operation required\n");
 		usage();
+	}
 
 	const char *op = argv[optind++];
 
@@ -1500,28 +1597,37 @@ main(int argc, char *argv[])
 	} else if (strcmp(op, "pubkey") == 0) {
 		uint slotid;
 
-		if (optind >= argc)
+		if (optind >= argc) {
+			fprintf(stderr, "error: slot required\n");
 			usage();
+		}
 		slotid = strtol(argv[optind++], NULL, 16);
 
-		if (optind < argc)
+		if (optind < argc) {
+			fprintf(stderr, "error: too many arguments\n");
 			usage();
+		}
 
 		cmd_pubkey(slotid);
 
 	} else if (strcmp(op, "ecdh") == 0) {
 		uint slotid;
 
-		if (optind >= argc)
+		if (optind >= argc) {
+			fprintf(stderr, "error: slot required\n");
 			usage();
+		}
 		slotid = strtol(argv[optind++], NULL, 16);
 
-		if (optind < argc)
+		if (optind < argc) {
+			fprintf(stderr, "error: too many arguments\n");
 			usage();
+		}
 
 		cmd_ecdh(slotid);
 
 	} else {
+		fprintf(stderr, "error: invalid operation '%s'\n", op);
 		usage();
 	}
 

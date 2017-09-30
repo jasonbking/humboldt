@@ -20,6 +20,7 @@ f usr/sbin/pcscd 0755 root sys
 f usr/sbin/yktool 0755 root sys
 f usr/sbin/yubihmac-bench 0755 root sys
 f usr/sbin/amd64/softtokend 0755 root sys
+f usr/sbin/amd64/pivtool 0755 root sys
 d usr/lib 0755 root sys
 f usr/lib/libusb-1.0.so.0.1.0 0755 root sys
 s usr/lib/libusb-1.0.so.0=libusb-1.0.so.0.1.0

@@ -22,6 +22,7 @@
 
 #include <string.h>
 #include <stdarg.h>
+#include <assert.h>
 
 #include "sshbuf.h"
 #define SSHKEY_INTERNAL
@@ -30,8 +31,6 @@
 
 /*#include "ssh.h"*/
 /*#include "log.h"*/
-
-#include "bunyan.h"
 
 int
 ssh_ed25519_sign(const struct sshkey *key, u_char **sigp, size_t *lenp,
@@ -141,12 +140,8 @@ ssh_ed25519_verify(const struct sshkey *key,
 	}
 	memcpy(sm, sigblob, len);
 	memcpy(sm+len, data, datalen);
-	if ((ret = crypto_sign_ed25519_open(m, &mlen, sm, smlen,
-	    key->ed25519_pk)) != 0) {
-		bunyan_log(ERROR, "crypto_sign_ed25519 failed",
-		    "func", BNY_STRING, __func__,
-		    "rcode", BNY_INT, ret, NULL);
-	}
+	ret = crypto_sign_ed25519_open(m, &mlen, sm, smlen, key->ed25519_pk);
+	assert(ret != 0);
 	if (ret != 0 || mlen != datalen) {
 		r = SSH_ERR_SIGNATURE_INVALID;
 		goto out;

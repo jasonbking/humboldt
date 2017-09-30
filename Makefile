@@ -39,6 +39,7 @@ YKTOOL_LDFLAGS=		-L$(PROTO_AREA)/usr/lib
 
 YKTOOL_DEPS=		pcsclite
 
+
 ED25519_SOURCES=		\
 	ed25519.c		\
 	fe25519.c		\
@@ -94,6 +95,25 @@ TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket -lpcsclite -lssp \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
 
+PIVTOOL_SOURCES=		\
+	pivtool.c		\
+	tlv.c			\
+	$(LIBSSH_SOURCES)
+PIVTOOL_HEADERS=		\
+	tlv.h
+PIVTOOL_OBJS=		$(PIVTOOL_SOURCES:%.c=%.o)
+PIVTOOL_DEPS=		pcsclite64 libressl
+PIVTOOL_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
+			-I$(DEPS)/libressl/include/ \
+			-fstack-protector-all \
+			-D_REENTRANT \
+			$(BASE_CFLAGS) $(CFLAGS64)
+PIVTOOL_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
+			-Wl,-z -Wl,aslr \
+			-D_REENTRANT
+PIVTOOL_LIBS= 		-lpcsclite -lssp -lumem \
+			$(DEPS)/libressl/crypto/.libs/libcrypto.a
+
 yubihmac-bench :	CFLAGS+=	$(YBENCH_CFLAGS)
 yubihmac-bench :	LIBS+=		$(YBENCH_LIBS)
 yubihmac-bench :	LDFLAGS+=	$(YBENCH_LDFLAGS)
@@ -119,6 +139,15 @@ softtokend :		HEADERS=	$(TOKEN_HEADERS)
 
 softtokend: $(TOKEN_OBJS) $(TOKEN_DEPS:%=deps/%/.ac.install.stamp)
 	$(CC) $(LDFLAGS) -o $@ $(TOKEN_OBJS) $(LIBS)
+	$(ALTCTFCONVERT) $@
+
+pivtool :		CFLAGS=		$(PIVTOOL_CFLAGS)
+pivtool :		LIBS+=		$(PIVTOOL_LIBS)
+pivtool :		LDFLAGS+=	$(PIVTOOL_LDFLAGS)
+pivtool :		HEADERS=	$(PIVTOOL_HEADERS)
+
+pivtool: $(PIVTOOL_OBJS) $(PIVTOOL_DEPS:%=deps/%/.ac.install.stamp)
+	$(CC) $(LDFLAGS) -o $@ $(PIVTOOL_OBJS) $(LIBS)
 	$(ALTCTFCONVERT) $@
 
 %.o: %.c $(HEADERS)
@@ -271,7 +300,7 @@ deps/libressl/configure: deps/libressl/.dirstamp deps/libressl/configure.ac
 deps/libressl/.ac.install.stamp: deps/libressl/.dirstamp deps/libressl/.ac.all.stamp
 	touch $@
 
-world: $(DEPS_BUILT) yubihmac-bench softtokend yktool
+world: $(DEPS_BUILT) yubihmac-bench softtokend yktool pivtool
 
 install: $(DEPS_INSTALLED) world
 	mkdir -p $(DESTDIR)/usr/sbin
@@ -279,6 +308,7 @@ install: $(DEPS_INSTALLED) world
 	cp yktool $(DESTDIR)/usr/sbin
 	mkdir -p $(DESTDIR)/usr/sbin/amd64
 	cp softtokend $(DESTDIR)/usr/sbin/amd64
+	cp pivtool $(DESTDIR)/usr/sbin/amd64
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system
 	cp pcscd.xml $(DESTDIR)/lib/svc/manifest/system
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system/filesystem
@@ -291,7 +321,7 @@ check:
 	echo check
 
 clean:
-	rm -f *.o yubihmac-bench softtokend yktool
+	rm -f *.o yubihmac-bench softtokend yktool pivtool
 	rm -fr deps
 
 .PHONY: manifest
