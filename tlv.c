@@ -276,8 +276,10 @@ void
 tlv_free(struct tlv_state *ts)
 {
 	assert(ts->ts_stack == NULL);
-	if (ts->ts_freebuf)
+	if (ts->ts_freebuf) {
+		explicit_bzero(ts->ts_buf, MAX_APDU_SIZE);
 		free(ts->ts_buf);
+	}
 	free(ts);
 }
 

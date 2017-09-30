@@ -24,6 +24,7 @@
 #include <strings.h>
 
 #include "sshkey.h"
+#include "sshbuf.h"
 #include "digest.h"
 
 #include <openssl/err.h>
@@ -218,8 +219,10 @@ make_apdu(enum iso_class cls, enum iso_ins ins, uint8_t p1, uint8_t p2)
 static void
 free_apdu(struct apdu *a)
 {
-	if (a->a_reply.b_data != NULL)
+	if (a->a_reply.b_data != NULL) {
+		explicit_bzero(a->a_reply.b_data, MAX_APDU_SIZE);
 		free(a->a_reply.b_data);
+	}
 	free(a);
 }
 
@@ -258,6 +261,7 @@ transceive_apdu(struct pivkey *key, struct apdu *apdu)
 
 	rv = SCardTransmit(key->pk_cardhdl, &key->pk_sendpci, cmd,
 	    cmdLen, NULL, r->b_data + r->b_offset, &recvLength);
+	explicit_bzero(cmd, cmdLen);
 	free(cmd);
 
 	if (debug == B_TRUE) {
@@ -352,6 +356,110 @@ transceive_apdu_chain(struct pivkey *pk, struct apdu *apdu)
 	apdu->a_reply.b_offset = offset;
 
 	return (0);
+}
+
+static int
+piv_ecdh(struct pivkey *pk, uint slotid, struct sshkey *othpub,
+    uint8_t **secret, size_t *seclen)
+{
+	int rv;
+	struct apdu *apdu;
+	struct tlv_state *tlv;
+	uint tag;
+	struct pivcert *pc;
+	const uint8_t *buf;
+	struct sshbuf *sbuf;
+	size_t len;
+
+	for (pc = pk->pk_certs; pc != NULL; pc = pc->pc_next) {
+		if (pc->pc_slot == slotid)
+			break;
+	}
+	if (pc == NULL)
+		return (ENOENT);
+
+	assert(pk->pk_intxn == B_TRUE);
+
+	sbuf = sshbuf_new();
+	assert(sbuf != NULL);
+	assert(othpub->type == KEY_ECDSA);
+	rv = sshbuf_put_eckey(sbuf, othpub->ecdsa);
+	assert(rv == 0);
+	/* The buffer has the 32-bit length prefixed */
+	len = sshbuf_len(sbuf) - 4;
+	buf = sshbuf_ptr(sbuf) + 4;
+	assert(*buf == 0x04);
+
+	tlv = tlv_init_write();
+	tlv_pushl(tlv, 0x7C, len + 16);
+	tlv_push(tlv, GA_TAG_RESPONSE);
+	tlv_pop(tlv);
+	tlv_pushl(tlv, GA_TAG_EXP, len);
+	tlv_write(tlv, buf, 0, len);
+	sshbuf_free(sbuf);
+	tlv_pop(tlv);
+	tlv_pop(tlv);
+
+	apdu = make_apdu(CLA_ISO, INS_GEN_AUTH, pc->pc_alg, slotid);
+	apdu->a_cmd.b_data = tlv_buf(tlv);
+	apdu->a_cmd.b_len = tlv_len(tlv);
+
+	rv = transceive_apdu_chain(pk, apdu);
+	if (rv != 0) {
+		fprintf(stderr, "transceive_apdu_chain(%s) failed: %d\n",
+		    pk->pk_rdrname, rv);
+		tlv_free(tlv);
+		free_apdu(apdu);
+		return (1);
+	}
+
+	tlv_free(tlv);
+
+	if (apdu->a_sw == SW_NO_ERROR) {
+		tlv = tlv_init(apdu->a_reply.b_data, apdu->a_reply.b_offset,
+		    apdu->a_reply.b_len);
+		tag = tlv_read_tag(tlv);
+		if (tag != 0x7C) {
+			if (debug == B_TRUE) {
+				fprintf(stderr, "card in %s returned wrong tag"
+				    " to INS_GEN_AUTH\n", pk->pk_rdrname);
+			}
+			tlv_skip(tlv);
+			tlv_free(tlv);
+			free_apdu(apdu);
+			return (1);
+		}
+		tag = tlv_read_tag(tlv);
+		if (tag != GA_TAG_RESPONSE) {
+			tlv_skip(tlv);
+			tlv_skip(tlv);
+			tlv_free(tlv);
+			free_apdu(apdu);
+			return (1);
+		}
+
+		*seclen = tlv_rem(tlv);
+		buf = calloc(1, *seclen);
+		assert(buf != NULL);
+		*seclen = tlv_read(tlv, buf, 0, *seclen);
+		*secret = buf;
+
+		tlv_end(tlv);
+		tlv_end(tlv);
+		tlv_free(tlv);
+
+		rv = 0;
+	} else {
+		if (debug == B_TRUE) {
+			fprintf(stderr, "card in %s returned sw = %04x to "
+			    "INS_GEN_AUTH\n", pk->pk_rdrname, apdu->a_sw);
+		}
+		rv = 1;
+	}
+
+	free_apdu(apdu);
+
+	return (rv);
 }
 
 static int
@@ -1201,6 +1309,84 @@ cmd_sign(uint slotid)
 	exit(0);
 }
 
+static void
+cmd_ecdh(uint slotid)
+{
+	struct pivcert *cert;
+	struct sshkey *pubkey;
+	uint8_t *buf, *ptr, *secret;
+	size_t nread, boff, seclen;
+	int rv;
+
+	switch (slotid) {
+	case 0x9A:
+	case 0x9C:
+	case 0x9D:
+	case 0x9E:
+		break;
+	default:
+		fprintf(stderr, "error: PIV slot %02X cannot be "
+		    "used for ECDH\n", slotid);
+		exit(3);
+	}
+
+	for (cert = selk->pk_certs; cert != NULL; cert = cert->pc_next) {
+		if (cert->pc_slot == slotid)
+			break;
+	}
+	if (cert == NULL) {
+		fprintf(stderr, "error: PIV slot %02X has no key present\n",
+		    slotid);
+		exit(1);
+	}
+
+	switch (cert->pc_alg) {
+	case PIV_ALG_ECCP256:
+	case PIV_ALG_ECCP384:
+		break;
+	default:
+		fprintf(stderr, "error: PIV slot %02X does not contain an EC "
+		    "key\n", slotid);
+		exit(1);
+	}
+
+	buf = calloc(1, 8192);
+	assert(buf != NULL);
+	boff = 0;
+	do {
+		nread = read(0, buf + boff, 8192 - boff);
+		if (nread > 0) {
+			boff += nread;
+			if (boff >= 8190) {
+				fprintf(stderr, "error: public key too long\n");
+				exit(1);
+			}
+		}
+	} while (!(nread == 0 || (nread == -1 && errno != EINTR)));
+
+	pubkey = sshkey_new(cert->pc_pubkey->type);
+	assert(pubkey != NULL);
+	ptr = buf;
+	rv = sshkey_read(pubkey, &ptr);
+	if (rv != 0) {
+		fprintf(stderr, "error: failed to parse public key: %d\n",
+		    rv);
+		exit(1);
+	}
+
+	piv_begin_txn(selk);
+	rv = piv_ecdh(selk, slotid, pubkey, &secret, &seclen);
+	piv_end_txn(selk);
+	if (rv != 0) {
+		fprintf(stderr, "error: piv_ecdh returned %d\n", rv);
+		exit(1);
+	}
+
+	fwrite(secret, 1, seclen, stdout);
+
+	exit(0);
+}
+
 void
 usage(void)
 {
@@ -1210,6 +1396,7 @@ usage(void)
 	    "  list                   Lists PIV tokens present\n"
 	    "  pubkey <slot>          Outputs a public key in SSH format\n"
 	    "  sign <slot>            Signs data on stdin\n"
+	    "  ecdh <slot>            Do ECDH with pubkey on stdin\n"
 	    "\n"
 	    "Options:\n"
 	    "  --debug|-d             Spit out lots of debug info to stderr\n"
@@ -1321,6 +1508,18 @@ main(int argc, char *argv[])
 			usage();
 
 		cmd_pubkey(slotid);
+
+	} else if (strcmp(op, "ecdh") == 0) {
+		uint slotid;
+
+		if (optind >= argc)
+			usage();
+		slotid = strtol(argv[optind++], NULL, 16);
+
+		if (optind < argc)
+			usage();
+
+		cmd_ecdh(slotid);
 
 	} else {
 		usage();
