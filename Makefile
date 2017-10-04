@@ -71,12 +71,15 @@ TOKEN_SOURCES=			\
 	supervisor.c		\
 	bunyan.c		\
 	agent.c			\
+	piv.c			\
+	tlv.c			\
 	ykccid.c		\
 	$(LIBSSH_SOURCES)
 TOKEN_HEADERS=			\
 	softtoken.h		\
 	bunyan.h		\
-	ykccid.h
+	piv.h			\
+	tlv.h
 
 TOKEN_OBJS=		$(TOKEN_SOURCES:%.c=%.o)
 
@@ -98,9 +101,13 @@ TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket -lpcsclite -lssp \
 PIVTOOL_SOURCES=		\
 	pivtool.c		\
 	tlv.c			\
+	piv.c			\
+	bunyan.c		\
 	$(LIBSSH_SOURCES)
 PIVTOOL_HEADERS=		\
-	tlv.h
+	tlv.h			\
+	bunyan.h		\
+	piv.h
 PIVTOOL_OBJS=		$(PIVTOOL_SOURCES:%.c=%.o)
 PIVTOOL_DEPS=		pcsclite64 libressl
 PIVTOOL_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
@@ -111,7 +118,7 @@ PIVTOOL_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
 PIVTOOL_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
 			-Wl,-z -Wl,aslr \
 			-D_REENTRANT
-PIVTOOL_LIBS= 		-lpcsclite -lssp -lumem \
+PIVTOOL_LIBS= 		-lpcsclite -lssp -lumem -lnvpair \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
 yubihmac-bench :	CFLAGS+=	$(YBENCH_CFLAGS)

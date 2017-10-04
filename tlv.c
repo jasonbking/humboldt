@@ -39,6 +39,12 @@ tlv_init(const uint8_t *buf, size_t offset, size_t len)
 	return (ts);
 }
 
+void
+tlv_enable_debug(struct tlv_state *ts)
+{
+	ts->ts_debug = B_TRUE;
+}
+
 struct tlv_state *
 tlv_init_write(void)
 {
@@ -177,7 +183,7 @@ tlv_read_tag(struct tlv_state *ts)
 	ts->ts_stack = sf;
 	++ts->ts_stklvl;
 
-	if (debug) {
+	if (ts->ts_debug) {
 		fprintf(stderr, "%*stag at +%d: 0x%x (%d bytes)\n",
 		    ts->ts_stklvl, "", origin, tag, len);
 	}
@@ -192,7 +198,7 @@ void
 tlv_end(struct tlv_state *ts)
 {
 	struct tlv_stack_frame *sf = ts->ts_stack;
-	if (debug) {
+	if (ts->ts_debug) {
 		fprintf(stderr, "%*send tag from +%d (%d bytes left)\n",
 		    ts->ts_stklvl + 1, "", ts->ts_ptr, ts->ts_len);
 	}
@@ -212,7 +218,7 @@ tlv_skip(struct tlv_state *ts)
 {
 	struct tlv_stack_frame *sf = ts->ts_stack;
 	uint lvl;
-	if (debug) {
+	if (ts->ts_debug) {
 		fprintf(stderr, "%*sskip tag from +%d (%d bytes left)\n",
 		    ts->ts_stklvl + 1, "", ts->ts_ptr, ts->ts_len);
 	}
@@ -285,7 +291,7 @@ tlv_free(struct tlv_state *ts)
 }
 
 void
-tlv_write(struct tlv_state *ts, uint8_t *src, size_t offset, size_t len)
+tlv_write(struct tlv_state *ts, const uint8_t *src, size_t offset, size_t len)
 {
 	assert(tlv_buf_rem(ts) >= len);
 	bcopy(&src[offset], &ts->ts_buf[ts->ts_offset], len);

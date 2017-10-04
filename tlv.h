@@ -29,6 +29,7 @@ struct tlv_state {
 	size_t ts_stklvl;
 	uint8_t *ts_buf;
 	boolean_t ts_freebuf;
+	boolean_t ts_debug;
 	size_t ts_offset;
 	size_t ts_ptr;
 	size_t ts_len;
@@ -37,6 +38,7 @@ struct tlv_state {
 
 struct tlv_state *tlv_init(const uint8_t *buf, size_t offset, size_t len);
 struct tlv_state *tlv_init_write(void);
+void tlv_enable_debug(struct tlv_state *ts);
 uint tlv_read_tag(struct tlv_state *ts);
 uint8_t tlv_read_byte(struct tlv_state *ts);
 uint16_t tlv_read_short(struct tlv_state *ts);
@@ -48,7 +50,8 @@ void tlv_end(struct tlv_state *ts);
 
 void tlv_pushl(struct tlv_state *ts, uint tag, size_t maxlen);
 void tlv_pop(struct tlv_state *ts);
-void tlv_write(struct tlv_state *ts, uint8_t *src, size_t offset, size_t len);
+void tlv_write(struct tlv_state *ts, const uint8_t *src, size_t offset,
+    size_t len);
 void tlv_write_uint(struct tlv_state *ts, uint val);
 void tlv_write_byte(struct tlv_state *ts, uint8_t val);
 

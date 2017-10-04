@@ -22,12 +22,17 @@ enum bunyan_log_level {
 enum bunyan_arg_type {
 	BNY_STRING,
 	BNY_INT,
+	BNY_UINT,
+	BNY_UINT64,
+	BNY_SIZE_T,
 	BNY_NVLIST,
-	BNY_TIMERS
+	BNY_TIMERS,
+	BNY_BIN_HEX,
 };
 
 void bunyan_init(void);
 void bunyan_set_name(const char *name);
+void bunyan_set_level(enum bunyan_log_level level);
 void bunyan_log(enum bunyan_log_level level, const char *msg, ...);
 void bunyan_set(const char *name1, enum bunyan_arg_type typ1, ...);
 

@@ -32,1073 +32,16 @@
 #include <openssl/x509v3.h>
 
 #include "tlv.h"
+#include "piv.h"
+#include "bunyan.h"
 
 boolean_t debug = B_FALSE;
 static boolean_t parseable = B_FALSE;
 static uint8_t *guid = NULL;
 static const char *pin = NULL;
 
-static struct pivkey *ks = NULL;
-static struct pivkey *selk = NULL;
-
-enum iso_class {
-	CLA_ISO = 0x00,
-	CLA_CHAIN = 0x10
-};
-
-enum iso_sel_p1 {
-	SEL_APP_AID = 0x04
-};
-
-enum iso_ins {
-	/* Standard commands from ISO7816-4 */
-	INS_SELECT = 0xA4,
-	INS_GET_DATA = 0xCB,
-	INS_VERIFY = 0x20,
-	INS_CHANGE_PIN = 0x24,
-	INS_RESET_PIN = 0x2C,
-	INS_GEN_AUTH = 0x87,
-	INS_PUT_DATA = 0xDB,
-	INS_GEN_ASYM = 0x47,
-	INS_CONTINUE = 0xC0,
-
-	/* YubicoPIV specific */
-	INS_SET_MGMT = 0xFF,
-	INS_IMPORT_ASYM = 0xFE,
-	INS_GET_VER = 0xFD,
-};
-
-enum iso_sw {
-	SW_NO_ERROR = 0x9000,
-	SW_FUNC_NOT_SUPPORTED = 0x6A81,
-	SW_CONDITIONS_NOT_SATISFIED = 0x6985,
-	SW_SECURITY_STATUS_NOT_SATISFIED = 0x6982,
-	SW_BYTES_REMAINING_00 = 0x6100,
-	SW_WARNING_NO_CHANGE_00 = 0x6200,
-	SW_WARNING_00 = 0x6300,
-	SW_FILE_NOT_FOUND = 0x6A82,
-	SW_INCORRECT_PIN = 0x63C0,
-};
-
-enum piv_sel_tag {
-	PIV_TAG_APT = 0x61,
-	PIV_TAG_AID = 0x4F,
-	PIV_TAG_AUTHORITY = 0x79,
-	PIV_TAG_APP_LABEL = 0x50,
-	PIV_TAG_URI = 0x5F50,
-	PIV_TAG_ALGS = 0xAC,
-};
-
-enum piv_tags {
-	PIV_TAG_CARDCAP = 0x5FC107,
-	PIV_TAG_CHUID = 0x5FC102,
-	PIV_TAG_SECOBJ = 0x5FC106,
-	PIV_TAG_KEYHIST = 0x5FC10C,
-	PIV_TAG_DISCOV = 0x7E,
-	PIV_TAG_CERT_9A = 0x5FC105,
-	PIV_TAG_CERT_9C = 0x5FC10A,
-	PIV_TAG_CERT_9D = 0x5FC10B,
-	PIV_TAG_CERT_9E = 0x5FC101,
-};
-
-enum gen_auth_tag {
-	GA_TAG_WITNESS = 0x80,
-	GA_TAG_CHALLENGE = 0x81,
-	GA_TAG_RESPONSE = 0x82,
-	GA_TAG_EXP = 0x85,
-};
-
-enum piv_alg {
-	PIV_ALG_3DES = 0x03,
-	PIV_ALG_RSA1024 = 0x06,
-	PIV_ALG_RSA2048 = 0x07,
-	PIV_ALG_AES128 = 0x08,
-	PIV_ALG_AES192 = 0x0A,
-	PIV_ALG_AES256 = 0x0C,
-	PIV_ALG_ECCP256 = 0x11,
-	PIV_ALG_ECCP384 = 0x14,
-};
-
-enum piv_cert_comp {
-	PIV_COMP_GZIP = 1,
-	PIV_COMP_NONE = 0,
-};
-
-enum piv_certinfo_flags {
-	PIV_CI_X509 = (1 << 2),
-	PIV_CI_COMPTYPE = 0x03,
-};
-
-const uint8_t AID_PIV[] = {
-	0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00
-};
-
-struct buffer {
-	uint8_t *b_data;
-	size_t b_offset;
-	size_t b_size;
-	size_t b_len;
-};
-
-struct apdu {
-	enum iso_class a_cls;
-	enum iso_ins a_ins;
-	uint8_t a_p1;
-	uint8_t a_p2;
-
-	struct buffer a_cmd;
-	uint16_t a_sw;
-	struct buffer a_reply;
-};
-
-struct pivcert {
-	struct pivcert *pc_next;
-	uint8_t pc_slot;
-	enum piv_alg pc_alg;
-	X509 *pc_x509;
-	const char *pc_subj;
-	struct sshkey *pc_pubkey;
-};
-
-struct pivkey {
-	struct pivkey *pk_next;
-	const char *pk_rdrname;
-	SCARDHANDLE pk_cardhdl;
-	DWORD pk_proto;
-	SCARD_IO_REQUEST pk_sendpci;
-	boolean_t pk_intxn;
-	boolean_t pk_reset;
-
-	uint8_t pk_guid[16];
-	enum piv_alg pk_algs[32];
-	size_t pk_alg_count;
-	uint pk_pinretries;
-
-	struct pivcert *pk_certs;
-};
-
-static void
-dump_hex(FILE *stream, const uint8_t *buf, int len)
-{
-	int i;
-	for (i = 0; i < len; ++i) {
-		fprintf(stream, "%02x", buf[i]);
-	}
-}
-
-static uint8_t *
-apdu_to_buffer(struct apdu *apdu, uint *outlen)
-{
-	struct buffer *d = &(apdu->a_cmd);
-	uint8_t *buf = calloc(1, 5 + d->b_len);
-	buf[0] = apdu->a_cls;
-	buf[1] = apdu->a_ins;
-	buf[2] = apdu->a_p1;
-	buf[3] = apdu->a_p2;
-	if (d->b_data == NULL) {
-		buf[4] = 0;
-		*outlen = 5;
-		return (buf);
-	} else {
-		/* TODO: maybe look at handling ext APDUs? */
-		assert(d->b_len < 256 && d->b_len > 0);
-		buf[4] = d->b_len;
-		bcopy(d->b_data + d->b_offset, buf + 5, d->b_len);
-		*outlen = d->b_len + 5;
-		return (buf);
-	}
-}
-
-static struct apdu *
-make_apdu(enum iso_class cls, enum iso_ins ins, uint8_t p1, uint8_t p2)
-{
-	struct apdu *a = calloc(1, sizeof (struct apdu));
-	a->a_cls = cls;
-	a->a_ins = ins;
-	a->a_p1 = p1;
-	a->a_p2 = p2;
-	return (a);
-}
-
-static void
-free_apdu(struct apdu *a)
-{
-	if (a->a_reply.b_data != NULL) {
-		explicit_bzero(a->a_reply.b_data, MAX_APDU_SIZE);
-		free(a->a_reply.b_data);
-	}
-	free(a);
-}
-
-static int
-transceive_apdu(struct pivkey *key, struct apdu *apdu)
-{
-	uint cmdLen = 0;
-	int rv;
-
-	boolean_t freedata = B_FALSE;
-	DWORD recvLength;
-	uint8_t *cmd;
-	struct buffer *r = &(apdu->a_reply);
-
-	assert(key->pk_intxn == B_TRUE);
-
-	cmd = apdu_to_buffer(apdu, &cmdLen);
-	assert(cmd != NULL);
-	if (cmd == NULL || cmdLen < 5)
-		return (ENOMEM);
-
-	if (r->b_data == NULL) {
-		r->b_data = calloc(1, MAX_APDU_SIZE);
-		r->b_size = MAX_APDU_SIZE;
-		r->b_offset = 0;
-		freedata = B_TRUE;
-	}
-	recvLength = r->b_size - r->b_offset;
-	assert(r->b_data != NULL);
-
-	if (debug == B_TRUE) {
-		fprintf(stderr, "> ");
-		dump_hex(stderr, cmd, cmdLen);
-		fprintf(stderr, "\n");
-	}
-
-	rv = SCardTransmit(key->pk_cardhdl, &key->pk_sendpci, cmd,
-	    cmdLen, NULL, r->b_data + r->b_offset, &recvLength);
-	explicit_bzero(cmd, cmdLen);
-	free(cmd);
-
-	if (debug == B_TRUE) {
-		fprintf(stderr, "< ");
-		dump_hex(stderr, r->b_data + r->b_offset, recvLength);
-		fprintf(stderr, "\n");
-	}
-
-	if (rv != SCARD_S_SUCCESS) {
-		fprintf(stderr, "SCardTransmit(%s) failed: %s\n",
-		    key->pk_rdrname, pcsc_stringify_error(rv));
-		if (freedata) {
-			free(r->b_data);
-			bzero(r, sizeof (struct buffer));
-		}
-		return (rv);
-	}
-	recvLength -= 2;
-
-	r->b_len = recvLength;
-	apdu->a_sw = (r->b_data[r->b_offset + recvLength] << 8) |
-	    r->b_data[r->b_offset + recvLength + 1];
-
-	return (0);
-}
-
-/*
- * Transceives a long APDU as a series of chained APDU commands and responses.
- *
- * Handles both send-side (command) chaining and response-side chaining.
- */
-static int
-transceive_apdu_chain(struct pivkey *pk, struct apdu *apdu)
-{
-	int rv;
-	size_t offset;
-	size_t rem;
-
-	assert(pk->pk_intxn == B_TRUE);
-
-	/* First, send the command. */
-	rem = apdu->a_cmd.b_len;
-	while (rem > 0) {
-		/* Is there another block needed in the chain? */
-		if (rem > 0xFF) {
-			apdu->a_cls |= CLA_CHAIN;
-			apdu->a_cmd.b_len = 0xFF;
-		} else {
-			apdu->a_cls &= ~CLA_CHAIN;
-			apdu->a_cmd.b_len = rem;
-		}
-		rv = transceive_apdu(pk, apdu);
-		if (rv != 0)
-			return (rv);
-		if ((apdu->a_sw & 0xFF00) == SW_NO_ERROR ||
-		    (apdu->a_sw & 0xFF00) == SW_BYTES_REMAINING_00 ||
-		    (apdu->a_sw & 0xFF00) == SW_WARNING_NO_CHANGE_00 ||
-		    (apdu->a_sw & 0xFF00) == SW_WARNING_00) {
-			apdu->a_cmd.b_offset += apdu->a_cmd.b_len;
-			rem -= apdu->a_cmd.b_len;
-		} else {
-			/*
-			 * Return any other error straight away -- we can
-			 * only get response chaining on BYTES_REMAINING
-			 */
-			return (0);
-		}
-	}
-
-	/*
-	 * We keep the original reply offset so we can calculate how much
-	 * data we actually received later.
-	 */
-	offset = apdu->a_reply.b_offset;
-
-	while ((apdu->a_sw & 0xFF00) == SW_BYTES_REMAINING_00) {
-		apdu->a_cls = CLA_ISO;
-		apdu->a_ins = INS_CONTINUE;
-		apdu->a_p1 = 0;
-		apdu->a_p2 = 0;
-		apdu->a_cmd.b_data = NULL;
-		apdu->a_reply.b_offset += apdu->a_reply.b_len;
-		assert(apdu->a_reply.b_offset < apdu->a_reply.b_size);
-
-		rv = transceive_apdu(pk, apdu);
-		if (rv != 0)
-			return (rv);
-	}
-
-	/* Work out the total length of all the segments we recieved. */
-	apdu->a_reply.b_len += apdu->a_reply.b_offset - offset;
-	apdu->a_reply.b_offset = offset;
-
-	return (0);
-}
-
-static int
-piv_verify_pin(struct pivkey *pk, const char *pin)
-{
-	int rv;
-	struct apdu *apdu;
-	char pinbuf[8];
-	size_t i;
-
-	memset(pinbuf, 0xFF, sizeof (pinbuf));
-	for (i = 0; i < 8, pin[i] != 0; ++i)
-		pinbuf[i] = pin[i];
-	if (pin[i] != 0) {
-		fprintf(stderr, "error: maximum PIN length is 8\n");
-		exit(3);
-	}
-
-	apdu = make_apdu(CLA_ISO, INS_VERIFY, 0x00, 0x80);
-	apdu->a_cmd.b_data = pinbuf;
-	apdu->a_cmd.b_len = 8;
-
-	rv = transceive_apdu(pk, apdu);
-	if (rv != 0) {
-		fprintf(stderr, "transceive_apdu(%s) failed: %d\n",
-		    pk->pk_rdrname, rv);
-		free_apdu(apdu);
-		return (1);
-	}
-
-	if (apdu->a_sw == SW_NO_ERROR) {
-		rv = 0;
-		pk->pk_reset = B_TRUE;
-
-	} else if ((apdu->a_sw & 0xFFF0) == SW_INCORRECT_PIN) {
-		pk->pk_pinretries = (apdu->a_sw & 0x000F);
-		rv = EACCES;
-
-	} else {
-		if (debug == B_TRUE) {
-			fprintf(stderr, "card in %s returned sw = %04x to "
-			    "INS_VERIFY\n", pk->pk_rdrname, apdu->a_sw);
-		}
-		rv = EINVAL;
-	}
-
-	free_apdu(apdu);
-
-	return (rv);
-}
-
-static int
-piv_ecdh(struct pivkey *pk, uint slotid, struct sshkey *othpub,
-    uint8_t **secret, size_t *seclen)
-{
-	int rv;
-	struct apdu *apdu;
-	struct tlv_state *tlv;
-	uint tag;
-	struct pivcert *pc;
-	const uint8_t *buf;
-	struct sshbuf *sbuf;
-	size_t len;
-	struct timespec t0, t1;
-
-	for (pc = pk->pk_certs; pc != NULL; pc = pc->pc_next) {
-		if (pc->pc_slot == slotid)
-			break;
-	}
-	if (pc == NULL)
-		return (ENOENT);
-
-	assert(pk->pk_intxn == B_TRUE);
-
-	sbuf = sshbuf_new();
-	assert(sbuf != NULL);
-	assert(othpub->type == KEY_ECDSA);
-	rv = sshbuf_put_eckey(sbuf, othpub->ecdsa);
-	assert(rv == 0);
-	/* The buffer has the 32-bit length prefixed */
-	len = sshbuf_len(sbuf) - 4;
-	buf = sshbuf_ptr(sbuf) + 4;
-	assert(*buf == 0x04);
-
-	tlv = tlv_init_write();
-	tlv_pushl(tlv, 0x7C, len + 16);
-	tlv_push(tlv, GA_TAG_RESPONSE);
-	tlv_pop(tlv);
-	tlv_pushl(tlv, GA_TAG_EXP, len);
-	tlv_write(tlv, buf, 0, len);
-	sshbuf_free(sbuf);
-	tlv_pop(tlv);
-	tlv_pop(tlv);
-
-	apdu = make_apdu(CLA_ISO, INS_GEN_AUTH, pc->pc_alg, slotid);
-	apdu->a_cmd.b_data = tlv_buf(tlv);
-	apdu->a_cmd.b_len = tlv_len(tlv);
-
-	assert(clock_gettime(CLOCK_MONOTONIC, &t0) == 0);
-	rv = transceive_apdu_chain(pk, apdu);
-	if (rv != 0) {
-		fprintf(stderr, "transceive_apdu_chain(%s) failed: %d\n",
-		    pk->pk_rdrname, rv);
-		tlv_free(tlv);
-		free_apdu(apdu);
-		return (1);
-	}
-	assert(clock_gettime(CLOCK_MONOTONIC, &t1) == 0);
-	if (t1.tv_nsec < t0.tv_nsec) {
-		t1.tv_nsec += 1000000000;
-		t1.tv_sec -= 1;
-	}
-	t1.tv_nsec -= t0.tv_nsec;
-	t1.tv_sec -= t0.tv_sec;
-	fprintf(stderr, "ecdh op took %d.%06ds\n", t1.tv_sec, t1.tv_nsec / 1000);
-
-	tlv_free(tlv);
-
-	if (apdu->a_sw == SW_NO_ERROR) {
-		tlv = tlv_init(apdu->a_reply.b_data, apdu->a_reply.b_offset,
-		    apdu->a_reply.b_len);
-		tag = tlv_read_tag(tlv);
-		if (tag != 0x7C) {
-			if (debug == B_TRUE) {
-				fprintf(stderr, "card in %s returned wrong tag"
-				    " to INS_GEN_AUTH\n", pk->pk_rdrname);
-			}
-			tlv_skip(tlv);
-			tlv_free(tlv);
-			free_apdu(apdu);
-			return (1);
-		}
-		tag = tlv_read_tag(tlv);
-		if (tag != GA_TAG_RESPONSE) {
-			tlv_skip(tlv);
-			tlv_skip(tlv);
-			tlv_free(tlv);
-			free_apdu(apdu);
-			return (1);
-		}
-
-		*seclen = tlv_rem(tlv);
-		buf = calloc(1, *seclen);
-		assert(buf != NULL);
-		*seclen = tlv_read(tlv, buf, 0, *seclen);
-		*secret = buf;
-
-		tlv_end(tlv);
-		tlv_end(tlv);
-		tlv_free(tlv);
-
-		rv = 0;
-
-	} else if (apdu->a_sw == SW_SECURITY_STATUS_NOT_SATISFIED) {
-		rv = EPERM;
-
-	} else {
-		if (debug == B_TRUE) {
-			fprintf(stderr, "card in %s returned sw = %04x to "
-			    "INS_GEN_AUTH\n", pk->pk_rdrname, apdu->a_sw);
-		}
-		rv = 1;
-	}
-
-	free_apdu(apdu);
-
-	return (rv);
-}
-
-static int
-piv_sign_hash(struct pivkey *pk, uint slotid, uint8_t *hash, size_t hashlen,
-    uint8_t **signature, size_t *siglen)
-{
-	int rv;
-	struct apdu *apdu;
-	struct tlv_state *tlv;
-	uint tag;
-	struct pivcert *pc;
-	uint8_t *buf;
-	struct timespec t0, t1;
-
-	/*
-	 * Find the pk_certs entry for this slot. We need this to figure out
-	 * what algorithm to ask for.
-	 */
-	for (pc = pk->pk_certs; pc != NULL; pc = pc->pc_next) {
-		if (pc->pc_slot == slotid)
-			break;
-	}
-	if (pc == NULL)
-		return (ENOENT);
-
-	assert(pk->pk_intxn == B_TRUE);
-
-	tlv = tlv_init_write();
-	tlv_pushl(tlv, 0x7C, hashlen + 16);
-	/* Push an empty RESPONSE tag to say that's what we're asking for. */
-	tlv_push(tlv, GA_TAG_RESPONSE);
-	tlv_pop(tlv);
-	/* And now push the data we're providing (the CHALLENGE). */
-	tlv_pushl(tlv, GA_TAG_CHALLENGE, hashlen);
-	tlv_write(tlv, hash, 0, hashlen);
-	tlv_pop(tlv);
-	tlv_pop(tlv);
-
-	apdu = make_apdu(CLA_ISO, INS_GEN_AUTH, pc->pc_alg, slotid);
-	apdu->a_cmd.b_data = tlv_buf(tlv);
-	apdu->a_cmd.b_len = tlv_len(tlv);
-
-	assert(clock_gettime(CLOCK_MONOTONIC, &t0) == 0);
-	rv = transceive_apdu_chain(pk, apdu);
-	if (rv != 0) {
-		fprintf(stderr, "transceive_apdu_chain(%s) failed: %d\n",
-		    pk->pk_rdrname, rv);
-		tlv_free(tlv);
-		free_apdu(apdu);
-		return (1);
-	}
-	assert(clock_gettime(CLOCK_MONOTONIC, &t1) == 0);
-	if (t1.tv_nsec < t0.tv_nsec) {
-		t1.tv_nsec += 1000000000;
-		t1.tv_sec -= 1;
-	}
-	t1.tv_nsec -= t0.tv_nsec;
-	t1.tv_sec -= t0.tv_sec;
-	fprintf(stderr, "signing op took %d.%06ds\n", t1.tv_sec, t1.tv_nsec / 1000);
-
-	tlv_free(tlv);
-
-	if (apdu->a_sw == SW_NO_ERROR) {
-		tlv = tlv_init(apdu->a_reply.b_data, apdu->a_reply.b_offset,
-		    apdu->a_reply.b_len);
-		tag = tlv_read_tag(tlv);
-		if (tag != 0x7C) {
-			if (debug == B_TRUE) {
-				fprintf(stderr, "card in %s returned wrong tag"
-				    " to INS_GEN_AUTH\n", pk->pk_rdrname);
-			}
-			tlv_skip(tlv);
-			tlv_free(tlv);
-			free_apdu(apdu);
-			return (1);
-		}
-		tag = tlv_read_tag(tlv);
-		if (tag != GA_TAG_RESPONSE) {
-			tlv_skip(tlv);
-			tlv_skip(tlv);
-			tlv_free(tlv);
-			free_apdu(apdu);
-			return (1);
-		}
-
-		*siglen = tlv_rem(tlv);
-		buf = calloc(1, *siglen);
-		assert(buf != NULL);
-		*siglen = tlv_read(tlv, buf, 0, *siglen);
-		*signature = buf;
-
-		tlv_end(tlv);
-		tlv_end(tlv);
-		tlv_free(tlv);
-
-		rv = 0;
-
-	} else if (apdu->a_sw = SW_SECURITY_STATUS_NOT_SATISFIED) {
-		rv = EPERM;
-
-	} else {
-		if (debug == B_TRUE) {
-			fprintf(stderr, "card in %s returned sw = %04x to "
-			    "INS_GEN_AUTH\n", pk->pk_rdrname, apdu->a_sw);
-		}
-		rv = 1;
-	}
-
-	free_apdu(apdu);
-
-	return (rv);
-}
-
-static int
-piv_read_cert(struct pivkey *pk, uint slotid)
-{
-	int rv;
-	struct apdu *apdu;
-	struct tlv_state *tlv;
-	uint tag, idx;
-	uint8_t *ptr;
-	size_t len;
-	X509 *cert;
-	struct pivcert *pc;
-	EVP_PKEY *pkey;
-	uint8_t certinfo = 0;
-
-	assert(pk->pk_intxn == B_TRUE);
-
-	tlv = tlv_init_write();
-	tlv_push(tlv, 0x5C);
-	switch (slotid) {
-	case 0x9A:
-		tlv_write_uint(tlv, PIV_TAG_CERT_9A);
-		break;
-	case 0x9C:
-		tlv_write_uint(tlv, PIV_TAG_CERT_9C);
-		break;
-	case 0x9D:
-		tlv_write_uint(tlv, PIV_TAG_CERT_9D);
-		break;
-	case 0x9E:
-		tlv_write_uint(tlv, PIV_TAG_CERT_9E);
-		break;
-	default:
-		assert(0);
-	}
-	tlv_pop(tlv);
-
-	apdu = make_apdu(CLA_ISO, INS_GET_DATA, 0x3F, 0xFF);
-	apdu->a_cmd.b_data = tlv_buf(tlv);
-	apdu->a_cmd.b_len = tlv_len(tlv);
-
-	rv = transceive_apdu_chain(pk, apdu);
-	if (rv != 0) {
-		fprintf(stderr, "transceive_apdu_chain(%s) failed: %d\n",
-		    pk->pk_rdrname, rv);
-		tlv_free(tlv);
-		free_apdu(apdu);
-		return (1);
-	}
-
-	tlv_free(tlv);
-
-	if (apdu->a_sw == SW_NO_ERROR) {
-		tlv = tlv_init(apdu->a_reply.b_data, apdu->a_reply.b_offset,
-		    apdu->a_reply.b_len);
-		tag = tlv_read_tag(tlv);
-		if (tag != 0x53) {
-			if (debug == B_TRUE) {
-				fprintf(stderr, "card in %s returned tag "
-				    " to INS_GET_DATA\n", pk->pk_rdrname);
-			}
-			tlv_skip(tlv);
-			tlv_free(tlv);
-			free_apdu(apdu);
-			return (1);
-		}
-		while (!tlv_at_end(tlv)) {
-			tag = tlv_read_tag(tlv);
-			if (tag == 0x71) {
-				certinfo = tlv_read_byte(tlv);
-				tlv_end(tlv);
-				continue;
-			}
-			if (tag == 0x70) {
-				ptr = tlv_ptr(tlv);
-				len = tlv_rem(tlv);
-			}
-			tlv_skip(tlv);
-		}
-		tlv_end(tlv);
-
-		/* See the NIST PIV spec. This bit should always be zero. */
-		if ((certinfo & PIV_CI_X509) != 0) {
-			if (debug == B_TRUE) {
-				fprintf(stderr, "cert in slot %02X of PIV card "
-				    "in %s is not x509, ignoring\n",
-				    slotid, pk->pk_rdrname);
-			}
-			tlv_free(tlv);
-			free_apdu(apdu);
-			return (1);
-		}
-
-		/* TODO: gzip support */
-		if ((certinfo & PIV_CI_COMPTYPE) != PIV_COMP_NONE) {
-			if (debug == B_TRUE) {
-				fprintf(stderr, "cert in slot %02X of PIV card "
-				    "in %s is compressed, ignoring\n",
-				    slotid, pk->pk_rdrname);
-			}
-			tlv_free(tlv);
-			free_apdu(apdu);
-			return (1);
-		}
-
-		cert = d2i_X509(NULL, &ptr, len);
-		if (cert == NULL) {
-			/* Getting error codes out of OpenSSL is weird. */
-			char errbuf[128];
-			unsigned long err = ERR_peek_last_error();
-			if (debug == B_TRUE) {
-				ERR_load_crypto_strings();
-				ERR_error_string(err, errbuf);
-				fprintf(stderr, "openssl: %s\n", errbuf);
-			}
-			tlv_free(tlv);
-			free_apdu(apdu);
-			return (1);
-		}
-
-		tlv_free(tlv);
-
-		for (pc = pk->pk_certs; pc != NULL; pc = pc->pc_next) {
-			if (pc->pc_slot == slotid)
-				break;
-		}
-		if (pc == NULL) {
-			pc = calloc(1, sizeof (struct pivcert));
-			assert(pc != NULL);
-			pc->pc_next = pk->pk_certs;
-			pk->pk_certs = pc;
-		} else {
-			OPENSSL_free(pc->pc_subj);
-			X509_free(pc->pc_x509);
-			sshkey_free(pc->pc_pubkey);
-		}
-		pc->pc_slot = slotid;
-		pc->pc_x509 = cert;
-		pc->pc_subj = X509_NAME_oneline(
-		    X509_get_subject_name(cert), NULL, 0);
-		pkey = X509_get_pubkey(cert);
-		assert(pkey != NULL);
-		assert(sshkey_from_evp_pkey(pkey, KEY_UNSPEC,
-		    &pc->pc_pubkey) == 0);
-
-		switch (pc->pc_pubkey->type) {
-		case KEY_ECDSA:
-			switch (sshkey_size(pc->pc_pubkey)) {
-			case 256:
-				pc->pc_alg = PIV_ALG_ECCP256;
-				break;
-			case 384:
-				pc->pc_alg = PIV_ALG_ECCP384;
-				break;
-			default:
-				assert(0);
-			}
-			break;
-		case KEY_RSA:
-			switch (sshkey_size(pc->pc_pubkey)) {
-			case 1024:
-				pc->pc_alg = PIV_ALG_RSA1024;
-				break;
-			case 2048:
-				pc->pc_alg = PIV_ALG_RSA2048;
-				break;
-			default:
-				assert(0);
-			}
-			break;
-		default:
-			assert(0);
-		}
-
-		rv = 0;
-	} else {
-		if (debug == B_TRUE) {
-			fprintf(stderr, "card in %s returned sw = %04x to "
-			    "INS_GET_DATA\n", pk->pk_rdrname, apdu->a_sw);
-		}
-		rv = 1;
-	}
-
-	free_apdu(apdu);
-
-	return (rv);
-}
-
-static void
-read_all_certs(struct pivkey *pk)
-{
-	piv_read_cert(pk, 0x9A);
-	piv_read_cert(pk, 0x9C);
-	piv_read_cert(pk, 0x9D);
-	piv_read_cert(pk, 0x9E);
-}
-
-static int
-piv_read_chuid(struct pivkey *pk)
-{
-	int rv;
-	struct apdu *apdu;
-	struct tlv_state *tlv;
-	uint tag, idx;
-
-	assert(pk->pk_intxn == B_TRUE);
-
-	tlv = tlv_init_write();
-	tlv_push(tlv, 0x5C);
-	tlv_write_uint(tlv, PIV_TAG_CHUID);
-	tlv_pop(tlv);
-
-	apdu = make_apdu(CLA_ISO, INS_GET_DATA, 0x3F, 0xFF);
-	apdu->a_cmd.b_data = tlv_buf(tlv);
-	apdu->a_cmd.b_len = tlv_len(tlv);
-
-	rv = transceive_apdu(pk, apdu);
-	if (rv != 0) {
-		fprintf(stderr, "transceive_apdu(%s) failed: %d\n",
-		    pk->pk_rdrname, rv);
-		tlv_free(tlv);
-		free_apdu(apdu);
-		return (1);
-	}
-
-	tlv_free(tlv);
-
-	if (apdu->a_sw == SW_NO_ERROR) {
-		tlv = tlv_init(apdu->a_reply.b_data, apdu->a_reply.b_offset,
-		    apdu->a_reply.b_len);
-		tag = tlv_read_tag(tlv);
-		if (tag != 0x53) {
-			if (debug == B_TRUE) {
-				fprintf(stderr, "card in %s returned tag "
-				    " to INS_GET_DATA\n", pk->pk_rdrname);
-			}
-			free_apdu(apdu);
-			return (1);
-		}
-		while (!tlv_at_end(tlv)) {
-			tag = tlv_read_tag(tlv);
-			switch (tag) {
-			case 0xEE:	/* Buffer Length */
-			case 0x30:	/* FASC-N */
-			case 0x32:	/* Org Ident */
-			case 0x33:	/* DUNS */
-			case 0x35:	/* Expiration date */
-			case 0x36:	/* Cardholder UUID */
-			case 0x3E:	/* Signature */
-			case 0xFE:	/* CRC */
-				tlv_skip(tlv);
-				break;
-			case 0x34:	/* Card GUID */
-				assert(tlv_read(tlv, pk->pk_guid, 0,
-				    sizeof (pk->pk_guid)) ==
-				    sizeof (pk->pk_guid));
-				tlv_end(tlv);
-				break;
-			default:
-				assert(0);
-			}
-		}
-		tlv_end(tlv);
-		tlv_free(tlv);
-		rv = 0;
-	} else {
-		if (debug == B_TRUE) {
-			fprintf(stderr, "card in %s returned sw = %04x to "
-			    "INS_GET_DATA\n", pk->pk_rdrname, apdu->a_sw);
-		}
-		rv = 1;
-	}
-
-	free_apdu(apdu);
-
-	return (rv);
-}
-
-static int
-piv_select(struct pivkey *pk)
-{
-	int rv;
-	struct apdu *apdu;
-	struct tlv_state *tlv;
-	uint tag, idx;
-
-	assert(pk->pk_intxn == B_TRUE);
-
-	apdu = make_apdu(CLA_ISO, INS_SELECT, SEL_APP_AID, 0);
-	apdu->a_cmd.b_data = (uint8_t *)AID_PIV;
-	apdu->a_cmd.b_len = sizeof (AID_PIV);
-
-	rv = transceive_apdu(pk, apdu);
-	if (rv != 0) {
-		fprintf(stderr, "transceive_apdu(%s) failed: %d\n",
-		    pk->pk_rdrname, rv);
-		free_apdu(apdu);
-		return (1);
-	}
-
-	if (apdu->a_sw == SW_NO_ERROR) {
-		tlv = tlv_init(apdu->a_reply.b_data, apdu->a_reply.b_offset,
-		    apdu->a_reply.b_len);
-		tag = tlv_read_tag(tlv);
-		if (tag != PIV_TAG_APT) {
-			if (debug == B_TRUE) {
-				fprintf(stderr, "card in %s returned bad app "
-				    "info tag to INS_SELECT\n", pk->pk_rdrname);
-			}
-			free_apdu(apdu);
-			return (1);
-		}
-		while (!tlv_at_end(tlv)) {
-			tag = tlv_read_tag(tlv);
-			switch (tag) {
-			case PIV_TAG_AID:
-			case PIV_TAG_AUTHORITY:
-			case PIV_TAG_APP_LABEL:
-			case PIV_TAG_URI:
-				/* TODO: validate/store these maybe? */
-				tlv_skip(tlv);
-				break;
-			case PIV_TAG_ALGS:
-				if (pk->pk_alg_count > 0) {
-					tlv_skip(tlv);
-					break;
-				}
-				while (!tlv_at_end(tlv)) {
-					tag = tlv_read_tag(tlv);
-					if (tag == 0x80) {
-						idx = pk->pk_alg_count++;
-						pk->pk_algs[idx] =
-						    tlv_read_uint(tlv);
-						tlv_end(tlv);
-					} else if (tag == 0x06) {
-						tlv_skip(tlv);
-					} else {
-						assert(0);
-					}
-				}
-				tlv_end(tlv);
-				break;
-			default:
-				assert(0);
-			}
-		}
-		tlv_end(tlv);
-		tlv_free(tlv);
-		rv = 0;
-	} else {
-		if (debug == B_TRUE) {
-			fprintf(stderr, "card in %s returned sw = %04x to "
-			    "INS_SELECT\n", pk->pk_rdrname, apdu->a_sw);
-		}
-		rv = 1;
-	}
-
-	free_apdu(apdu);
-
-	return (rv);
-}
-
-static void
-piv_begin_txn(struct pivkey *key)
-{
-	assert(key->pk_intxn == B_FALSE);
-	LONG rv;
-	rv = SCardBeginTransaction(key->pk_cardhdl);
-	if (rv != SCARD_S_SUCCESS) {
-		fprintf(stderr, "SCardBeginTransaction(%s) failed: %s\n",
-		    key->pk_rdrname, pcsc_stringify_error(rv));
-		exit(1);
-	}
-	key->pk_intxn = B_TRUE;
-}
-
-static void
-piv_end_txn(struct pivkey *key)
-{
-	assert(key->pk_intxn == B_TRUE);
-	LONG rv;
-	rv = SCardEndTransaction(key->pk_cardhdl,
-	    key->pk_reset ? SCARD_RESET_CARD : SCARD_LEAVE_CARD);
-	if (rv != SCARD_S_SUCCESS) {
-		fprintf(stderr, "SCardEndTransaction(%s) failed: %s\n",
-		    key->pk_rdrname, pcsc_stringify_error(rv));
-		exit(1);
-	}
-	key->pk_intxn = B_FALSE;
-	key->pk_reset = B_FALSE;
-}
-
-static void
-find_all_pivkeys(SCARDCONTEXT ctx)
-{
-	DWORD rv, readersLen;
-	LPTSTR readers, thisrdr;
-
-	rv = SCardListReaders(ctx, NULL, NULL, &readersLen);
-	if (rv != SCARD_S_SUCCESS) {
-		fprintf(stderr, "SCardListReaders failed: %s\n",
-		    pcsc_stringify_error(rv));
-		exit(1);
-	}
-	readers = calloc(1, readersLen);
-	rv = SCardListReaders(ctx, NULL, readers, &readersLen);
-	if (rv != SCARD_S_SUCCESS) {
-		fprintf(stderr, "SCardListReaders failed: %s\n",
-		    pcsc_stringify_error(rv));
-		exit(1);
-	}
-
-	for (thisrdr = readers; *thisrdr != 0; thisrdr += strlen(thisrdr) + 1) {
-		SCARDHANDLE card;
-		struct pivkey *key;
-		DWORD activeProtocol;
-
-		rv = SCardConnect(ctx, thisrdr, SCARD_SHARE_SHARED,
-		    SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, &card,
-		    &activeProtocol);
-		if (rv != SCARD_S_SUCCESS) {
-			if (debug == B_TRUE) {
-				fprintf(stderr, "SCardConnect(%s) failed: %s\n",
-				    thisrdr, pcsc_stringify_error(rv));
-			}
-			continue;
-		}
-
-		key = calloc(1, sizeof (struct pivkey));
-		key->pk_cardhdl = card;
-		key->pk_rdrname = thisrdr;
-		key->pk_proto = activeProtocol;
-
-		switch (activeProtocol) {
-		case SCARD_PROTOCOL_T0:
-			key->pk_sendpci = *SCARD_PCI_T0;
-			break;
-		case SCARD_PROTOCOL_T1:
-			key->pk_sendpci = *SCARD_PCI_T1;
-			break;
-		default:
-			assert(0);
-		}
-
-		piv_begin_txn(key);
-		rv = piv_select(key);
-		if (rv == 0)
-			rv = piv_read_chuid(key);
-		if (rv == 0)
-			read_all_certs(key);
-		piv_end_txn(key);
-
-		if (rv == 0) {
-			key->pk_next = ks;
-			ks = key;
-		} else {
-			(void) SCardDisconnect(card, SCARD_RESET_CARD);
-		}
-	}
-}
+static struct piv_token *ks = NULL;
+static struct piv_token *selk = NULL;
 
 static uint8_t *
 parse_hex(const char *str, uint *outlen)
@@ -1143,7 +86,7 @@ parse_hex(const char *str, uint *outlen)
 }
 
 static uint8_t *
-read_stdin(uint limit, uint *outlen)
+read_stdin(size_t limit, size_t *outlen)
 {
 	uint8_t *buf = calloc(1, limit * 3);
 	size_t n;
@@ -1166,14 +109,16 @@ read_stdin(uint limit, uint *outlen)
 }
 
 static void
-assert_pin(struct pivkey *pk)
+assert_pin(struct piv_token *pk)
 {
 	int rv;
+	uint retries;
+
 	if (pin != NULL) {
-		rv = piv_verify_pin(selk, pin);
+		rv = piv_verify_pin(selk, pin, &retries);
 		if (rv == EACCES) {
 			fprintf(stderr, "error: invalid PIN code (%d attempts "
-			    "remaining)\n", pk->pk_pinretries);
+			    "remaining)\n", retries);
 			exit(3);
 		} else if (rv != 0) {
 			fprintf(stderr, "error: failed to verify PIN\n");
@@ -1182,22 +127,29 @@ assert_pin(struct pivkey *pk)
 	}
 }
 
+extern char *buf_to_hex(const uint8_t *buf, size_t len);
+
 static void
 cmd_list(SCARDCONTEXT ctx)
 {
-	struct pivkey *pk;
-	struct pivcert *cert;
-	int i;
+	struct piv_token *pk;
+	struct piv_slot *cert;
+	int i, rv;
+	char *buf;
 
-	for (pk = ks; pk != NULL; pk = pk->pk_next) {
-		printf("PIV card in '%s': guid = ",
-		    pk->pk_rdrname);
-		dump_hex(stdout, pk->pk_guid, sizeof (pk->pk_guid));
-		fprintf(stdout, "\n");
-		if (pk->pk_alg_count > 0) {
+	for (pk = ks; pk != NULL; pk = pk->pt_next) {
+		assert(piv_txn_begin(pk) == 0);
+		piv_read_all_certs(pk);
+		piv_txn_end(pk);
+
+		buf = buf_to_hex(pk->pt_guid, sizeof (pk->pt_guid));
+		printf("PIV card in '%s': guid = %s\n",
+		    pk->pt_rdrname, buf);
+		free(buf);
+		if (pk->pt_alg_count > 0) {
 			printf("  * supports: ");
-			for (i = 0; i < pk->pk_alg_count; ++i) {
-				switch (pk->pk_algs[i]) {
+			for (i = 0; i < pk->pt_alg_count; ++i) {
+				switch (pk->pt_algs[i]) {
 				case PIV_ALG_3DES:
 					printf("3DES ");
 					break;
@@ -1226,10 +178,10 @@ cmd_list(SCARDCONTEXT ctx)
 			}
 			printf("\n");
 		}
-		for (cert = pk->pk_certs; cert != NULL; cert = cert->pc_next) {
-			printf("  * slot %02X: %s (%s %d)\n", cert->pc_slot,
-			    cert->pc_subj, sshkey_type(cert->pc_pubkey),
-			    sshkey_size(cert->pc_pubkey));
+		for (cert = pk->pt_slots; cert != NULL; cert = cert->ps_next) {
+			printf("  * slot %02X: %s (%s %d)\n", cert->ps_slot,
+			    cert->ps_subj, sshkey_type(cert->ps_pubkey),
+			    sshkey_size(cert->ps_pubkey));
 		}
 	}
 }
@@ -1237,7 +189,8 @@ cmd_list(SCARDCONTEXT ctx)
 static void
 cmd_pubkey(uint slotid)
 {
-	struct pivcert *cert;
+	struct piv_slot *cert;
+	char *buf;
 	int rv;
 
 	switch (slotid) {
@@ -1252,8 +205,8 @@ cmd_pubkey(uint slotid)
 		exit(3);
 	}
 
-	for (cert = selk->pk_certs; cert != NULL; cert = cert->pc_next) {
-		if (cert->pc_slot == slotid)
+	for (cert = selk->pt_slots; cert != NULL; cert = cert->ps_next) {
+		if (cert->ps_slot == slotid)
 			break;
 	}
 	if (cert == NULL) {
@@ -1262,21 +215,22 @@ cmd_pubkey(uint slotid)
 		exit(1);
 	}
 
-	rv = sshkey_write(cert->pc_pubkey, stdout);
+	rv = sshkey_write(cert->ps_pubkey, stdout);
 	if (rv != 0) {
 		fprintf(stderr, "error: failed to write out key\n");
 		exit(1);
 	}
-	fprintf(stdout, " PIV_slot_%02X@", slotid);
-	dump_hex(stdout, selk->pk_guid, sizeof (selk->pk_guid));
-	fprintf(stdout, " \"%s\"\n", cert->pc_subj);
+	buf = buf_to_hex(selk->pt_guid, sizeof (selk->pt_guid));
+	fprintf(stdout, " PIV_slot_%02X@%s \"%s\"\n", slotid, buf,
+	    cert->ps_subj);
+	free(buf);
 	exit(0);
 }
 
 static void
 cmd_sign(uint slotid)
 {
-	struct pivcert *cert;
+	struct piv_slot *cert;
 	uint8_t *buf, *sig;
 	int hashalg;
 	struct ssh_digest_ctx *hctx;
@@ -1295,17 +249,23 @@ cmd_sign(uint slotid)
 		exit(3);
 	}
 
-	for (cert = selk->pk_certs; cert != NULL; cert = cert->pc_next) {
-		if (cert->pc_slot == slotid)
-			break;
-	}
-	if (cert == NULL) {
+	piv_txn_begin(selk);
+	rv = piv_read_cert(selk, slotid);
+	piv_txn_end(selk);
+
+	cert = piv_get_slot(selk, slotid);
+
+	if (cert == NULL && rv == ENOENT) {
 		fprintf(stderr, "error: PIV slot %02X has no key present\n",
+		    slotid);
+		exit(1);
+	} else if (cert == NULL) {
+		fprintf(stderr, "error: failed to read cert in PIV slot %02X\n",
 		    slotid);
 		exit(1);
 	}
 
-	switch (cert->pc_alg) {
+	switch (cert->ps_alg) {
 	case PIV_ALG_RSA1024:
 		inplen = 128;
 		dglen = 32;
@@ -1347,8 +307,8 @@ cmd_sign(uint slotid)
 	 * ECDSA is so much nicer than this. Why can't we just use it? Oh,
 	 * because Java ruined everything. Right.
 	 */
-	if (cert->pc_alg == PIV_ALG_RSA1024 ||
-	    cert->pc_alg == PIV_ALG_RSA2048) {
+	if (cert->ps_alg == PIV_ALG_RSA1024 ||
+	    cert->ps_alg == PIV_ALG_RSA2048) {
 		int nid;
 		/*
 		 * Roll up your sleeves, folks, we're going in (to the dank
@@ -1395,10 +355,10 @@ cmd_sign(uint slotid)
 		OPENSSL_free(out);
 	}
 
-	piv_begin_txn(selk);
+	piv_txn_begin(selk);
 	assert_pin(selk);
-	rv = piv_sign_hash(selk, slotid, buf, inplen, &sig, &siglen);
-	piv_end_txn(selk);
+	rv = piv_sign_prehash(selk, cert, buf, inplen, &sig, &siglen);
+	piv_txn_end(selk);
 	if (rv == EPERM) {
 		fprintf(stderr, "error: key in slot %02X requires PIN\n",
 		    slotid);
@@ -1417,7 +377,7 @@ cmd_sign(uint slotid)
 static void
 cmd_ecdh(uint slotid)
 {
-	struct pivcert *cert;
+	struct piv_slot *cert;
 	struct sshkey *pubkey;
 	uint8_t *buf, *ptr, *secret;
 	size_t nread, boff, seclen;
@@ -1435,17 +395,23 @@ cmd_ecdh(uint slotid)
 		exit(3);
 	}
 
-	for (cert = selk->pk_certs; cert != NULL; cert = cert->pc_next) {
-		if (cert->pc_slot == slotid)
-			break;
-	}
-	if (cert == NULL) {
+	piv_txn_begin(selk);
+	rv = piv_read_cert(selk, slotid);
+	piv_txn_end(selk);
+
+	cert = piv_get_slot(selk, slotid);
+
+	if (cert == NULL && rv == ENOENT) {
 		fprintf(stderr, "error: PIV slot %02X has no key present\n",
+		    slotid);
+		exit(1);
+	} else if (cert == NULL) {
+		fprintf(stderr, "error: failed to read cert in PIV slot %02X\n",
 		    slotid);
 		exit(1);
 	}
 
-	switch (cert->pc_alg) {
+	switch (cert->ps_alg) {
 	case PIV_ALG_ECCP256:
 	case PIV_ALG_ECCP384:
 		break;
@@ -1455,21 +421,10 @@ cmd_ecdh(uint slotid)
 		exit(1);
 	}
 
-	buf = calloc(1, 8192);
+	buf = read_stdin(8192, &boff);
 	assert(buf != NULL);
-	boff = 0;
-	do {
-		nread = read(0, buf + boff, 8192 - boff);
-		if (nread > 0) {
-			boff += nread;
-			if (boff >= 8190) {
-				fprintf(stderr, "error: public key too long\n");
-				exit(1);
-			}
-		}
-	} while (!(nread == 0 || (nread == -1 && errno != EINTR)));
 
-	pubkey = sshkey_new(cert->pc_pubkey->type);
+	pubkey = sshkey_new(cert->ps_pubkey->type);
 	assert(pubkey != NULL);
 	ptr = buf;
 	rv = sshkey_read(pubkey, &ptr);
@@ -1479,10 +434,10 @@ cmd_ecdh(uint slotid)
 		exit(1);
 	}
 
-	piv_begin_txn(selk);
+	piv_txn_begin(selk);
 	assert_pin(selk);
-	rv = piv_ecdh(selk, slotid, pubkey, &secret, &seclen);
-	piv_end_txn(selk);
+	rv = piv_ecdh(selk, cert, pubkey, &secret, &seclen);
+	piv_txn_end(selk);
 	if (rv == EPERM) {
 		fprintf(stderr, "error: key in slot %02X requires PIN\n",
 		    slotid);
@@ -1530,10 +485,13 @@ main(int argc, char *argv[])
 	int c;
 	uint len;
 
+	bunyan_init();
+	bunyan_set_name("pivtool");
+
 	while ((c = getopt(argc, argv, optstring)) != -1) {
 		switch (c) {
 		case 'd':
-			debug = B_TRUE;
+			bunyan_set_level(TRACE);
 			break;
 		case 'c':
 			/*acc_code = parse_hex(optarg, &len);*/
@@ -1574,7 +532,7 @@ main(int argc, char *argv[])
 		return (1);
 	}
 
-	find_all_pivkeys(ctx);
+	ks = piv_enumerate(ctx);
 
 	if (strcmp(op, "list") == 0) {
 		if (optind < argc)
@@ -1588,14 +546,14 @@ main(int argc, char *argv[])
 		return (1);
 	}
 	if (guid != NULL) {
-		for (selk = ks; selk != NULL; selk = selk->pk_next) {
-			if (bcmp(selk->pk_guid, guid, 16) == 0)
+		for (selk = ks; selk != NULL; selk = selk->pt_next) {
+			if (bcmp(selk->pt_guid, guid, 16) == 0)
 				break;
 		}
 	}
 	if (selk == NULL) {
 		selk = ks;
-		if (selk->pk_next != NULL) {
+		if (selk->pt_next != NULL) {
 			fprintf(stderr, "error: multiple PIV cards present; "
 			    "you must provide -g|--guid to select one\n");
 			return (3);

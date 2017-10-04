@@ -26,6 +26,7 @@
 
 #include <sys/mman.h>
 #include <sys/debug.h>
+#include <sys/sdt.h>
 #include <libnvpair.h>
 
 #include "bunyan.h"
@@ -36,6 +37,7 @@ static mutex_t bunyan_bmutex;
 static mutex_t *bunyan_wrmutex = NULL;
 static void *bunyan_shmem = NULL;
 static nvlist_t *bunyan_base = NULL;
+static enum bunyan_log_level bunyan_min_level = INFO;
 
 struct bunyan_timers {
 	struct timer_block *bt_first;
@@ -52,6 +54,33 @@ struct timer_block {
 };
 
 #define	NS_PER_S	1000000000ULL
+
+static inline char
+nybble_to_hex(uint8_t nybble)
+{
+	if (nybble >= 0xA)
+		return ('A' + (nybble - 0xA));
+	else
+		return ('0' + nybble);
+}
+
+char *
+buf_to_hex(const uint8_t *buf, size_t len)
+{
+	size_t i, j = 0;
+	char *out = calloc(1, len * 3 + 1);
+	uint8_t nybble;
+	for (i = 0; i < len; ++i) {
+		nybble = (buf[i] & 0xF0) >> 4;
+		out[j++] = nybble_to_hex(nybble);
+		nybble = (buf[i] & 0x0F);
+		out[j++] = nybble_to_hex(nybble);
+		if (i + 1 < len)
+			out[j++] = ' ';
+	}
+	out[j] = 0;
+	return (out);
+}
 
 void
 tspec_subtract(struct timespec *result, const struct timespec *x,
@@ -86,6 +115,14 @@ bny_timers_to_nvl(struct bunyan_timers *tms, nvlist_t *nvl)
 		}
 	}
 	return (0);
+}
+
+void
+bunyan_set_level(enum bunyan_log_level level)
+{
+	mutex_enter(&bunyan_bmutex);
+	bunyan_min_level = level;
+	mutex_exit(&bunyan_bmutex);
 }
 
 struct bunyan_timers *
@@ -170,7 +207,9 @@ bunyan_init(void)
 void
 bunyan_set_name(const char *name)
 {
+	mutex_enter(&bunyan_bmutex);
 	bunyan_name = name;
+	mutex_exit(&bunyan_bmutex);
 }
 
 static void
@@ -254,12 +293,13 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 
 	mutex_enter(&bunyan_bmutex);
 	VERIFY0(nvlist_dup(bunyan_base, &nvl, 0));
-	mutex_exit(&bunyan_bmutex);
 	VERIFY0(nvlist_add_int32(nvl, "level", level));
 	VERIFY0(nvlist_add_string(nvl, "name", bunyan_name));
 	if (bunyan_hostname == NULL)
 		bunyan_get_hostname();
 	VERIFY0(nvlist_add_string(nvl, "hostname", bunyan_hostname));
+	mutex_exit(&bunyan_bmutex);
+
 	VERIFY0(nvlist_add_int32(nvl, "pid", getpid()));
 
 	bunyan_timestamp(time, sizeof (time));
@@ -270,7 +310,11 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 	va_start(ap, msg);
 	while (1) {
 		const char *strval;
+		char *wstrval;
+		const uint8_t *binval;
 		int intval;
+		uint uintval;
+		uint64_t uint64val;
 		size_t szval;
 		nvlist_t *nvlval;
 		struct bunyan_timers *tsval;
@@ -290,6 +334,18 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 			intval = va_arg(ap, int);
 			VERIFY0(nvlist_add_int32(nvl, propname, intval));
 			break;
+		case BNY_UINT:
+			uintval = va_arg(ap, uint);
+			VERIFY0(nvlist_add_uint32(nvl, propname, uintval));
+			break;
+		case BNY_UINT64:
+			uint64val = va_arg(ap, uint64_t);
+			VERIFY0(nvlist_add_uint64(nvl, propname, uint64val));
+			break;
+		case BNY_SIZE_T:
+			szval = va_arg(ap, size_t);
+			VERIFY0(nvlist_add_uint64(nvl, propname, szval));
+			break;
 		case BNY_NVLIST:
 			nvlval = va_arg(ap, nvlist_t *);
 			VERIFY0(nvlist_add_nvlist(nvl, propname, nvlval));
@@ -300,11 +356,25 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 			VERIFY0(bny_timers_to_nvl(tsval, nnvl));
 			VERIFY0(nvlist_add_nvlist(nvl, propname, nnvl));
 			break;
+		case BNY_BIN_HEX:
+			binval = va_arg(ap, const uint8_t *);
+			szval = va_arg(ap, size_t);
+			wstrval = buf_to_hex(binval, szval);
+			VERIFY0(nvlist_add_string(nvl, propname, wstrval));
+			free(wstrval);
+			break;
 		default:
 			assert(0);
 		}
 	}
 	va_end(ap);
+
+	mutex_enter(&bunyan_bmutex);
+	if (level < bunyan_min_level) {
+		mutex_exit(&bunyan_bmutex);
+		return;
+	}
+	mutex_exit(&bunyan_bmutex);
 
 	mutex_enter(bunyan_wrmutex);
 	nvlist_print_json(stderr, nvl);
