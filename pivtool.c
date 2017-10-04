@@ -423,6 +423,7 @@ piv_ecdh(struct pivkey *pk, uint slotid, struct sshkey *othpub,
 	const uint8_t *buf;
 	struct sshbuf *sbuf;
 	size_t len;
+	struct timespec t0, t1;
 
 	for (pc = pk->pk_certs; pc != NULL; pc = pc->pc_next) {
 		if (pc->pc_slot == slotid)
@@ -457,6 +458,7 @@ piv_ecdh(struct pivkey *pk, uint slotid, struct sshkey *othpub,
 	apdu->a_cmd.b_data = tlv_buf(tlv);
 	apdu->a_cmd.b_len = tlv_len(tlv);
 
+	assert(clock_gettime(CLOCK_MONOTONIC, &t0) == 0);
 	rv = transceive_apdu_chain(pk, apdu);
 	if (rv != 0) {
 		fprintf(stderr, "transceive_apdu_chain(%s) failed: %d\n",
@@ -465,6 +467,14 @@ piv_ecdh(struct pivkey *pk, uint slotid, struct sshkey *othpub,
 		free_apdu(apdu);
 		return (1);
 	}
+	assert(clock_gettime(CLOCK_MONOTONIC, &t1) == 0);
+	if (t1.tv_nsec < t0.tv_nsec) {
+		t1.tv_nsec += 1000000000;
+		t1.tv_sec -= 1;
+	}
+	t1.tv_nsec -= t0.tv_nsec;
+	t1.tv_sec -= t0.tv_sec;
+	fprintf(stderr, "ecdh op took %d.%06ds\n", t1.tv_sec, t1.tv_nsec / 1000);
 
 	tlv_free(tlv);
 
@@ -529,6 +539,7 @@ piv_sign_hash(struct pivkey *pk, uint slotid, uint8_t *hash, size_t hashlen,
 	uint tag;
 	struct pivcert *pc;
 	uint8_t *buf;
+	struct timespec t0, t1;
 
 	/*
 	 * Find the pk_certs entry for this slot. We need this to figure out
@@ -558,6 +569,7 @@ piv_sign_hash(struct pivkey *pk, uint slotid, uint8_t *hash, size_t hashlen,
 	apdu->a_cmd.b_data = tlv_buf(tlv);
 	apdu->a_cmd.b_len = tlv_len(tlv);
 
+	assert(clock_gettime(CLOCK_MONOTONIC, &t0) == 0);
 	rv = transceive_apdu_chain(pk, apdu);
 	if (rv != 0) {
 		fprintf(stderr, "transceive_apdu_chain(%s) failed: %d\n",
@@ -566,6 +578,14 @@ piv_sign_hash(struct pivkey *pk, uint slotid, uint8_t *hash, size_t hashlen,
 		free_apdu(apdu);
 		return (1);
 	}
+	assert(clock_gettime(CLOCK_MONOTONIC, &t1) == 0);
+	if (t1.tv_nsec < t0.tv_nsec) {
+		t1.tv_nsec += 1000000000;
+		t1.tv_sec -= 1;
+	}
+	t1.tv_nsec -= t0.tv_nsec;
+	t1.tv_sec -= t0.tv_sec;
+	fprintf(stderr, "signing op took %d.%06ds\n", t1.tv_sec, t1.tv_nsec / 1000);
 
 	tlv_free(tlv);
 
