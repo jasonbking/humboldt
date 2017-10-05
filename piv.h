@@ -58,6 +58,8 @@ enum iso_sw {
 	SW_WARNING_00 = 0x6300,
 	SW_FILE_NOT_FOUND = 0x6A82,
 	SW_INCORRECT_PIN = 0x63C0,
+	SW_INCORRECT_P1P2 = 0x6A86,
+	SW_WRONG_DATA = 0x6A80,
 };
 
 enum piv_sel_tag {
@@ -97,6 +99,14 @@ enum piv_alg {
 	PIV_ALG_AES256 = 0x0C,
 	PIV_ALG_ECCP256 = 0x11,
 	PIV_ALG_ECCP384 = 0x14,
+
+	/*
+	 * Proprietary hack for Javacards running PivApplet -- they don't
+	 * support bare ECDSA so instead we have to give them the full input
+	 * data and they hash it on the card.
+	 */
+	PIV_ALG_ECCP256_SHA1 = 0xf0,
+	PIV_ALG_ECCP256_SHA256 = 0xf1,
 };
 
 enum piv_cert_comp {
@@ -230,6 +240,33 @@ int piv_read_cert(struct piv_token *tk, enum piv_slotid slotid);
  * other error will return early and may not try all slots.
  */
 int piv_read_all_certs(struct piv_token *tk);
+
+/*
+ * Authenticates as the card administrator using a 3DES key.
+ *
+ * Errors:
+ *  - EIO: general card communication failure
+ */
+int piv_auth_admin(struct piv_token *tk, const uint8_t *key, size_t keylen);
+
+/*
+ * Generates a new asymmetric private key in a slot on the token, and returns
+ * the public key.
+ *
+ * Errors:
+ *  - EIO: general card communication failure
+ */
+int piv_generate(struct piv_token *tk, enum piv_slotid slotid,
+    enum piv_alg alg, struct sshkey **pubkey);
+
+/*
+ * Loads a certificate for a given slot on the token.
+ *
+ * Errors:
+ *  - EIO: general card communication failure
+ */
+int piv_load_cert(struct piv_token *tk, enum piv_slotid slotid,
+    const uint8_t *data, size_t datalen);
 
 /*
  * Tries to unlock the PIV token using a PIN code.

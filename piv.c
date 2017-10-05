@@ -26,6 +26,7 @@
 #include "sshkey.h"
 #include "sshbuf.h"
 #include "digest.h"
+#include "cipher.h"
 
 #include <openssl/err.h>
 #include <openssl/x509.h>
@@ -543,6 +544,155 @@ piv_select(struct piv_token *tk)
 }
 
 int
+piv_auth_admin(struct piv_token *pt, const uint8_t *key, size_t keylen)
+{
+	int rv;
+	struct apdu *apdu;
+	struct tlv_state *tlv;
+	uint tag;
+	uint8_t *chal = NULL, *resp = NULL, *iv = NULL;
+	size_t challen, ivlen, resplen;
+	const struct sshcipher *cipher;
+	struct sshcipher_ctx *cctx;
+
+	assert(pt->pt_intxn == B_TRUE);
+
+	cipher = cipher_by_name("3des-cbc");
+	assert(cipher != NULL);
+
+	assert(cipher_keylen(cipher) == keylen);
+	assert(cipher_authlen(cipher) == 0);
+
+	tlv = tlv_init_write();
+	tlv_push(tlv, 0x7C);
+	tlv_push(tlv, GA_TAG_CHALLENGE);
+	tlv_pop(tlv);
+	tlv_pop(tlv);
+
+	apdu = piv_apdu_make(CLA_ISO, INS_GEN_AUTH, PIV_ALG_3DES,
+	    PIV_SLOT_ADMIN);
+	apdu->a_cmd.b_data = tlv_buf(tlv);
+	apdu->a_cmd.b_len = tlv_len(tlv);
+
+	rv = piv_apdu_transceive(pt, apdu);
+	if (rv != 0) {
+		bunyan_log(WARN, "piv_auth_admin.transceive_chain failed",
+		    "reader", BNY_STRING, pt->pt_rdrname,
+		    "err", BNY_STRING, pcsc_stringify_error(rv),
+		    NULL);
+		tlv_free(tlv);
+		piv_apdu_free(apdu);
+		return (EIO);
+	}
+
+	tlv_free(tlv);
+
+	if (apdu->a_sw != SW_NO_ERROR) {
+		bunyan_log(DEBUG, "card did not return challenge to "
+		    "INS_GEN_AUTH",
+		    "reader", BNY_STRING, pt->pt_rdrname,
+		    "sw", BNY_UINT, (uint)apdu->a_sw, NULL);
+		piv_apdu_free(apdu);
+		return (EINVAL);
+	}
+
+	tlv = tlv_init(apdu->a_reply.b_data, apdu->a_reply.b_offset,
+	    apdu->a_reply.b_len);
+	tag = tlv_read_tag(tlv);
+	if (tag != 0x7C) {
+		bunyan_log(DEBUG, "card returned invalid tag in PIV "
+		    "INS_GEN_AUTH response payload",
+		    "reader", BNY_STRING, pt->pt_rdrname,
+		    "slotid", BNY_UINT, (uint)0x9B,
+		    "tag", BNY_UINT, tag,
+		    "reply", BNY_BIN_HEX, apdu->a_reply.b_data +
+		    apdu->a_reply.b_offset, apdu->a_reply.b_len, NULL);
+		tlv_skip(tlv);
+		tlv_free(tlv);
+		piv_apdu_free(apdu);
+		return (ENOTSUP);
+	}
+
+	while (!tlv_at_end(tlv)) {
+		tag = tlv_read_tag(tlv);
+		if (tag == GA_TAG_CHALLENGE) {
+			challen = tlv_rem(tlv);
+			chal = calloc(1, challen);
+			challen = tlv_read(tlv, chal, 0, challen);
+			tlv_end(tlv);
+			continue;
+		}
+		tlv_skip(tlv);
+	}
+	tlv_end(tlv);
+
+	assert(chal != NULL);
+	tlv_free(tlv);
+	piv_apdu_free(apdu);
+
+	resplen = challen;
+	resp = calloc(1, resplen);
+	assert(resp != NULL);
+
+	assert(cipher_blocksize(cipher) == challen);
+
+	ivlen = cipher_ivlen(cipher);
+	iv = calloc(1, ivlen);
+	assert(iv != NULL);
+	explicit_bzero(iv, ivlen);
+
+	rv = cipher_init(&cctx, cipher, key, keylen, iv, ivlen, 1);
+	assert(rv == 0);
+	rv = cipher_crypt(cctx, 0, resp, chal, challen, 0, 0);
+	assert(rv == 0);
+	cipher_free(cctx);
+
+	tlv = tlv_init_write();
+	tlv_push(tlv, 0x7C);
+	tlv_push(tlv, GA_TAG_RESPONSE);
+	tlv_write(tlv, resp, 0, resplen);
+	tlv_pop(tlv);
+	tlv_pop(tlv);
+
+	pt->pt_reset = B_TRUE;
+
+	apdu = piv_apdu_make(CLA_ISO, INS_GEN_AUTH, PIV_ALG_3DES,
+	    PIV_SLOT_ADMIN);
+	apdu->a_cmd.b_data = tlv_buf(tlv);
+	apdu->a_cmd.b_len = tlv_len(tlv);
+
+	free(chal);
+	explicit_bzero(resp, resplen);
+	free(resp);
+
+	rv = piv_apdu_transceive(pt, apdu);
+	if (rv != 0) {
+		bunyan_log(WARN, "piv_auth_admin.transceive_chain failed",
+		    "reader", BNY_STRING, pt->pt_rdrname,
+		    "err", BNY_STRING, pcsc_stringify_error(rv),
+		    NULL);
+		tlv_free(tlv);
+		piv_apdu_free(apdu);
+		return (EIO);
+	}
+
+	tlv_free(tlv);
+
+	if (apdu->a_sw == SW_NO_ERROR) {
+		rv = 0;
+	} else if (apdu->a_sw == SW_INCORRECT_P1P2) {
+		rv = ENOENT;
+	} else if (apdu->a_sw == SW_WRONG_DATA) {
+		rv = EACCES;
+	} else {
+		rv = EINVAL;
+	}
+
+	piv_apdu_free(apdu);
+	return (rv);
+}
+
+int
 piv_read_cert(struct piv_token *pk, enum piv_slotid slotid)
 {
 	int rv;
@@ -813,10 +963,12 @@ piv_sign(struct piv_token *tk, struct piv_slot *slot, const uint8_t *data,
     size_t datalen, enum sshdigest_types *hashalgo, uint8_t **signature,
     size_t *siglen)
 {
-	int rv;
+	int rv, i;
 	struct ssh_digest_ctx *hctx;
 	uint8_t *buf;
 	size_t nread, dglen, inplen;
+	boolean_t cardhash = B_FALSE;
+	enum piv_alg oldalg;
 
 	assert(tk->pt_intxn == B_TRUE);
 
@@ -840,8 +992,26 @@ piv_sign(struct piv_token *tk, struct piv_slot *slot, const uint8_t *data,
 		}
 		break;
 	case PIV_ALG_ECCP256:
-		*hashalgo = SSH_DIGEST_SHA256;
-		inplen = (dglen = 32);
+		inplen = 32;
+		if (*hashalgo == SSH_DIGEST_SHA1) {
+			dglen = 20;
+		} else {
+			*hashalgo = SSH_DIGEST_SHA256;
+			dglen = 32;
+		}
+		for (i = 0; i < tk->pt_alg_count; ++i) {
+			if (tk->pt_algs[i] == PIV_ALG_ECCP256_SHA1 &&
+			    *hashalgo == SSH_DIGEST_SHA1) {
+				cardhash = B_TRUE;
+				oldalg = slot->ps_alg;
+				slot->ps_alg = PIV_ALG_ECCP256_SHA1;
+			} else if (tk->pt_algs[i] == PIV_ALG_ECCP256_SHA256 &&
+			    *hashalgo == SSH_DIGEST_SHA256) {
+				cardhash = B_TRUE;
+				oldalg = slot->ps_alg;
+				slot->ps_alg = PIV_ALG_ECCP256_SHA256;
+			}
+		}
 		break;
 	case PIV_ALG_ECCP384:
 		*hashalgo = SSH_DIGEST_SHA384;
@@ -851,14 +1021,20 @@ piv_sign(struct piv_token *tk, struct piv_slot *slot, const uint8_t *data,
 		assert(0);
 	}
 
-	buf = calloc(1, dglen);
-	assert(buf != NULL);
+	if (!cardhash) {
+		buf = calloc(1, dglen);
+		assert(buf != NULL);
 
-	hctx = ssh_digest_start(*hashalgo);
-	assert(hctx != NULL);
-	assert(ssh_digest_update(hctx, data, datalen) == 0);
-	assert(ssh_digest_final(hctx, buf, dglen) == 0);
-	ssh_digest_free(hctx);
+		hctx = ssh_digest_start(*hashalgo);
+		assert(hctx != NULL);
+		assert(ssh_digest_update(hctx, data, datalen) == 0);
+		assert(ssh_digest_final(hctx, buf, dglen) == 0);
+		ssh_digest_free(hctx);
+	} else {
+		bunyan_log(TRACE, "doing hash on card", NULL);
+		buf = data;
+		inplen = datalen;
+	}
 
 	/*
 	 * If it's an RSA signature, we have to generate the PKCS#1 style
@@ -916,7 +1092,12 @@ piv_sign(struct piv_token *tk, struct piv_slot *slot, const uint8_t *data,
 	}
 
 	rv = piv_sign_prehash(tk, slot, buf, inplen, signature, siglen);
-	free(buf);
+
+	if (!cardhash)
+		free(buf);
+
+	if (cardhash)
+		slot->ps_alg = oldalg;
 
 	return (rv);
 }

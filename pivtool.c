@@ -39,9 +39,16 @@ boolean_t debug = B_FALSE;
 static boolean_t parseable = B_FALSE;
 static uint8_t *guid = NULL;
 static const char *pin = NULL;
+static const uint8_t DEFAULT_ADMIN_KEY[] = {
+	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+};
+static const uint8_t *admin_key = DEFAULT_ADMIN_KEY;
 
 static struct piv_token *ks = NULL;
 static struct piv_token *selk = NULL;
+static struct piv_slot *override = NULL;
 
 static uint8_t *
 parse_hex(const char *str, uint *outlen)
@@ -174,6 +181,12 @@ cmd_list(SCARDCONTEXT ctx)
 				case PIV_ALG_ECCP384:
 					printf("ECCP384 ");
 					break;
+				case PIV_ALG_ECCP256_SHA1:
+					printf("ECCP256-SHA1 (Javacard) ");
+					break;
+				case PIV_ALG_ECCP256_SHA256:
+					printf("ECCP256-SHA256 (Javacard) ");
+					break;
 				}
 			}
 			printf("\n");
@@ -187,9 +200,9 @@ cmd_list(SCARDCONTEXT ctx)
 }
 
 static void
-cmd_pubkey(uint slotid)
+cmd_generate(uint slotid, enum piv_alg alg)
 {
-	struct piv_slot *cert;
+	struct piv_slot *slot;
 	char *buf;
 	int rv;
 
@@ -201,40 +214,22 @@ cmd_pubkey(uint slotid)
 		break;
 	default:
 		fprintf(stderr, "error: PIV slot %02X cannot be "
-		    "used for asymmetric signing\n", slotid);
+		    "used for asymmetric crypto\n", slotid);
 		exit(3);
 	}
 
-	for (cert = selk->pt_slots; cert != NULL; cert = cert->ps_next) {
-		if (cert->ps_slot == slotid)
-			break;
-	}
-	if (cert == NULL) {
-		fprintf(stderr, "error: PIV slot %02X has no key present\n",
-		    slotid);
-		exit(1);
-	}
+	piv_txn_begin(selk);
+	rv = piv_auth_admin(selk, admin_key, 24);
+	piv_txn_end(selk);
 
-	rv = sshkey_write(cert->ps_pubkey, stdout);
-	if (rv != 0) {
-		fprintf(stderr, "error: failed to write out key\n");
-		exit(1);
-	}
-	buf = buf_to_hex(selk->pt_guid, sizeof (selk->pt_guid));
-	fprintf(stdout, " PIV_slot_%02X@%s \"%s\"\n", slotid, buf,
-	    cert->ps_subj);
-	free(buf);
 	exit(0);
 }
 
 static void
-cmd_sign(uint slotid)
+cmd_pubkey(uint slotid)
 {
 	struct piv_slot *cert;
-	uint8_t *buf, *sig;
-	int hashalg;
-	struct ssh_digest_ctx *hctx;
-	size_t nread, dglen, inplen, siglen;
+	char *buf;
 	int rv;
 
 	switch (slotid) {
@@ -265,99 +260,67 @@ cmd_sign(uint slotid)
 		exit(1);
 	}
 
-	switch (cert->ps_alg) {
-	case PIV_ALG_RSA1024:
-		inplen = 128;
-		dglen = 32;
-		hashalg = SSH_DIGEST_SHA256;
-		break;
-	case PIV_ALG_RSA2048:
-		inplen = 256;
-		dglen = 32;
-		hashalg = SSH_DIGEST_SHA256;
-		break;
-	case PIV_ALG_ECCP256:
-		hashalg = SSH_DIGEST_SHA256;
-		inplen = (dglen = 32);
-		break;
-	case PIV_ALG_ECCP384:
-		hashalg = SSH_DIGEST_SHA384;
-		inplen = (dglen = 48);
+	rv = sshkey_write(cert->ps_pubkey, stdout);
+	if (rv != 0) {
+		fprintf(stderr, "error: failed to write out key\n");
+		exit(1);
+	}
+	buf = buf_to_hex(selk->pt_guid, sizeof (selk->pt_guid));
+	fprintf(stdout, " PIV_slot_%02X@%s \"%s\"\n", slotid, buf,
+	    cert->ps_subj);
+	free(buf);
+	exit(0);
+}
+
+static void
+cmd_sign(uint slotid)
+{
+	struct piv_slot *cert;
+	uint8_t *buf, *sig;
+	enum sshdigest_types hashalg;
+	struct ssh_digest_ctx *hctx;
+	size_t nread, dglen, inplen, siglen;
+	int rv;
+
+	switch (slotid) {
+	case 0x9A:
+	case 0x9C:
+	case 0x9D:
+	case 0x9E:
 		break;
 	default:
-		assert(0);
+		fprintf(stderr, "error: PIV slot %02X cannot be "
+		    "used for asymmetric signing\n", slotid);
+		exit(3);
 	}
 
-	hctx = ssh_digest_start(hashalg);
-	assert(hctx != NULL);
+	if (override == NULL) {
+		piv_txn_begin(selk);
+		rv = piv_read_cert(selk, slotid);
+		piv_txn_end(selk);
 
-	buf = calloc(1, 8192);
+		cert = piv_get_slot(selk, slotid);
+	} else {
+		cert = override;
+	}
+
+	if (cert == NULL && rv == ENOENT) {
+		fprintf(stderr, "error: PIV slot %02X has no key present\n",
+		    slotid);
+		exit(1);
+	} else if (cert == NULL) {
+		fprintf(stderr, "error: failed to read cert in PIV slot %02X\n",
+		    slotid);
+		exit(1);
+	}
+
+	buf = read_stdin(8192, &inplen);
 	assert(buf != NULL);
-	do {
-		nread = fread(buf, 1, 8192, stdin);
-		assert(ssh_digest_update(hctx, buf, nread) == 0);
-	} while (!(nread == 0 || (nread == -1 && !(errno == EINTR))));
-
-	assert(ssh_digest_final(hctx, buf, dglen) == 0);
-
-	/*
-	 * If it's an RSA signature, we have to generate the PKCS#1 style
-	 * padded signing blob around the hash.
-	 *
-	 * ECDSA is so much nicer than this. Why can't we just use it? Oh,
-	 * because Java ruined everything. Right.
-	 */
-	if (cert->ps_alg == PIV_ALG_RSA1024 ||
-	    cert->ps_alg == PIV_ALG_RSA2048) {
-		int nid;
-		/*
-		 * Roll up your sleeves, folks, we're going in (to the dank
-		 * and musty corners of OpenSSL where few dare tread)
-		 */
-		X509_SIG digestInfo;
-		X509_ALGOR algor;
-		ASN1_TYPE parameter;
-		ASN1_OCTET_STRING digest;
-		uint8_t *tmp, *out;
-
-		tmp = calloc(1, inplen);
-		assert(tmp != NULL);
-		out = NULL;
-
-		/*
-		 * XXX: I thought this should be sha256WithRSAEncryption?
-		 *      but that doesn't work lol
-		 */
-		nid = NID_sha256;
-		bcopy(buf, tmp, dglen);
-		digestInfo.algor = &algor;
-		digestInfo.algor->algorithm = OBJ_nid2obj(nid);
-		digestInfo.algor->parameter = &parameter;
-		digestInfo.algor->parameter->type = V_ASN1_NULL;
-		digestInfo.algor->parameter->value.ptr = NULL;
-		digestInfo.digest = &digest;
-		digestInfo.digest->data = tmp;
-		digestInfo.digest->length = (int)dglen;
-		nread = i2d_X509_SIG(&digestInfo, &out);
-
-		/*
-		 * There is another undocumented openssl function that does
-		 * this padding bit, but eh.
-		 */
-		memset(buf, 0xFF, inplen);
-		buf[0] = 0x00;
-		/* The second byte is the block type -- 0x01 here means 0xFF */
-		buf[1] = 0x01;
-		buf[inplen - nread - 1] = 0x00;
-		bcopy(out, buf + (inplen - nread), nread);
-
-		free(tmp);
-		OPENSSL_free(out);
-	}
 
 	piv_txn_begin(selk);
 	assert_pin(selk);
-	rv = piv_sign_prehash(selk, cert, buf, inplen, &sig, &siglen);
+	hashalg = 0;
+	rv = piv_sign(selk, cert, buf, inplen, &hashalg, &sig, &siglen);
 	piv_txn_end(selk);
 	if (rv == EPERM) {
 		fprintf(stderr, "error: key in slot %02X requires PIN\n",
@@ -395,11 +358,15 @@ cmd_ecdh(uint slotid)
 		exit(3);
 	}
 
-	piv_txn_begin(selk);
-	rv = piv_read_cert(selk, slotid);
-	piv_txn_end(selk);
+	if (override == NULL) {
+		piv_txn_begin(selk);
+		rv = piv_read_cert(selk, slotid);
+		piv_txn_end(selk);
 
-	cert = piv_get_slot(selk, slotid);
+		cert = piv_get_slot(selk, slotid);
+	} else {
+		cert = override;
+	}
 
 	if (cert == NULL && rv == ENOENT) {
 		fprintf(stderr, "error: PIV slot %02X has no key present\n",
@@ -462,18 +429,21 @@ usage(void)
 	    "  pubkey <slot>          Outputs a public key in SSH format\n"
 	    "  sign <slot>            Signs data on stdin\n"
 	    "  ecdh <slot>            Do ECDH with pubkey on stdin\n"
+	    "  generate <slot>        Generate a new private key and a\n"
+	    "                         self-signed cert\n"
 	    "\n"
 	    "Options:\n"
-	    "  --pin|-p               PIN code to authenticate with\n"
+	    "  --pin|-P <code>        PIN code to authenticate with\n"
 	    "  --debug|-d             Spit out lots of debug info to stderr\n"
 	    "                         (incl. APDU trace)\n"
-	    "  --parseable|-P         Generate parseable output from 'list'\n"
-	    "  --guid|-g              GUID of the PIV token to use\n");
+	    "  --parseable|-p         Generate parseable output from 'list'\n"
+	    "  --guid|-g              GUID of the PIV token to use\n"
+	    "  --algorithm|-a <algo>  Override algorithm for the slot and\n"
+	    "                         don't use the certificate\n");
 	exit(3);
 }
 
-//const char *optstring = "d(debug)P(parseable)g:(guid)p:(pin)";
-const char *optstring = "dPg:p:";
+const char *optstring = "d(debug)p(parseable)g:(guid)P:(pin)a:(algorithm)";
 
 int
 main(int argc, char *argv[])
@@ -501,6 +471,24 @@ main(int argc, char *argv[])
 				exit(3);
 			}
 			break;
+		case 'a':
+			override = calloc(1, sizeof (struct piv_slot));
+			if (strcasecmp(optarg, "rsa1024") == 0) {
+				override->ps_alg = PIV_ALG_RSA1024;
+			} else if (strcasecmp(optarg, "rsa2048") == 0) {
+				override->ps_alg = PIV_ALG_RSA2048;
+			} else if (strcasecmp(optarg, "eccp256") == 0) {
+				override->ps_alg = PIV_ALG_ECCP256;
+			} else if (strcasecmp(optarg, "eccp384") == 0) {
+				override->ps_alg = PIV_ALG_ECCP384;
+			} else if (strcasecmp(optarg, "3des") == 0) {
+				override->ps_alg = PIV_ALG_3DES;
+			} else {
+				fprintf(stderr, "error: invalid algorithm\n");
+				exit(3);
+			}
+			/* ps_slot will be set after we've parsed the slot */
+			break;
 		case 'g':
 			guid = parse_hex(optarg, &len);
 			if (len != 16) {
@@ -509,10 +497,10 @@ main(int argc, char *argv[])
 				exit(3);
 			}
 			break;
-		case 'p':
+		case 'P':
 			pin = optarg;
 			break;
-		case 'P':
+		case 'p':
 			parseable = B_TRUE;
 			break;
 		}
@@ -570,6 +558,9 @@ main(int argc, char *argv[])
 		if (optind < argc)
 			usage();
 
+		if (override != NULL)
+			override->ps_slot = slotid;
+
 		cmd_sign(slotid);
 
 	} else if (strcmp(op, "pubkey") == 0) {
@@ -602,7 +593,26 @@ main(int argc, char *argv[])
 			usage();
 		}
 
+		if (override != NULL)
+			override->ps_slot = slotid;
+
 		cmd_ecdh(slotid);
+
+	} else if (strcmp(op, "generate") == 0) {
+		uint slotid;
+
+		if (optind >= argc) {
+			fprintf(stderr, "error: slot required\n");
+			usage();
+		}
+		slotid = strtol(argv[optind++], NULL, 16);
+
+		if (optind < argc) {
+			fprintf(stderr, "error: too many arguments\n");
+			usage();
+		}
+
+		cmd_generate(slotid, override->ps_alg);
 
 	} else {
 		fprintf(stderr, "error: invalid operation '%s'\n", op);
