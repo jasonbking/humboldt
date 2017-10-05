@@ -693,6 +693,211 @@ piv_auth_admin(struct piv_token *pt, const uint8_t *key, size_t keylen)
 }
 
 int
+piv_generate(struct piv_token *pt, enum piv_slotid slotid, enum piv_alg alg,
+    struct sshkey **pubkey)
+{
+	int rv;
+	struct apdu *apdu;
+	struct tlv_state *tlv;
+	uint tag;
+	struct sshkey *k = NULL;
+
+	assert(pt->pt_intxn == B_TRUE);
+
+	tlv = tlv_init_write();
+	tlv_push(tlv, 0xAC);
+	tlv_push(tlv, 0x80);
+	tlv_write_uint(tlv, alg);
+	tlv_pop(tlv);
+	tlv_pop(tlv);
+
+	apdu = piv_apdu_make(CLA_ISO, INS_GEN_ASYM, 0x00, slotid);
+	apdu->a_cmd.b_data = tlv_buf(tlv);
+	apdu->a_cmd.b_len = tlv_len(tlv);
+
+	rv = piv_apdu_transceive_chain(pt, apdu);
+	if (rv != 0) {
+		bunyan_log(WARN, "piv_generate.transceive_chain failed",
+		    "reader", BNY_STRING, pt->pt_rdrname,
+		    "err", BNY_STRING, pcsc_stringify_error(rv),
+		    NULL);
+		tlv_free(tlv);
+		piv_apdu_free(apdu);
+		return (EIO);
+	}
+
+	tlv_free(tlv);
+
+	if (apdu->a_sw == SW_NO_ERROR) {
+		tlv = tlv_init(apdu->a_reply.b_data, apdu->a_reply.b_offset,
+		    apdu->a_reply.b_len);
+		tag = tlv_read_tag(tlv);
+		if (tag != 0x7F49) {
+			bunyan_log(DEBUG, "card returned invalid tag in "
+			    "PIV INS_GEN_ASYM response payload",
+			    "reader", BNY_STRING, pt->pt_rdrname,
+			    "slotid", BNY_UINT, (uint)slotid,
+			    "tag", BNY_UINT, tag,
+			    "reply", BNY_BIN_HEX, apdu->a_reply.b_data +
+			    apdu->a_reply.b_offset, apdu->a_reply.b_len, NULL);
+			tlv_skip(tlv);
+			tlv_free(tlv);
+			piv_apdu_free(apdu);
+			return (ENOTSUP);
+		}
+		if (alg == PIV_ALG_RSA1024 || alg == PIV_ALG_RSA2048) {
+			k = sshkey_new(KEY_RSA);
+			assert(k != NULL);
+		} else if (alg == PIV_ALG_ECCP256) {
+			k = sshkey_new(KEY_ECDSA);
+			assert(k != NULL);
+			k->ecdsa_nid = NID_X9_62_prime256v1;
+			k->ecdsa = EC_KEY_new_by_curve_name(k->ecdsa_nid);
+			EC_KEY_set_asn1_flag(k->ecdsa, OPENSSL_EC_NAMED_CURVE);
+		} else if (alg == PIV_ALG_ECCP384) {
+			k = sshkey_new(KEY_ECDSA);
+			assert(k != NULL);
+			k->ecdsa_nid = NID_secp384r1;
+			k->ecdsa = EC_KEY_new_by_curve_name(k->ecdsa_nid);
+			EC_KEY_set_asn1_flag(k->ecdsa, OPENSSL_EC_NAMED_CURVE);
+		}
+		while (!tlv_at_end(tlv)) {
+			tag = tlv_read_tag(tlv);
+			if (alg == PIV_ALG_RSA1024 || alg == PIV_ALG_RSA2048) {
+				if (tag == 0x81) {		/* Modulus */
+					assert(BN_bin2bn(tlv_ptr(tlv),
+					    tlv_rem(tlv), k->rsa->n) != NULL);
+					tlv_skip(tlv);
+					continue;
+				} else if (tag == 0x82) {	/* Exponent */
+					assert(BN_bin2bn(tlv_ptr(tlv),
+					    tlv_rem(tlv), k->rsa->e) != NULL);
+					tlv_skip(tlv);
+					continue;
+				}
+			} else if (alg == PIV_ALG_ECCP256 ||
+			    alg == PIV_ALG_ECCP384) {
+				if (tag == 0x86) {
+					const EC_GROUP *g;
+					EC_POINT *pt;
+
+					g = EC_KEY_get0_group(k->ecdsa);
+					pt = EC_POINT_new(g);
+					rv = EC_POINT_oct2point(g, pt,
+					    tlv_ptr(tlv), tlv_rem(tlv), NULL);
+					assert(rv == 1);
+
+					rv = sshkey_ec_validate_public(g, pt);
+					assert(rv == 0);
+					rv = EC_KEY_set_public_key(
+					    k->ecdsa, pt);
+					assert(rv == 1);
+					EC_POINT_free(pt);
+
+					tlv_skip(tlv);
+					continue;
+				}
+			}
+			tlv_skip(tlv);
+			tlv_skip(tlv);
+			tlv_free(tlv);
+			piv_apdu_free(apdu);
+			return (ENOTSUP);
+		}
+		tlv_end(tlv);
+		tlv_free(tlv);
+
+		*pubkey = k;
+
+		rv = 0;
+
+	} else if (apdu->a_sw == SW_SECURITY_STATUS_NOT_SATISFIED) {
+		rv = EPERM;
+
+	} else {
+		rv = EINVAL;
+	}
+
+	piv_apdu_free(apdu);
+	return (rv);
+}
+
+int
+piv_write_cert(struct piv_token *pk, enum piv_slotid slotid,
+    const uint8_t *data, size_t datalen, uint flags)
+{
+	int rv;
+	struct apdu *apdu;
+	struct tlv_state *tlv;
+	uint tag;
+
+	assert(pk->pt_intxn == B_TRUE);
+
+	switch (slotid) {
+	case PIV_SLOT_9A:
+		tag = PIV_TAG_CERT_9A;
+		break;
+	case PIV_SLOT_9C:
+		tag = PIV_TAG_CERT_9C;
+		break;
+	case PIV_SLOT_9D:
+		tag = PIV_TAG_CERT_9D;
+		break;
+	case PIV_SLOT_9E:
+		tag = PIV_TAG_CERT_9E;
+		break;
+	default:
+		assert(0);
+	}
+
+	tlv = tlv_init_write();
+	tlv_push(tlv, 0x5C);
+	tlv_write_uint(tlv, tag);
+	tlv_pop(tlv);
+	tlv_pushl(tlv, 0x53, datalen + 8);
+	tlv_pushl(tlv, 0x70, datalen + 3);
+	tlv_write(tlv, data, 0, datalen);
+	tlv_pop(tlv);
+	tlv_push(tlv, 0x71);
+	tlv_write_byte(tlv, (uint8_t)flags);
+	tlv_pop(tlv);
+	tlv_pop(tlv);
+
+	apdu = piv_apdu_make(CLA_ISO, INS_PUT_DATA, 0x3F, 0xFF);
+	apdu->a_cmd.b_data = tlv_buf(tlv);
+	apdu->a_cmd.b_len = tlv_len(tlv);
+
+	rv = piv_apdu_transceive_chain(pk, apdu);
+	if (rv != 0) {
+		bunyan_log(WARN, "piv_write_cert.transceive_chain failed",
+		    "reader", BNY_STRING, pk->pt_rdrname,
+		    "err", BNY_STRING, pcsc_stringify_error(rv),
+		    NULL);
+		tlv_free(tlv);
+		piv_apdu_free(apdu);
+		return (EIO);
+	}
+
+	tlv_free(tlv);
+
+	if (apdu->a_sw == SW_NO_ERROR) {
+		rv = 0;
+	} else if (apdu->a_sw == SW_OUT_OF_MEMORY) {
+		rv = ENOMEM;
+	} else if (apdu->a_sw == SW_SECURITY_STATUS_NOT_SATISFIED) {
+		rv = EPERM;
+	} else if (apdu->a_sw == SW_FUNC_NOT_SUPPORTED) {
+		rv = ENOENT;
+	} else {
+		rv = EINVAL;
+	}
+
+	piv_apdu_free(apdu);
+
+	return (rv);
+}
+
+int
 piv_read_cert(struct piv_token *pk, enum piv_slotid slotid)
 {
 	int rv;

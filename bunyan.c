@@ -65,7 +65,7 @@ nybble_to_hex(uint8_t nybble)
 }
 
 char *
-buf_to_hex(const uint8_t *buf, size_t len)
+buf_to_hex(const uint8_t *buf, size_t len, boolean_t spaces)
 {
 	size_t i, j = 0;
 	char *out = calloc(1, len * 3 + 1);
@@ -75,7 +75,7 @@ buf_to_hex(const uint8_t *buf, size_t len)
 		out[j++] = nybble_to_hex(nybble);
 		nybble = (buf[i] & 0x0F);
 		out[j++] = nybble_to_hex(nybble);
-		if (i + 1 < len)
+		if (spaces && i + 1 < len)
 			out[j++] = ' ';
 	}
 	out[j] = 0;
@@ -359,7 +359,7 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 		case BNY_BIN_HEX:
 			binval = va_arg(ap, const uint8_t *);
 			szval = va_arg(ap, size_t);
-			wstrval = buf_to_hex(binval, szval);
+			wstrval = buf_to_hex(binval, szval, B_TRUE);
 			VERIFY0(nvlist_add_string(nvl, propname, wstrval));
 			free(wstrval);
 			break;

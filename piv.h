@@ -60,6 +60,7 @@ enum iso_sw {
 	SW_INCORRECT_PIN = 0x63C0,
 	SW_INCORRECT_P1P2 = 0x6A86,
 	SW_WRONG_DATA = 0x6A80,
+	SW_OUT_OF_MEMORY = 0x6A84,
 };
 
 enum piv_sel_tag {
@@ -246,6 +247,9 @@ int piv_read_all_certs(struct piv_token *tk);
  *
  * Errors:
  *  - EIO: general card communication failure
+ *  - ENOENT: the card has no 3DES admin key
+ *  - EACCES: the key was invalid
+ *  - EINVAL: the card rejected the command
  */
 int piv_auth_admin(struct piv_token *tk, const uint8_t *key, size_t keylen);
 
@@ -255,6 +259,8 @@ int piv_auth_admin(struct piv_token *tk, const uint8_t *key, size_t keylen);
  *
  * Errors:
  *  - EIO: general card communication failure
+ *  - EPERM: the card requires admin authentication before generating keys
+ *  - EINVAL: the card rejected the command
  */
 int piv_generate(struct piv_token *tk, enum piv_slotid slotid,
     enum piv_alg alg, struct sshkey **pubkey);
@@ -264,9 +270,13 @@ int piv_generate(struct piv_token *tk, enum piv_slotid slotid,
  *
  * Errors:
  *  - EIO: general card communication failure
+ *  - ENOMEM: certificate is too large to fit on card
+ *  - EPERM: admin authentication required to write a cert
+ *  - ENOENT: slot unsupported
+ *  - EINVAL: other card error
  */
-int piv_load_cert(struct piv_token *tk, enum piv_slotid slotid,
-    const uint8_t *data, size_t datalen);
+int piv_write_cert(struct piv_token *tk, enum piv_slotid slotid,
+    const uint8_t *data, size_t datalen, uint flags);
 
 /*
  * Tries to unlock the PIV token using a PIN code.

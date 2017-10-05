@@ -134,7 +134,7 @@ assert_pin(struct piv_token *pk)
 	}
 }
 
-extern char *buf_to_hex(const uint8_t *buf, size_t len);
+extern char *buf_to_hex(const uint8_t *buf, size_t len, boolean_t spaces);
 
 static void
 cmd_list(SCARDCONTEXT ctx)
@@ -149,7 +149,7 @@ cmd_list(SCARDCONTEXT ctx)
 		piv_read_all_certs(pk);
 		piv_txn_end(pk);
 
-		buf = buf_to_hex(pk->pt_guid, sizeof (pk->pt_guid));
+		buf = buf_to_hex(pk->pt_guid, sizeof (pk->pt_guid), B_FALSE);
 		printf("PIV card in '%s': guid = %s\n",
 		    pk->pt_rdrname, buf);
 		free(buf);
@@ -205,12 +205,30 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	struct piv_slot *slot;
 	char *buf;
 	int rv;
+	struct sshkey *pub;
+	X509 *cert;
+	EVP_PKEY *pkey;
+	X509_NAME *subj;
+	const char *name;
+	enum sshdigest_types hashalg;
+	int nid;
+	ASN1_TYPE null_parameter;
+	uint8_t *tbs = NULL, *sig, *cdata = NULL;
+	size_t tbslen, siglen, cdlen;
+	uint flags;
 
 	switch (slotid) {
 	case 0x9A:
+		name = "PIV Authentication";
+		break;
 	case 0x9C:
+		name = "Digital Signature";
+		break;
 	case 0x9D:
+		name = "Key Management";
+		break;
 	case 0x9E:
+		name = "Card Authentication";
 		break;
 	default:
 		fprintf(stderr, "error: PIV slot %02X cannot be "
@@ -220,7 +238,101 @@ cmd_generate(uint slotid, enum piv_alg alg)
 
 	piv_txn_begin(selk);
 	rv = piv_auth_admin(selk, admin_key, 24);
+	if (rv == 0)
+		rv = piv_generate(selk, slotid, alg, &pub);
+
+	if (rv != 0) {
+		piv_txn_end(selk);
+		fprintf(stderr, "error: key generation failed (%d)\n", rv);
+		exit(1);
+	}
+
+	pkey = EVP_PKEY_new();
+	assert(pkey != NULL);
+	if (pub->type == KEY_RSA) {
+		rv = EVP_PKEY_assign_RSA(pkey, pub->rsa);
+		assert(rv == 1);
+		nid = NID_sha256WithRSAEncryption;
+	} else if (pub->type == KEY_ECDSA) {
+		rv = EVP_PKEY_assign_EC_KEY(pkey, pub->ecdsa);
+		assert(rv == 1);
+		nid = NID_ecdsa_with_SHA256;
+	} else {
+		assert(0);
+	}
+
+	cert = X509_new();
+	assert(cert != NULL);
+	assert(X509_set_version(cert, 2) == 1);
+	assert(ASN1_INTEGER_set(X509_get_serialNumber(cert), 1) == 1);
+	assert(X509_gmtime_adj(X509_get_notBefore(cert), 0) != NULL);
+	assert(X509_gmtime_adj(X509_get_notAfter(cert), 315360000L) != NULL);
+	assert(X509_set_pubkey(cert, pkey) == 1);
+	subj = X509_get_subject_name(cert);
+	assert(name != NULL);
+	assert(X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
+	    (unsigned char *)name, -1, -1, 0) == 1);
+	assert(X509_set_issuer_name(cert, subj) == 1);
+	cert->sig_alg->algorithm = OBJ_nid2obj(nid);
+	cert->cert_info->signature->algorithm = cert->sig_alg->algorithm;
+	if (pub->type == KEY_RSA) {
+		null_parameter.type = V_ASN1_NULL;
+		null_parameter.value.ptr = NULL;
+		cert->sig_alg->parameter = &null_parameter;
+		cert->cert_info->signature->parameter = &null_parameter;
+	}
+
+	cert->cert_info->enc.modified = 1;
+	tbslen = i2d_X509_CINF(cert->cert_info, &tbs);
+	assert(tbs != NULL);
+	assert(tbslen > 0);
+
+	hashalg = SSH_DIGEST_SHA256;
+	assert_pin(selk);
+	rv = piv_sign(selk, override, tbs, tbslen, &hashalg, &sig, &siglen);
+
+	if (rv == EPERM) {
+		piv_txn_end(selk);
+		fprintf(stderr, "error: slot in %02X requires a PIN\n",
+		    slotid);
+		exit(1);
+	} else if (rv != 0) {
+		piv_txn_end(selk);
+		fprintf(stderr, "error: failed to sign cert with key\n");
+		exit(1);
+	}
+
+	if (hashalg != SSH_DIGEST_SHA256) {
+		piv_txn_end(selk);
+		fprintf(stderr, "error: card requires hash-on-card and does "
+		    "not support SHA256\n");
+		exit(1);
+	}
+
+	M_ASN1_BIT_STRING_set(cert->signature, sig, siglen);
+	cert->signature->flags = ASN1_STRING_FLAG_BITS_LEFT;
+
+	cdlen = i2d_X509(cert, &cdata);
+	assert(cdata != NULL);
+	assert(cdlen > 0);
+
+	flags = PIV_COMP_NONE;
+	rv = piv_write_cert(selk, slotid, cdata, cdlen, flags);
 	piv_txn_end(selk);
+
+	if (rv != 0) {
+		fprintf(stderr, "error: failed to write cert\n");
+		exit(1);
+	}
+
+	rv = sshkey_write(pub, stdout);
+	if (rv != 0) {
+		fprintf(stderr, "error: failed to write out key\n");
+		exit(1);
+	}
+	buf = buf_to_hex(selk->pt_guid, sizeof (selk->pt_guid), B_FALSE);
+	fprintf(stdout, " PIV_slot_%02X@%s\n", slotid, buf);
+	free(buf);
 
 	exit(0);
 }
@@ -265,7 +377,7 @@ cmd_pubkey(uint slotid)
 		fprintf(stderr, "error: failed to write out key\n");
 		exit(1);
 	}
-	buf = buf_to_hex(selk->pt_guid, sizeof (selk->pt_guid));
+	buf = buf_to_hex(selk->pt_guid, sizeof (selk->pt_guid), B_FALSE);
 	fprintf(stdout, " PIV_slot_%02X@%s \"%s\"\n", slotid, buf,
 	    cert->ps_subj);
 	free(buf);
@@ -611,6 +723,12 @@ main(int argc, char *argv[])
 			fprintf(stderr, "error: too many arguments\n");
 			usage();
 		}
+
+		if (override == NULL) {
+			fprintf(stderr, "error: algorithm required\n");
+			usage();
+		}
+		override->ps_slot = slotid;
 
 		cmd_generate(slotid, override->ps_alg);
 
