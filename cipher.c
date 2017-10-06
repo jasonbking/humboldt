@@ -135,9 +135,9 @@ static const struct sshcipher ciphers[] = {
 	{ "aes192-ctr",	SSH_CIPHER_SSH2, 16, 24, 0, 0, 0, 0, EVP_aes_192_ctr },
 	{ "aes256-ctr",	SSH_CIPHER_SSH2, 16, 32, 0, 0, 0, 0, EVP_aes_256_ctr },
 # ifdef OPENSSL_HAVE_EVPGCM
-	{ "aes128-gcm@openssh.com",
+	{ "aes128-gcm",
 			SSH_CIPHER_SSH2, 16, 16, 12, 16, 0, 0, EVP_aes_128_gcm },
-	{ "aes256-gcm@openssh.com",
+	{ "aes256-gcm",
 			SSH_CIPHER_SSH2, 16, 32, 12, 16, 0, 0, EVP_aes_256_gcm },
 # endif /* OPENSSL_HAVE_EVPGCM */
 #else /* WITH_OPENSSL */
@@ -146,7 +146,7 @@ static const struct sshcipher ciphers[] = {
 	{ "aes256-ctr",	SSH_CIPHER_SSH2, 16, 32, 0, 0, 0, CFLAG_AESCTR, NULL },
 	{ "none",	SSH_CIPHER_NONE, 8, 0, 0, 0, 0, CFLAG_NONE, NULL },
 #endif /* WITH_OPENSSL */
-	{ "chacha20-poly1305@openssh.com",
+	{ "chacha20-poly1305",
 			SSH_CIPHER_SSH2, 8, 64, 0, 16, 0, CFLAG_CHACHAPOLY, NULL },
 
 	{ NULL,		SSH_CIPHER_INVALID, 0, 0, 0, 0, 0, 0, NULL }

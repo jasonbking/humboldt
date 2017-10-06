@@ -130,7 +130,7 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 	const struct sshcipher *cipher;
 	struct sshcipher_ctx *cctx;
 	nvlist_t *nv;
-	const char *ciphername = "chacha20-poly1305@openssh.com";
+	const char *ciphername = "chacha20-poly1305";
 	struct sshbuf *buf;
 	librename_atomic_t *rast;
 	FILE *f;

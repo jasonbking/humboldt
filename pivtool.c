@@ -182,10 +182,10 @@ cmd_list(SCARDCONTEXT ctx)
 					printf("ECCP384 ");
 					break;
 				case PIV_ALG_ECCP256_SHA1:
-					printf("ECCP256-SHA1 (Javacard) ");
+					printf("ECCP256-SHA1 ");
 					break;
 				case PIV_ALG_ECCP256_SHA256:
-					printf("ECCP256-SHA256 (Javacard) ");
+					printf("ECCP256-SHA256 ");
 					break;
 				}
 			}
@@ -216,6 +216,8 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	uint8_t *tbs = NULL, *sig, *cdata = NULL;
 	size_t tbslen, siglen, cdlen;
 	uint flags;
+	BIGNUM *serial;
+	ASN1_INTEGER *serial_asn1;
 
 	switch (slotid) {
 	case 0x9A:
@@ -250,32 +252,50 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	pkey = EVP_PKEY_new();
 	assert(pkey != NULL);
 	if (pub->type == KEY_RSA) {
-		rv = EVP_PKEY_assign_RSA(pkey, pub->rsa);
+		RSA *copy = RSA_new();
+		assert(copy != NULL);
+		copy->e = BN_dup(pub->rsa->e);
+		assert(copy->e != NULL);
+		copy->n = BN_dup(pub->rsa->n);
+		assert(copy->n != NULL);
+		rv = EVP_PKEY_assign_RSA(pkey, copy);
 		assert(rv == 1);
 		nid = NID_sha256WithRSAEncryption;
 	} else if (pub->type == KEY_ECDSA) {
-		rv = EVP_PKEY_assign_EC_KEY(pkey, pub->ecdsa);
+		EC_KEY *copy = EC_KEY_dup(pub->ecdsa);
+		rv = EVP_PKEY_assign_EC_KEY(pkey, copy);
 		assert(rv == 1);
 		nid = NID_ecdsa_with_SHA256;
 	} else {
 		assert(0);
 	}
 
+	serial = BN_new();
+	serial_asn1 = ASN1_INTEGER_new();
+	assert(serial != NULL);
+	assert(BN_pseudo_rand(serial, 64, 0, 0) == 1);
+	assert(BN_to_ASN1_INTEGER(serial, serial_asn1) != NULL);
+
 	cert = X509_new();
 	assert(cert != NULL);
 	assert(X509_set_version(cert, 2) == 1);
-	assert(ASN1_INTEGER_set(X509_get_serialNumber(cert), 1) == 1);
+	assert(X509_set_serialNumber(cert, serial_asn1) == 1);
 	assert(X509_gmtime_adj(X509_get_notBefore(cert), 0) != NULL);
 	assert(X509_gmtime_adj(X509_get_notAfter(cert), 315360000L) != NULL);
-	assert(X509_set_pubkey(cert, pkey) == 1);
-	subj = X509_get_subject_name(cert);
-	assert(name != NULL);
+
+	subj = X509_NAME_new();
+	assert(subj != NULL);
 	assert(X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
 	    (unsigned char *)name, -1, -1, 0) == 1);
+	assert(X509_set_subject_name(cert, subj) == 1);
 	assert(X509_set_issuer_name(cert, subj) == 1);
+
+	assert(X509_set_pubkey(cert, pkey) == 1);
+
 	cert->sig_alg->algorithm = OBJ_nid2obj(nid);
 	cert->cert_info->signature->algorithm = cert->sig_alg->algorithm;
 	if (pub->type == KEY_RSA) {
+		bzero(&null_parameter, sizeof (null_parameter));
 		null_parameter.type = V_ASN1_NULL;
 		null_parameter.value.ptr = NULL;
 		cert->sig_alg->parameter = &null_parameter;
@@ -529,6 +549,12 @@ cmd_ecdh(uint slotid)
 	fwrite(secret, 1, seclen, stdout);
 
 	exit(0);
+}
+
+const char *
+_umem_debug_init()
+{
+	return ("guards");
 }
 
 void

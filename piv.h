@@ -268,6 +268,8 @@ int piv_generate(struct piv_token *tk, enum piv_slotid slotid,
 /*
  * Loads a certificate for a given slot on the token.
  *
+ * "flags" should include bits from enum piv_certinfo_flags (and piv_cert_comp).
+ *
  * Errors:
  *  - EIO: general card communication failure
  *  - ENOMEM: certificate is too large to fit on card
@@ -304,7 +306,8 @@ int piv_verify_pin(struct piv_token *tk, const char *pin, uint *retries);
  * you the algo you asked for (you will need to check it on return).
  *
  * "signature" will be written with a pointer to a buffer "siglen" bytes long
- * containing the output signature in ASN.1/X509 format.
+ * containing the output signature in ASN.1/X509 format. It should be released
+ * with free().
  *
  * Errors:
  *   - EIO: general card communication failure
@@ -326,7 +329,7 @@ int piv_sign_prehash(struct piv_token *tk, struct piv_slot *slot,
  * "pubkey" must point at an EC public key.
  *
  * "secret" will be written with a pointer to a buffer "seclen" bytes long
- * containing the output shared secret.
+ * containing the output shared secret. It should be released with freezero().
  *
  * Errors:
  *   - EIO: general card communication failure
@@ -337,5 +340,27 @@ int piv_sign_prehash(struct piv_token *tk, struct piv_slot *slot,
  */
 int piv_ecdh(struct piv_token *tk, struct piv_slot *slot,
     struct sshkey *pubkey, uint8_t **secret, size_t *seclen);
+
+
+struct piv_ecdh_box {
+	uint8_t pdb_guid[16];
+	enum piv_slotid pdb_slot;
+	struct sshkey *pdb_ephem_pub;
+	const char *pdb_cipher;
+	const char *pdb_kdf;
+	struct apdubuf pdb_iv;
+	struct apdubuf pdb_encrypted;
+	struct apdubuf pdb_plain;
+};
+
+struct piv_ecdh_box *piv_box_new(void);
+int piv_box_seal(struct piv_token *tk, struct piv_slot *slot,
+    struct piv_ecdh_box *box);
+int piv_box_to_base64(struct piv_ecdh_box *box, char **output, size_t *len);
+
+int piv_box_from_base64(const char *input, size_t len,
+    struct piv_ecdh_box **box);
+int piv_box_open(struct piv_token *tks, struct piv_ecdh_box *box);
+void piv_box_free(struct piv_ecdh_box *box);
 
 #endif

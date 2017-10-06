@@ -34,7 +34,7 @@ YKTOOL_HEADERS=
 YKTOOL_OBJS=		$(YKTOOL_SOURCES:%.c=%.o)
 
 YKTOOL_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC
-YKTOOL_LIBS=		-lpcsclite
+YKTOOL_LIBS=		-lpcsclite -lumem
 YKTOOL_LDFLAGS=		-L$(PROTO_AREA)/usr/lib
 
 YKTOOL_DEPS=		pcsclite

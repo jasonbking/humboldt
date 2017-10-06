@@ -817,6 +817,12 @@ cmd_program_otp(SCARDCONTEXT ctx, int slot)
 	exit(1);
 }
 
+const char *
+_umem_debug_init()
+{
+	return ("guards");
+}
+
 void
 usage(void)
 {

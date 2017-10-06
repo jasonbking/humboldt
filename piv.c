@@ -18,10 +18,12 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stddef.h>
-#include <sys/types.h>
 #include <errno.h>
-#include <sys/errno.h>
 #include <strings.h>
+
+#include <sys/errno.h>
+#include <sys/types.h>
+#include <sys/debug.h>
 
 #include "sshkey.h"
 #include "sshbuf.h"
@@ -1227,7 +1229,7 @@ piv_sign(struct piv_token *tk, struct piv_slot *slot, const uint8_t *data,
 	}
 
 	if (!cardhash) {
-		buf = calloc(1, dglen);
+		buf = calloc(1, inplen);
 		assert(buf != NULL);
 
 		hctx = ssh_digest_start(*hashalgo);
@@ -1504,4 +1506,82 @@ piv_ecdh(struct piv_token *pk, struct piv_slot *slot, struct sshkey *pubkey,
 	piv_apdu_free(apdu);
 
 	return (rv);
+}
+
+struct piv_ecdh_box *
+piv_box_new(void)
+{
+	struct piv_ecdh_box *box;
+	box = calloc(1, sizeof (struct piv_ecdh_box));
+	return (box);
+}
+
+void
+piv_box_free(struct piv_ecdh_box *box)
+{
+	sshkey_free(box->pdb_ephem_pub);
+	free(box->pdb_iv.b_data);
+	free(box->pdb_encrypted.b_data);
+	free(box->pdb_plain.b_data);
+	free(box);
+}
+
+int
+piv_box_open(struct piv_token *tks, struct piv_ecdh_box *box)
+{
+}
+
+int
+piv_box_seal(struct piv_token *tk, struct piv_slot *slot,
+    struct piv_ecdh_box *box)
+{
+	const struct sshcipher *cipher;
+	int rv;
+	int dgalg;
+	struct sshkey *key;
+	struct sshcipher_ctx *cctx;
+	struct ssh_digest_ctx *dgctx;
+	uint8_t *iv, *key, *dg, *sec;
+	size_t ivlen, authlen, blocksz, keylen, dglen, seclen;
+
+	bcopy(tk->pt_guid, box->pdb_guid, sizeof (tk->pt_guid));
+	box->pdb_slot = slot->ps_slot;
+
+	rv = sshkey_generate(KEY_ECDSA, 256, &key);
+	VERIFY0(rv);
+	VERIFY0(sshkey_demote(key, &box->pdb_ephem_pub));
+
+	if (box->pdb_cipher == NULL)
+		box->pdb_cipher = "chacha20-poly1305";
+	if (box->pdb_kdf == NULL)
+		box->pdb_kdf = "sha256";
+
+	cipher = cipher_by_name(box->pdb_cipher);
+	VERIFY3P(cipher, !=, NULL);
+	ivlen = cipher_ivlen(cipher);
+	authlen = cipher_authlen(cipher);
+	blocksz = cipher_blocksz(cipher);
+	keylen = cipher_keylen(cipher);
+
+	dgalg = ssh_digest_alg_by_name(box->pdb_kdf);
+	dglen = ssh_digest_bytes(dgalg);
+	VERIFY3U(dglen, >=, keylen);
+
+	iv = calloc(1, ivlen);
+	VERIFY3P(iv, !=, NULL);
+
+	free(box->pdb_iv.b_data);
+	box->pdb_iv.b_size = ivlen;
+	box->pdb_iv.b_data = iv;
+
+}
+
+int
+piv_box_to_base64(struct piv_ecdh_box *box, char **output, size_t *len)
+{
+}
+
+int
+piv_box_from_base64(const char *input, size_t len, struct piv_ecdh_box **box)
+{
 }
