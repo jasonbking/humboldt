@@ -40,7 +40,7 @@
 #include "softtoken.h"
 #include "bunyan.h"
 #include "sshkey.h"
-#include "ykccid.h"
+#include "piv.h"
 
 #include "sshkey.h"
 #include "cipher.h"
@@ -90,42 +90,15 @@ hex_buffer(const char *buf, size_t len)
 	return (obuf);
 }
 
-static char *
-expand_key_and_replace(char *input, size_t inlen, size_t outlen)
-{
-	char *out;
-	size_t pos, len;
-	char buf[crypto_hash_sha512_BYTES];
-
-	out = calloc(1, outlen);
-	VERIFY3P(out, !=, NULL);
-
-	explicit_bzero(&buf, sizeof (buf));
-	crypto_hash_sha512(buf, input, inlen);
-	do {
-		len = crypto_hash_sha512_BYTES;
-		if (len > outlen)
-			len = outlen;
-		bcopy(buf, out, len);
-		pos += len;
-		outlen -= len;
-		if (outlen > 0)
-			crypto_hash_sha512(buf, buf, sizeof (buf));
-	} while (outlen > 0);
-	explicit_bzero(&buf, sizeof (buf));
-	explicit_bzero(input, inlen);
-	free(input);
-	return (out);
-}
-
 static void
-encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
-    struct token_slot *info)
+encrypt_and_write_key(struct sshkey *skey, struct piv_token *tk,
+    const char *dir, struct token_slot *info)
 {
 	int rv, i;
-	char *chal, *key, *iv, *encdata, *packdata;
+	uint8_t *boxd, *key, *iv, *encdata;
+	char *packdata;
 	u_char *pubblob;
-	size_t challen, keylen, keysz, ivlen, authlen, blocksz, enclen;
+	size_t boxdlen, keylen, ivlen, authlen, blocksz, enclen;
 	size_t packlen, publen;
 	const struct sshcipher *cipher;
 	struct sshcipher_ctx *cctx;
@@ -135,6 +108,8 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 	librename_atomic_t *rast;
 	FILE *f;
 	struct sshkey *pubkey;
+	struct piv_slot *slot;
+	struct piv_ecdh_box *box;
 
 	VERIFY0(sshkey_demote(skey, &pubkey));
 	VERIFY0(sshkey_to_blob(pubkey, &pubblob, &publen));
@@ -143,15 +118,15 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 	buf = sshbuf_new();
 	VERIFY3P(buf, !=, NULL);
 
-	/* Generate the random challenge value that we'll give to the token */
-	challen = 64;
-	chal = calloc(1, challen);
-	VERIFY3P(chal, !=, NULL);
-	arc4random_buf(chal, challen);
-
 	/* Get some cipher metadata so we know what sizes things should be */
 	cipher = cipher_by_name(ciphername);
 	VERIFY3P(cipher, !=, NULL);
+
+	/* Generate the random key to encrypt the actual data */
+	keylen = cipher_keylen(cipher);
+	key = calloc(1, keylen);
+	VERIFY3P(key, !=, NULL);
+	arc4random_buf(key, keylen);
 
 	authlen = cipher_authlen(cipher);
 	blocksz = cipher_blocksize(cipher);
@@ -162,28 +137,28 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 	VERIFY3P(iv, !=, NULL);
 	arc4random_buf(iv, ivlen);
 
-	/*
-	 * Now feed our challenge through the HW token to generate our real
-	 * key material. It might be too short for what the cipher actually
-	 * needs.
-	 */
-	keysz = cipher_keylen(cipher);
-	key = calloc(1, keysz);
-	VERIFY3P(key, !=, NULL);
+	slot = piv_get_slot(tk, PIV_SLOT_KEY_MGMT);
+	if (slot == NULL) {
+		VERIFY0(piv_txn_begin(tk));
+		rv = piv_read_cert(tk, PIV_SLOT_KEY_MGMT);
+		piv_txn_end(tk);
+		VERIFY3U(rv, ==, 0);
+		slot = piv_get_slot(tk, PIV_SLOT_KEY_MGMT);
+	}
+	VERIFY3P(slot, !=, NULL);
 
-	ykc_txn_begin(yk);
-	VERIFY0(ykc_select(yk));
-	keylen = keysz;
-	VERIFY0(ykc_hmac(yk, 1, chal, challen, key, &keylen));
-	VERIFY3U(keylen, <, keysz);
-	ykc_txn_end(yk);
+	bunyan_log(TRACE, "boxing key for PIV slot",
+	    "keyname", BNY_STRING, info->ts_name,
+	    "algo", BNY_UINT, (uint)info->ts_algo,
+	    "guid", BNY_BIN_HEX, tk->pt_guid, sizeof (tk->pt_guid),
+	    "slotid", BNY_UINT, (uint)slot->ps_slot, NULL);
 
-	/*
-	 * If it is too short, expand it by hashing it with SHA-512 until we
-	 * have enough material.
-	 */
-	if (keylen < keysz)
-		key = expand_key_and_replace(key, keylen, keysz);
+	box = piv_box_new();
+	VERIFY3P(box, !=, NULL);
+	VERIFY0(piv_box_set_data(box, key, keylen));
+	VERIFY0(piv_box_seal(tk, slot, box));
+	VERIFY0(piv_box_to_binary(box, &boxd, &boxdlen));
+	piv_box_free(box);
 
 	rv = sshkey_private_serialize(skey, buf);
 	VERIFY0(rv);
@@ -194,7 +169,7 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 		VERIFY0(rv);
 	}
 
-	rv = cipher_init(&cctx, cipher, key, keysz, iv, ivlen, 1);
+	rv = cipher_init(&cctx, cipher, key, keylen, iv, ivlen, 1);
 	VERIFY0(rv);
 	enclen = sshbuf_len(buf) + authlen;
 	encdata = calloc(1, enclen);
@@ -214,9 +189,7 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 	VERIFY0(nvlist_add_uint8(nv, "algo", info->ts_algo));
 	VERIFY0(nvlist_add_uint8(nv, "type", info->ts_type));
 
-	VERIFY0(nvlist_add_byte_array(nv, "challenge", chal, challen));
-	VERIFY0(nvlist_add_uint32(nv, "yk_serial", yk->yk_serial));
-	VERIFY0(nvlist_add_uint8(nv, "yk_slot", 1));
+	VERIFY0(nvlist_add_byte_array(nv, "local-box", boxd, boxdlen));
 
 	VERIFY0(nvlist_add_string(nv, "encalgo", ciphername));
 	VERIFY0(nvlist_add_byte_array(nv, "encdata", encdata, enclen));
@@ -244,15 +217,15 @@ encrypt_and_write_key(struct sshkey *skey, struct yubikey *yk, const char *dir,
 	librename_atomic_fini(rast);
 
 	/* Make sure to explicit_bzero any buffers that held sensitive data. */
-	explicit_bzero(key, keysz);
+	explicit_bzero(key, keylen);
 	free(key);
-	explicit_bzero(chal, challen);
-	free(chal);
 	explicit_bzero(iv, ivlen);
 	free(iv);
 	explicit_bzero(encdata, enclen);
 	free(encdata);
 	free(pubblob);
+	explicit_bzero(boxd, boxdlen);
+	free(boxd);
 	sshbuf_free(buf);
 }
 
@@ -276,21 +249,22 @@ lock_key(struct token_slot *slot)
 static int
 unlock_key(struct token_slot *slot)
 {
-	struct yubikey *ykb, *yk;
+	struct piv_token *tk, *tks;
+	struct piv_slot *sl;
+	struct piv_ecdh_box *box;
 	nvlist_t *nv = slot->ts_nvl;
 	int rv, i;
 	SCARDCONTEXT ctx;
-	uchar_t *chal, *key, *iv, *encdata;
-	uint_t challen, keysz, ivlen, authlen, blocksz, enclen;
-	size_t keylen;
+	uchar_t *boxd, *key, *iv, *encdata;
+	uint_t boxdlen, keylen, ivlen, authlen, blocksz, enclen;
 	const struct sshcipher *cipher;
 	struct sshbuf *buf;
 	struct sshkey *pkey, *pubkey;
 	struct sshcipher_ctx *cctx;
 	char *ciphername;
-	uint32_t serial;
-	uint8_t slotn;
 	struct bunyan_timers *tms;
+	uint attempts;
+	const char *pin;
 
 	tms = bny_timers_new();
 	VERIFY3P(tms, !=, NULL);
@@ -301,62 +275,53 @@ unlock_key(struct token_slot *slot)
 
 	VERIFY0(bny_timer_next(tms, "scard_establish"));
 
-	ykb = ykc_find(ctx);
-	assert(ykb != NULL);
-	yk = ykb;
+	tks = piv_enumerate(ctx);
+	assert(tks != NULL);
 
 	VERIFY0(bny_timer_next(tms, "find_yubikeys"));
 
-	VERIFY0(nvlist_lookup_uint32(nv, "yk_serial", &serial));
-	VERIFY0(nvlist_lookup_uint8(nv, "yk_slot", &slotn));
-	do {
-		const uint16_t mask =
-		    (slotn == 1 ? CONFIG1_VALID : CONFIG2_VALID);
-		if (yk->yk_serial == serial && (yk->yk_touchlvl & mask) != 0)
-			break;
-		yk = yk->yk_next;
-	} while (yk != NULL);
-	VERIFY3P(yk, !=, NULL);
+	VERIFY0(nvlist_lookup_byte_array(nv, "local-box", &boxd, &boxdlen));
+	VERIFY0(piv_box_from_binary(boxd, boxdlen, &box));
+	VERIFY0(piv_box_find_token(tks, box, &tk, &sl));
+
+	VERIFY0(bny_timer_next(tms, "select_yubikey"));
+
+	attempts = 2;
+	pin = getenv("PIV_LOCAL_PIN");
+	if (pin == NULL)
+		pin = "123456";
+	VERIFY0(piv_txn_begin(tk));
+	VERIFY0(piv_verify_pin(tk, pin, &attempts));
+	VERIFY0(piv_box_open(tk, sl, box));
+	piv_txn_end(tk);
+
+	VERIFY0(piv_box_take_data(box, &key, &keylen));
+	piv_box_free(box);
+	piv_release(tks);
+
+	VERIFY0(bny_timer_next(tms, "ecdh_kd"));
 
 	VERIFY0(nvlist_lookup_string(nv, "encalgo", &ciphername));
+	VERIFY0(nvlist_lookup_byte_array(nv, "iv", &iv, &ivlen));
+
 	cipher = cipher_by_name(ciphername);
 	VERIFY3P(cipher, !=, NULL);
 
 	authlen = cipher_authlen(cipher);
 	blocksz = cipher_blocksize(cipher);
-
-	VERIFY0(nvlist_lookup_byte_array(nv, "challenge", &chal, &challen));
-	VERIFY0(nvlist_lookup_byte_array(nv, "iv", &iv, &ivlen));
 	VERIFY3S(ivlen, ==, cipher_ivlen(cipher));
-
-	keysz = cipher_keylen(cipher);
-	key = calloc(1, keysz);
-	VERIFY3P(key, !=, NULL);
-
-	ykc_txn_begin(yk);
-	VERIFY0(ykc_select(yk));
-	keylen = keysz;
-	VERIFY0(ykc_hmac(yk, slotn, chal, challen, key, &keylen));
-	VERIFY3U(keylen, <, keysz);
-	ykc_txn_end(yk);
-
-	ykc_release(ykb);
-
-	if (keylen < keysz)
-		key = expand_key_and_replace(key, keylen, keysz);
-
-	VERIFY0(bny_timer_next(tms, "hmac_kd"));
+	VERIFY3U(keylen, ==, cipher_keylen(cipher));
 
 	VERIFY0(nvlist_lookup_byte_array(nv, "encdata", &encdata, &enclen));
 
-	VERIFY0(cipher_init(&cctx, cipher, key, keysz, iv, ivlen, 0));
+	VERIFY0(cipher_init(&cctx, cipher, key, keylen, iv, ivlen, 0));
 
 	slot->ts_data->tsd_len = enclen - authlen;
 	VERIFY0(cipher_crypt(cctx, 0, (u_char *)slot->ts_data->tsd_data,
 	    encdata, enclen - authlen, 0, authlen));
 
 	cipher_free(cctx);
-	explicit_bzero(key, keysz);
+	explicit_bzero(key, keylen);
 	free(key);
 
 	VERIFY0(bny_timer_next(tms, "decrypt"));
@@ -384,7 +349,7 @@ generate_keys(const char *zonename, const char *keydir)
 {
 	struct sshkey *authkey;
 	struct sshkey *certkey;
-	struct yubikey *yk;
+	struct piv_token *tks;
 	int rv, i;
 	SCARDCONTEXT ctx;
 	struct token_slot tpl;
@@ -393,16 +358,15 @@ generate_keys(const char *zonename, const char *keydir)
 	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
 	assert(rv == SCARD_S_SUCCESS);
 
-	yk = ykc_find(ctx);
-	assert(yk != NULL);
-	assert(yk->yk_next == NULL);
+	tks = piv_enumerate(ctx);
+	assert(tks != NULL);
 
 	rv = sshkey_generate(KEY_ED25519, 256, &authkey);
 	VERIFY0(rv);
 	tpl.ts_type = SLOT_ASYM_AUTH;
 	tpl.ts_algo = ALGO_ED_25519;
 	tpl.ts_name = "auth.key";
-	encrypt_and_write_key(authkey, yk, keydir, &tpl);
+	encrypt_and_write_key(authkey, tks, keydir, &tpl);
 	sshkey_free(authkey);
 
 	rv = sshkey_generate(KEY_RSA, 2048, &certkey);
@@ -410,10 +374,10 @@ generate_keys(const char *zonename, const char *keydir)
 	tpl.ts_type = SLOT_ASYM_CERT_SIGN;
 	tpl.ts_algo = ALGO_RSA_2048;
 	tpl.ts_name = "cert.key";
-	encrypt_and_write_key(certkey, yk, keydir, &tpl);
+	encrypt_and_write_key(certkey, tks, keydir, &tpl);
 	sshkey_free(certkey);
 
-	ykc_release(yk);
+	piv_release(tks);
 }
 
 static void

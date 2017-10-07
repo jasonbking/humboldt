@@ -1765,7 +1765,7 @@ piv_box_seal(struct piv_token *tk, struct piv_slot *slot,
 
 	bcopy(tk->pt_guid, box->pdb_guid, sizeof (tk->pt_guid));
 	box->pdb_slot = slot->ps_slot;
-	box->pdb_pub = slot->ps_pubkey;
+	VERIFY0(sshkey_demote(slot->ps_pubkey, &box->pdb_pub));
 
 	free(box->pdb_enc.b_data);
 	box->pdb_enc.b_data = enc;

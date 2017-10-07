@@ -97,9 +97,6 @@ check_add_zone(zoneid_t id)
 {
 	struct zone_state *zs;
 
-	if (id == GLOBAL_ZONEID)
-		return;
-
 	mutex_enter(&zonest_mutex);
 	for (zs = zonest; zs != NULL; zs = zs->zs_next) {
 		if (zs->zs_id == id) {
@@ -170,9 +167,6 @@ stop_zone(zoneid_t id)
 {
 	struct zone_state *zs;
 	struct ctl_cmd cmd;
-
-	if (id == GLOBAL_ZONEID)
-		return;
 
 	mutex_enter(&zonest_mutex);
 	for (zs = zonest; zs != NULL; zs = zs->zs_next) {
@@ -295,6 +289,8 @@ main(int argc, char *argv[])
 	bunyan_init();
 	bunyan_set_name("softtoken_mgr");
 	bunyan_log(INFO, "starting up", NULL);
+
+	bunyan_set_level(DEBUG);
 
 	VERIFY0(mutex_init(&zonest_mutex,
 	    USYNC_THREAD | LOCK_ERRORCHECK, NULL));

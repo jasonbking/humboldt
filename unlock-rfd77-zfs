@@ -30,25 +30,18 @@ fi
 # out of sync with us. Doing a list command will cause PCSC to reset it and
 # bring it back into sync.
 #
-yktool list >/dev/null 2>/dev/null || true
+pivtool list >/dev/null 2>/dev/null || true
 
 #
 # Now run around any encrypted datasets on the system and unlock them.
 #
-zfs list -p -H -o name,encryptionroot,rfd77:challenge,rfd77:slot,rfd77:serial | \
-    while read name encroot chal slot serial; do
-	if [[ "${name}" == "${encroot}" && "${chal}" != "-" ]]; then
-		if [[ "${slot}" == "-" ]]; then
-			slot="1"
-		fi
-		ykopts=""
-		if [[ "${serial}" != "-" ]]; then
-			ykopts="${ykargs} -s ${serial}"
-		fi
-		echo "$chal" | \
+zfs list -p -H -o name,encryptionroot,rfd77:local-box | \
+    while read name encroot box; do
+	if [[ "${name}" == "${encroot}" && "${box}" != "-" ]]; then
+		ykopts="-P 123456"
+		echo "$box" | \
 		    openssl enc -base64 -d | \
-		    yktool ${ykopts} hmac ${slot} | \
-		    openssl dgst -sha256 -binary | \
+		    pivtool ${ykopts} unbox | \
 		    zfs load-key "${name}"
 	fi
 done
