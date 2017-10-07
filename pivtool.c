@@ -18,10 +18,12 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stddef.h>
-#include <sys/types.h>
 #include <errno.h>
-#include <sys/errno.h>
 #include <strings.h>
+
+#include <sys/types.h>
+#include <sys/errno.h>
+#include <sys/debug.h>
 
 #include "sshkey.h"
 #include "sshbuf.h"
@@ -38,6 +40,7 @@
 boolean_t debug = B_FALSE;
 static boolean_t parseable = B_FALSE;
 static uint8_t *guid = NULL;
+static uint min_retries = 2;
 static const char *pin = NULL;
 static const uint8_t DEFAULT_ADMIN_KEY[] = {
 	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
@@ -119,10 +122,10 @@ static void
 assert_pin(struct piv_token *pk)
 {
 	int rv;
-	uint retries;
+	uint retries = min_retries;
 
 	if (pin != NULL) {
-		rv = piv_verify_pin(selk, pin, &retries);
+		rv = piv_verify_pin(pk, pin, &retries);
 		if (rv == EACCES) {
 			fprintf(stderr, "error: invalid PIN code (%d attempts "
 			    "remaining)\n", retries);
@@ -470,6 +473,106 @@ cmd_sign(uint slotid)
 }
 
 static void
+cmd_box(uint slotid)
+{
+	struct piv_slot *slot;
+	struct piv_ecdh_box *box;
+	int rv;
+	size_t len;
+	uint8_t *buf;
+
+	piv_txn_begin(selk);
+	rv = piv_read_cert(selk, slotid);
+	piv_txn_end(selk);
+	if (rv == ENOENT) {
+		fprintf(stderr, "error: slot %02X does not contain a key\n",
+		    slotid);
+		exit(1);
+	} else if (rv != 0) {
+		fprintf(stderr, "error: slot %02X reading cert failed\n",
+		    slotid);
+		exit(1);
+	}
+
+	slot = piv_get_slot(selk, slotid);
+	VERIFY3P(slot, !=, NULL);
+
+	box = piv_box_new();
+	VERIFY3P(box, !=, NULL);
+
+	buf = read_stdin(8192, &len);
+	assert(buf != NULL);
+	VERIFY3U(len, >, 0);
+	VERIFY0(piv_box_set_data(box, buf, len));
+	explicit_bzero(buf, len);
+	free(buf);
+
+	VERIFY0(piv_box_seal(selk, slot, box));
+
+	VERIFY0(piv_box_to_binary(box, &buf, &len));
+	piv_box_free(box);
+
+	fwrite(buf, 1, len, stdout);
+	explicit_bzero(buf, len);
+	free(buf);
+	exit(0);
+}
+
+static void
+cmd_unbox(void)
+{
+	struct piv_token *tk;
+	struct piv_slot *sl;
+	struct piv_ecdh_box *box;
+	int rv;
+	size_t len;
+	uint8_t *buf;
+	char *guid;
+
+	buf = read_stdin(8192, &len);
+	assert(buf != NULL);
+	VERIFY3U(len, >, 0);
+
+	if (piv_box_from_binary(buf, len, &box)) {
+		fprintf(stderr, "error: failed parsing ecdh box\n");
+		exit(1);
+	}
+	free(buf);
+
+	rv = piv_box_find_token(ks, box, &tk, &sl);
+	if (rv == ENOENT) {
+		fprintf(stderr, "error: no token found on system that can "
+		    "unlock this box\n");
+		exit(1);
+	} else if (rv != 0) {
+		fprintf(stderr, "error: failed to communicate with token\n");
+		exit(1);
+	}
+
+	piv_txn_begin(tk);
+	assert_pin(tk);
+	rv = piv_box_open(tk, sl, box);
+	piv_txn_end(tk);
+
+	if (rv == EPERM) {
+		guid = buf_to_hex(tk->pt_guid, sizeof (tk->pt_guid), B_FALSE);
+		fprintf(stderr, "error: token %s slot %02X requires a PIN\n",
+		    guid, sl->ps_slot);
+		free(guid);
+		exit(1);
+	} else if (rv != 0) {
+		fprintf(stderr, "error: failed to communicate with token\n");
+		exit(1);
+	}
+
+	VERIFY0(piv_box_take_data(box, &buf, &len));
+	fwrite(buf, 1, len, stdout);
+	explicit_bzero(buf, len);
+	free(buf);
+	exit(0);
+}
+
+static void
 cmd_ecdh(uint slotid)
 {
 	struct piv_slot *cert;
@@ -569,6 +672,9 @@ usage(void)
 	    "  ecdh <slot>            Do ECDH with pubkey on stdin\n"
 	    "  generate <slot>        Generate a new private key and a\n"
 	    "                         self-signed cert\n"
+	    "  box <slot>             Encrypts stdin data with an ECDH box\n"
+	    "  unbox                  Decrypts stdin data with an ECDH box\n"
+	    "                         Chooses token and slot automatically\n"
 	    "\n"
 	    "Options:\n"
 	    "  --pin|-P <code>        PIN code to authenticate with\n"
@@ -581,7 +687,13 @@ usage(void)
 	exit(3);
 }
 
-const char *optstring = "d(debug)p(parseable)g:(guid)P:(pin)a:(algorithm)";
+const char *optstring =
+    "d(debug)"
+    "p(parseable)"
+    "g:(guid)"
+    "P:(pin)"
+    "a:(algorithm)"
+    "f(force)";
 
 int
 main(int argc, char *argv[])
@@ -608,6 +720,9 @@ main(int argc, char *argv[])
 				    "6 bytes in length (you gave %d)\n", len);
 				exit(3);
 			}
+			break;
+		case 'f':
+			min_retries = 0;
 			break;
 		case 'a':
 			override = calloc(1, sizeof (struct piv_slot));
@@ -677,7 +792,7 @@ main(int argc, char *argv[])
 				break;
 		}
 	}
-	if (selk == NULL) {
+	if (selk == NULL && strcmp(op, "unbox") != 0) {
 		selk = ks;
 		if (selk->pt_next != NULL) {
 			fprintf(stderr, "error: multiple PIV cards present; "
@@ -735,6 +850,32 @@ main(int argc, char *argv[])
 			override->ps_slot = slotid;
 
 		cmd_ecdh(slotid);
+
+	} else if (strcmp(op, "box") == 0) {
+		uint slotid;
+
+		if (optind >= argc) {
+			fprintf(stderr, "error: slot required\n");
+			usage();
+		}
+		slotid = strtol(argv[optind++], NULL, 16);
+
+		if (optind < argc) {
+			fprintf(stderr, "error: too many arguments\n");
+			usage();
+		}
+
+		if (override != NULL)
+			override->ps_slot = slotid;
+
+		cmd_box(slotid);
+
+	} else if (strcmp(op, "unbox") == 0) {
+		if (optind < argc) {
+			fprintf(stderr, "error: too many arguments\n");
+			usage();
+		}
+		cmd_unbox();
 
 	} else if (strcmp(op, "generate") == 0) {
 		uint slotid;

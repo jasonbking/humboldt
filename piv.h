@@ -178,6 +178,21 @@ struct piv_token {
 	struct piv_slot *pt_slots;
 };
 
+struct piv_ecdh_box {
+	uint8_t pdb_guid[16];
+	enum piv_slotid pdb_slot;
+	struct sshkey *pdb_ephem_pub;
+	struct sshkey *pdb_pub;
+
+	boolean_t pdb_free_str;
+	const char *pdb_cipher;
+	const char *pdb_kdf;
+
+	struct apdubuf pdb_iv;
+	struct apdubuf pdb_enc;
+	struct apdubuf pdb_plain;
+};
+
 struct piv_token *piv_enumerate(SCARDCONTEXT ctx);
 void piv_release(struct piv_token *pk);
 
@@ -286,9 +301,18 @@ int piv_write_cert(struct piv_token *tk, enum piv_slotid slotid,
  * The "pin" argument should be a NULL-terminated ASCII numeric string of the
  * PIN to use. Max length is 10 digits.
  *
+ * If the argument "retries" is given, then it will be read to determine a
+ * minimum number of remaining attempts to assert are possible before trying to
+ * unlock: if less than "*retries" attempts are remaining, we will not attempt
+ * to unlock and will return EAGAIN.
+ *
+ * If EACCES is returned, then "retries" will also be written with the new
+ * remaining attempts count.
+ *
  * Errors:
  *  - EIO: general card communication failure
  *  - EINVAL: the card rejected the command (e.g. because applet not selected)
+ *  - EAGAIN: the PIN has a remaining retries count that is too low
  *  - EACCES: the PIN code was incorrect. If non-NULL, the "retries" argument
  *            will be written with the number of attempts remaining before the
  *            card locks itself (and potentially erases keys)
@@ -341,26 +365,19 @@ int piv_sign_prehash(struct piv_token *tk, struct piv_slot *slot,
 int piv_ecdh(struct piv_token *tk, struct piv_slot *slot,
     struct sshkey *pubkey, uint8_t **secret, size_t *seclen);
 
-
-struct piv_ecdh_box {
-	uint8_t pdb_guid[16];
-	enum piv_slotid pdb_slot;
-	struct sshkey *pdb_ephem_pub;
-	const char *pdb_cipher;
-	const char *pdb_kdf;
-	struct apdubuf pdb_iv;
-	struct apdubuf pdb_encrypted;
-	struct apdubuf pdb_plain;
-};
-
 struct piv_ecdh_box *piv_box_new(void);
+int piv_box_set_data(struct piv_ecdh_box *box, const uint8_t *data, size_t len);
 int piv_box_seal(struct piv_token *tk, struct piv_slot *slot,
     struct piv_ecdh_box *box);
-int piv_box_to_base64(struct piv_ecdh_box *box, char **output, size_t *len);
+int piv_box_to_binary(struct piv_ecdh_box *box, uint8_t **output, size_t *len);
 
-int piv_box_from_base64(const char *input, size_t len,
+int piv_box_from_binary(const uint8_t *input, size_t len,
     struct piv_ecdh_box **box);
-int piv_box_open(struct piv_token *tks, struct piv_ecdh_box *box);
+int piv_box_find_token(struct piv_token *tks, struct piv_ecdh_box *box,
+    struct piv_token **tk, struct piv_slot **slot);
+int piv_box_open(struct piv_token *tk, struct piv_slot *slot,
+    struct piv_ecdh_box *box);
+int piv_box_take_data(struct piv_ecdh_box *box, uint8_t **data, size_t *len);
 void piv_box_free(struct piv_ecdh_box *box);
 
 #endif
