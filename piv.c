@@ -1594,6 +1594,80 @@ piv_box_take_data(struct piv_ecdh_box *box, uint8_t **data, size_t *len)
 }
 
 int
+piv_box_open_offline(struct sshkey *privkey, struct piv_ecdh_box *box)
+{
+	const struct sshcipher *cipher;
+	int rv;
+	int dgalg;
+	struct sshcipher_ctx *cctx;
+	struct ssh_digest_ctx *dgctx;
+	uint8_t *iv, *key, *dg, *sec, *enc, *plain;
+	size_t ivlen, authlen, blocksz, keylen, dglen, seclen;
+	size_t fieldsz, plainlen, enclen;
+	size_t i, j;
+
+	VERIFY3P(box->pdb_cipher, !=, NULL);
+	VERIFY3P(box->pdb_kdf, !=, NULL);
+
+	cipher = cipher_by_name(box->pdb_cipher);
+	VERIFY3P(cipher, !=, NULL);
+	ivlen = cipher_ivlen(cipher);
+	authlen = cipher_authlen(cipher);
+	blocksz = cipher_blocksize(cipher);
+	keylen = cipher_keylen(cipher);
+
+	dgalg = ssh_digest_alg_by_name(box->pdb_kdf);
+	dglen = ssh_digest_bytes(dgalg);
+	VERIFY3U(dglen, >=, keylen);
+
+	fieldsz = EC_GROUP_get_degree(EC_KEY_get0_group(privkey->ecdsa));
+	seclen = (fieldsz + 7) / 8;
+	sec = calloc(1, seclen);
+	assert(sec != NULL);
+	seclen = ECDH_compute_key(sec, seclen,
+	    EC_KEY_get0_public_key(box->pdb_ephem_pub->ecdsa), privkey->ecdsa,
+	    NULL);
+	VERIFY3U(seclen, >, 0);
+
+	dgctx = ssh_digest_start(dgalg);
+	VERIFY3P(dgctx, !=, NULL);
+	VERIFY0(ssh_digest_update(dgctx, sec, seclen));
+	key = calloc(1, dglen);
+	VERIFY3P(key, !=, NULL);
+	VERIFY0(ssh_digest_final(dgctx, key, dglen));
+
+	explicit_bzero(sec, seclen);
+	free(sec);
+
+	iv = box->pdb_iv.b_data;
+	VERIFY3U(box->pdb_iv.b_size, ==, ivlen);
+	VERIFY3P(iv, !=, NULL);
+
+	enc = box->pdb_enc.b_data;
+	VERIFY3P(enc, !=, NULL);
+	enclen = box->pdb_enc.b_size;
+	VERIFY3U(enclen, >=, authlen + blocksz);
+
+	plainlen = enclen - authlen;
+	plain = calloc(1, plainlen);
+	VERIFY3P(plain, !=, NULL);
+
+	VERIFY0(cipher_init(&cctx, cipher, key, keylen, iv, ivlen, 0));
+	VERIFY0(cipher_crypt(cctx, 0, plain, enc, enclen - authlen, 0,
+	    authlen));
+	cipher_free(cctx);
+
+	explicit_bzero(key, dglen);
+	free(key);
+
+	free(box->pdb_plain.b_data);
+	box->pdb_plain.b_data = plain;
+	box->pdb_plain.b_size = plainlen;
+
+	return (0);
+}
+
+int
 piv_box_open(struct piv_token *tk, struct piv_slot *slot,
     struct piv_ecdh_box *box)
 {
@@ -1609,9 +1683,6 @@ piv_box_open(struct piv_token *tk, struct piv_slot *slot,
 
 	VERIFY3P(box->pdb_cipher, !=, NULL);
 	VERIFY3P(box->pdb_kdf, !=, NULL);
-
-	VERIFY0(bcmp(tk->pt_guid, box->pdb_guid, sizeof (tk->pt_guid)));
-	VERIFY3U(box->pdb_slot, ==, slot->ps_slot);
 
 	cipher = cipher_by_name(box->pdb_cipher);
 	VERIFY3P(cipher, !=, NULL);
@@ -1656,12 +1727,16 @@ piv_box_open(struct piv_token *tk, struct piv_slot *slot,
 	VERIFY3P(plain, !=, NULL);
 
 	VERIFY0(cipher_init(&cctx, cipher, key, keylen, iv, ivlen, 0));
-	VERIFY0(cipher_crypt(cctx, 0, plain, enc, enclen - authlen, 0,
-	    authlen));
+	rv = cipher_crypt(cctx, 0, plain, enc, enclen - authlen, 0,
+	    authlen);
 	cipher_free(cctx);
 
 	explicit_bzero(key, dglen);
 	free(key);
+
+	if (rv != 0) {
+		return (EBADMSG);
+	}
 
 	free(box->pdb_plain.b_data);
 	box->pdb_plain.b_data = plain;
@@ -1671,8 +1746,7 @@ piv_box_open(struct piv_token *tk, struct piv_slot *slot,
 }
 
 int
-piv_box_seal(struct piv_token *tk, struct piv_slot *slot,
-    struct piv_ecdh_box *box)
+piv_box_seal_offline(struct sshkey *pubk, struct piv_ecdh_box *box)
 {
 	const struct sshcipher *cipher;
 	int rv;
@@ -1710,7 +1784,7 @@ piv_box_seal(struct piv_token *tk, struct piv_slot *slot,
 	sec = calloc(1, seclen);
 	assert(sec != NULL);
 	seclen = ECDH_compute_key(sec, seclen,
-	    EC_KEY_get0_public_key(slot->ps_pubkey->ecdsa), pkey->ecdsa, NULL);
+	    EC_KEY_get0_public_key(pubk->ecdsa), pkey->ecdsa, NULL);
 	VERIFY3U(seclen, >, 0);
 
 	sshkey_free(pkey);
@@ -1763,13 +1837,27 @@ piv_box_seal(struct piv_token *tk, struct piv_slot *slot,
 	explicit_bzero(key, dglen);
 	free(key);
 
-	bcopy(tk->pt_guid, box->pdb_guid, sizeof (tk->pt_guid));
-	box->pdb_slot = slot->ps_slot;
-	VERIFY0(sshkey_demote(slot->ps_pubkey, &box->pdb_pub));
+	VERIFY0(sshkey_demote(pubk, &box->pdb_pub));
 
 	free(box->pdb_enc.b_data);
 	box->pdb_enc.b_data = enc;
 	box->pdb_enc.b_size = enclen;
+
+	return (0);
+}
+
+int
+piv_box_seal(struct piv_token *tk, struct piv_slot *slot,
+    struct piv_ecdh_box *box)
+{
+	int rv;
+
+	rv = piv_box_seal_offline(slot->ps_pubkey, box);
+	if (rv != 0)
+		return (rv);
+
+	bcopy(tk->pt_guid, box->pdb_guid, sizeof (tk->pt_guid));
+	box->pdb_slot = slot->ps_slot;
 
 	return (0);
 }
@@ -1781,24 +1869,28 @@ piv_box_find_token(struct piv_token *tks, struct piv_ecdh_box *box,
 	struct piv_token *pt;
 	struct piv_slot *s;
 	int rv;
+	enum piv_slotid slotid;
 
 	for (pt = tks; pt != NULL; pt = pt->pt_next) {
 		if (bcmp(pt->pt_guid, box->pdb_guid, sizeof (pt->pt_guid)) == 0)
 			break;
 	}
 	if (pt == NULL) {
+		slotid = box->pdb_slot;
+		if (slotid == 0 || slotid == 0xFF)
+			slotid = PIV_SLOT_KEY_MGMT;
 		for (pt = tks; pt != NULL; pt = pt->pt_next) {
-			s = piv_get_slot(pt, box->pdb_slot);
+			s = piv_get_slot(pt, slotid);
 			if (s == NULL) {
 				rv = piv_txn_begin(pt);
 				if (rv != 0)
 					continue;
-				rv = piv_read_cert(pt, box->pdb_slot);
+				rv = piv_read_cert(pt, slotid);
 				piv_txn_end(pt);
 
 				if (rv != 0)
 					continue;
-				s = piv_get_slot(pt, box->pdb_slot);
+				s = piv_get_slot(pt, slotid);
 			}
 			if (sshkey_equal_public(s->ps_pubkey, box->pdb_pub))
 				goto out;

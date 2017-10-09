@@ -41,6 +41,7 @@ boolean_t debug = B_FALSE;
 static boolean_t parseable = B_FALSE;
 static uint8_t *guid = NULL;
 static uint min_retries = 2;
+static struct sshkey *opubkey = NULL;
 static const char *pin = NULL;
 static const uint8_t DEFAULT_ADMIN_KEY[] = {
 	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
@@ -481,21 +482,23 @@ cmd_box(uint slotid)
 	size_t len;
 	uint8_t *buf;
 
-	piv_txn_begin(selk);
-	rv = piv_read_cert(selk, slotid);
-	piv_txn_end(selk);
-	if (rv == ENOENT) {
-		fprintf(stderr, "error: slot %02X does not contain a key\n",
-		    slotid);
-		exit(1);
-	} else if (rv != 0) {
-		fprintf(stderr, "error: slot %02X reading cert failed\n",
-		    slotid);
-		exit(1);
-	}
+	if (slotid != 0 || opubkey == NULL) {
+		piv_txn_begin(selk);
+		rv = piv_read_cert(selk, slotid);
+		piv_txn_end(selk);
+		if (rv == ENOENT) {
+			fprintf(stderr, "error: slot %02X does not contain "
+			    "a key\n", slotid);
+			exit(1);
+		} else if (rv != 0) {
+			fprintf(stderr, "error: slot %02X reading cert "
+			    "failed\n", slotid);
+			exit(1);
+		}
 
-	slot = piv_get_slot(selk, slotid);
-	VERIFY3P(slot, !=, NULL);
+		slot = piv_get_slot(selk, slotid);
+		VERIFY3P(slot, !=, NULL);
+	}
 
 	box = piv_box_new();
 	VERIFY3P(box, !=, NULL);
@@ -507,7 +510,11 @@ cmd_box(uint slotid)
 	explicit_bzero(buf, len);
 	free(buf);
 
-	VERIFY0(piv_box_seal(selk, slot, box));
+	if (opubkey == NULL) {
+		VERIFY0(piv_box_seal(selk, slot, box));
+	} else {
+		VERIFY0(piv_box_seal_offline(opubkey, box));
+	}
 
 	VERIFY0(piv_box_to_binary(box, &buf, &len));
 	piv_box_free(box);
@@ -625,6 +632,7 @@ cmd_ecdh(uint slotid)
 
 	buf = read_stdin(8192, &boff);
 	assert(buf != NULL);
+	buf[boff] = 0;
 
 	pubkey = sshkey_new(cert->ps_pubkey->type);
 	assert(pubkey != NULL);
@@ -683,8 +691,33 @@ usage(void)
 	    "  --parseable|-p         Generate parseable output from 'list'\n"
 	    "  --guid|-g              GUID of the PIV token to use\n"
 	    "  --algorithm|-a <algo>  Override algorithm for the slot and\n"
-	    "                         don't use the certificate\n");
+	    "                         don't use the certificate\n"
+	    "  --key|-k <pubkey>      Use a public key for box operation\n"
+	    "                         instead of a slot\n");
 	exit(3);
+}
+
+static void
+check_select_key(void)
+{
+	if (ks == NULL) {
+		fprintf(stderr, "error: no PIV cards present\n");
+		exit(1);
+	}
+	if (guid != NULL) {
+		for (selk = ks; selk != NULL; selk = selk->pt_next) {
+			if (bcmp(selk->pt_guid, guid, 16) == 0)
+				break;
+		}
+	}
+	if (selk == NULL) {
+		selk = ks;
+		if (selk->pt_next != NULL) {
+			fprintf(stderr, "error: multiple PIV cards present; "
+			    "you must provide -g|--guid to select one\n");
+			exit(3);
+		}
+	}
 }
 
 const char *optstring =
@@ -693,7 +726,8 @@ const char *optstring =
     "g:(guid)"
     "P:(pin)"
     "a:(algorithm)"
-    "f(force)";
+    "f(force)"
+    "k:(key)";
 
 int
 main(int argc, char *argv[])
@@ -704,6 +738,7 @@ main(int argc, char *argv[])
 	extern int optind, optopt, opterr;
 	int c;
 	uint len;
+	uint8_t *ptr;
 
 	bunyan_init();
 	bunyan_set_name("pivtool");
@@ -756,6 +791,17 @@ main(int argc, char *argv[])
 		case 'p':
 			parseable = B_TRUE;
 			break;
+		case 'k':
+			opubkey = sshkey_new(KEY_UNSPEC);
+			assert(opubkey != NULL);
+			ptr = optarg;
+			rv = sshkey_read(opubkey, &ptr);
+			if (rv != 0) {
+				fprintf(stderr, "error: failed to parse public "
+				    "key: %d\n", rv);
+				exit(3);
+			}
+			break;
 		}
 	}
 
@@ -782,24 +828,7 @@ main(int argc, char *argv[])
 		return (0);
 	}
 
-	if (ks == NULL) {
-		fprintf(stderr, "error: no PIV cards present\n");
-		return (1);
-	}
-	if (guid != NULL) {
-		for (selk = ks; selk != NULL; selk = selk->pt_next) {
-			if (bcmp(selk->pt_guid, guid, 16) == 0)
-				break;
-		}
-	}
-	if (selk == NULL && strcmp(op, "unbox") != 0) {
-		selk = ks;
-		if (selk->pt_next != NULL) {
-			fprintf(stderr, "error: multiple PIV cards present; "
-			    "you must provide -g|--guid to select one\n");
-			return (3);
-		}
-	}
+
 
 	if (strcmp(op, "sign") == 0) {
 		uint slotid;
@@ -814,6 +843,7 @@ main(int argc, char *argv[])
 		if (override != NULL)
 			override->ps_slot = slotid;
 
+		check_select_key();
 		cmd_sign(slotid);
 
 	} else if (strcmp(op, "pubkey") == 0) {
@@ -830,6 +860,7 @@ main(int argc, char *argv[])
 			usage();
 		}
 
+		check_select_key();
 		cmd_pubkey(slotid);
 
 	} else if (strcmp(op, "ecdh") == 0) {
@@ -849,16 +880,22 @@ main(int argc, char *argv[])
 		if (override != NULL)
 			override->ps_slot = slotid;
 
+		check_select_key();
 		cmd_ecdh(slotid);
 
 	} else if (strcmp(op, "box") == 0) {
 		uint slotid;
 
-		if (optind >= argc) {
-			fprintf(stderr, "error: slot required\n");
-			usage();
+		if (opubkey == NULL) {
+			if (optind >= argc) {
+				fprintf(stderr, "error: slot required\n");
+				usage();
+			}
+			slotid = strtol(argv[optind++], NULL, 16);
+			check_select_key();
+		} else {
+			slotid = 0;
 		}
-		slotid = strtol(argv[optind++], NULL, 16);
 
 		if (optind < argc) {
 			fprintf(stderr, "error: too many arguments\n");
@@ -897,6 +934,7 @@ main(int argc, char *argv[])
 		}
 		override->ps_slot = slotid;
 
+		check_select_key();
 		cmd_generate(slotid, override->ps_alg);
 
 	} else {

@@ -371,6 +371,7 @@ struct piv_ecdh_box *piv_box_new(void);
 int piv_box_set_data(struct piv_ecdh_box *box, const uint8_t *data, size_t len);
 int piv_box_seal(struct piv_token *tk, struct piv_slot *slot,
     struct piv_ecdh_box *box);
+int piv_box_seal_offline(struct sshkey *pubk, struct piv_ecdh_box *box);
 int piv_box_to_binary(struct piv_ecdh_box *box, uint8_t **output, size_t *len);
 
 int piv_box_from_binary(const uint8_t *input, size_t len,
@@ -379,6 +380,7 @@ int piv_box_find_token(struct piv_token *tks, struct piv_ecdh_box *box,
     struct piv_token **tk, struct piv_slot **slot);
 int piv_box_open(struct piv_token *tk, struct piv_slot *slot,
     struct piv_ecdh_box *box);
+int piv_box_open_offline(struct sshkey *privkey, struct piv_ecdh_box *box);
 int piv_box_take_data(struct piv_ecdh_box *box, uint8_t **data, size_t *len);
 void piv_box_free(struct piv_ecdh_box *box);
 
