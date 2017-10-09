@@ -314,7 +314,6 @@ install: $(DEPS_INSTALLED) world
 	cp yubihmac-bench $(DESTDIR)/usr/sbin
 	cp yktool $(DESTDIR)/usr/sbin
 	mkdir -p $(DESTDIR)/usr/sbin/amd64
-	cp softtokend $(DESTDIR)/usr/sbin/amd64
 	cp pivtool $(DESTDIR)/usr/sbin/amd64
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system
 	cp pcscd.xml $(DESTDIR)/lib/svc/manifest/system
@@ -322,6 +321,10 @@ install: $(DEPS_INSTALLED) world
 	cp unlock-rfd77-zfs.xml $(DESTDIR)/lib/svc/manifest/system/filesystem
 	mkdir -p $(DESTDIR)/lib/svc/method
 	cp unlock-rfd77-zfs $(DESTDIR)/lib/svc/method
+	mkdir -p $(DESTDIR)/smartdc/bin
+	cp softtokend $(DESTDIR)/smartdc/bin
+	mkdir -p $(DESTDIR)/smartdc/lib
+	cp piv-prompt-pin.sh $(DESTDIR)/smartdc/lib
 	rm -f $(DESTDIR)/usr/man/man1/pcsc-spy.1
 
 check:

@@ -13,7 +13,7 @@
     <dependent name='fs-local' grouping='require_all' restart_on='error'>
       <service_fmri value='svc:/system/filesystem/local:default'/>
     </dependent>
-    <exec_method name='start' type='method' exec='/lib/svc/method/unlock-rfd77-zfs' timeout_seconds='600'>
+    <exec_method name='start' type='method' exec='/lib/svc/method/unlock-rfd77-zfs' timeout_seconds='0'>
       <method_context working_directory='/tmp'/>
     </exec_method>
     <exec_method name='stop' type='method' exec=':kill' timeout_seconds='60'>

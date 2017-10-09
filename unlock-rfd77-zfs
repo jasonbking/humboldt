@@ -26,11 +26,52 @@ if [[ "z${encstatus}" == "z" ]]; then
 fi
 
 #
+# Get the PIN code for the PIV applet we need to use out of our boot args
+#
+read pivpin < <(bootparams | awk -F= '$1 == "piv-pin" { print $2; exit(0); }')
+
+#
 # If we're in a qemu VM with the emulated CCID device, after reboot it's often
 # out of sync with us. Doing a list command will cause PCSC to reset it and
 # bring it back into sync.
 #
 pivtool list >/dev/null 2>/dev/null || true
+
+unlock_fs() {
+	local fs="$1"
+	local box="$2"
+	if ! try_unlock "$fs" "$box"; then
+		exit $SMF_EXIT_ERROR
+	fi
+}
+
+try_unlock() {
+	local fs="$1"
+	local box="$2"
+	local opts=""
+	if [[ "z${pivpin}" != "z" ]]; then
+		opts="${opts} -P ${pivpin}"
+	fi
+	set +e
+	echo "$box" | \
+	    openssl enc -base64 -d | \
+	    pivtool ${opts} unbox >/dev/null 2>/tmp/pivtool.err.out.$$
+	set -e
+	if [[ $? -eq 0 ]]; then
+		echo "$box" | \
+		    openssl enc -base64 -d | \
+		    pivtool ${opts} unbox | \
+		    zfs unlock "${fs}"
+	elif [[ $? -eq 4 ]]; then
+		mkfifo /tmp/pivpin.pipe.$$
+		/smartdc/lib/sdc-on-tty -d /dev/console \
+		    /smartdc/lib/piv-prompt-pin.sh "/tmp/pivpin.pipe.$$" \
+		    "$(cat /tmp/pivtool.err.out.$$)"
+		read pivpin < /tmp/pivpin.pipe.$$
+		rm -f /tmp/pivpin.pipe.$$ /tmp/pivtool.err.out.$$
+		try_unlock "$fs" "$box"
+	fi
+}
 
 #
 # Now run around any encrypted datasets on the system and unlock them.
@@ -38,11 +79,7 @@ pivtool list >/dev/null 2>/dev/null || true
 zfs list -p -H -o name,encryptionroot,rfd77:local-box | \
     while read name encroot box; do
 	if [[ "${name}" == "${encroot}" && "${box}" != "-" ]]; then
-		ykopts="-P 123456"
-		echo "$box" | \
-		    openssl enc -base64 -d | \
-		    pivtool ${ykopts} unbox | \
-		    zfs load-key "${name}"
+		unlock_fs "$name" "$box"
 	fi
 done
 

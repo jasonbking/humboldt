@@ -40,6 +40,7 @@
 boolean_t debug = B_FALSE;
 static boolean_t parseable = B_FALSE;
 static uint8_t *guid = NULL;
+static size_t guid_len = 0;
 static uint min_retries = 2;
 static struct sshkey *opubkey = NULL;
 static const char *pin = NULL;
@@ -130,77 +131,221 @@ assert_pin(struct piv_token *pk)
 		if (rv == EACCES) {
 			fprintf(stderr, "error: invalid PIN code (%d attempts "
 			    "remaining)\n", retries);
-			exit(3);
+			exit(4);
 		} else if (rv != 0) {
 			fprintf(stderr, "error: failed to verify PIN\n");
-			exit(3);
+			exit(4);
 		}
 	}
 }
 
 extern char *buf_to_hex(const uint8_t *buf, size_t len, boolean_t spaces);
 
+static const char *
+alg_to_string(uint alg)
+{
+	switch (alg) {
+	case PIV_ALG_3DES:
+		return ("3DES");
+	case PIV_ALG_RSA1024:
+		return ("RSA1024");
+	case PIV_ALG_RSA2048:
+		return ("RSA2048");
+	case PIV_ALG_AES128:
+		return ("AES128");
+	case PIV_ALG_AES192:
+		return ("AES192");
+	case PIV_ALG_AES256:
+		return ("AES256");
+	case PIV_ALG_ECCP256:
+		return ("ECCP256");
+	case PIV_ALG_ECCP384:
+		return ("ECCP384");
+	case PIV_ALG_ECCP256_SHA1:
+		return ("ECCP256-SHA1");
+	case PIV_ALG_ECCP256_SHA256:
+		return ("ECCP256-SHA256");
+	default:
+		return ("?");
+	}
+}
+
 static void
 cmd_list(SCARDCONTEXT ctx)
 {
 	struct piv_token *pk;
-	struct piv_slot *cert;
-	int i, rv;
-	char *buf;
+	struct piv_slot *slot;
+	int rv;
+	uint i;
+	char *buf = NULL;
 
 	for (pk = ks; pk != NULL; pk = pk->pt_next) {
 		assert(piv_txn_begin(pk) == 0);
 		piv_read_all_certs(pk);
 		piv_txn_end(pk);
 
-		buf = buf_to_hex(pk->pt_guid, sizeof (pk->pt_guid), B_FALSE);
-		printf("PIV card in '%s': guid = %s\n",
-		    pk->pt_rdrname, buf);
 		free(buf);
-		if (pk->pt_alg_count > 0) {
-			printf("  * supports: ");
+		buf = buf_to_hex(pk->pt_guid, sizeof (pk->pt_guid), B_FALSE);
+
+		if (parseable) {
+			printf("%s:%s:%s:%s:%d.%d.%d:",
+			    pk->pt_rdrname, buf,
+			    pk->pt_nochuid ? "true" : "false",
+			    pk->pt_ykpiv ? "true" : "false",
+			    pk->pt_ykver[0], pk->pt_ykver[1], pk->pt_ykver[2]);
 			for (i = 0; i < pk->pt_alg_count; ++i) {
-				switch (pk->pt_algs[i]) {
-				case PIV_ALG_3DES:
-					printf("3DES ");
-					break;
-				case PIV_ALG_RSA1024:
-					printf("RSA1024 ");
-					break;
-				case PIV_ALG_RSA2048:
-					printf("RSA2048 ");
-					break;
-				case PIV_ALG_AES128:
-					printf("AES128 ");
-					break;
-				case PIV_ALG_AES192:
-					printf("AES192 ");
-					break;
-				case PIV_ALG_AES256:
-					printf("AES256 ");
-					break;
-				case PIV_ALG_ECCP256:
-					printf("ECCP256 ");
-					break;
-				case PIV_ALG_ECCP384:
-					printf("ECCP384 ");
-					break;
-				case PIV_ALG_ECCP256_SHA1:
-					printf("ECCP256-SHA1 ");
-					break;
-				case PIV_ALG_ECCP256_SHA256:
-					printf("ECCP256-SHA256 ");
-					break;
+				printf("%s%s", alg_to_string(pk->pt_algs[i]),
+				    (i + 1 < pk->pt_alg_count) ? "," : "");
+			}
+			for (i = 0x9A; i < 0x9F; ++i) {
+				slot = piv_get_slot(pk, i);
+				if (slot == NULL) {
+					printf(":%02X", i);
+				} else {
+					printf(":%02X;%s;%s;%d",
+					    i, slot->ps_subj,
+					    sshkey_type(slot->ps_pubkey),
+					    sshkey_size(slot->ps_pubkey));
 				}
 			}
 			printf("\n");
+			continue;
 		}
-		for (cert = pk->pt_slots; cert != NULL; cert = cert->ps_next) {
-			printf("  * slot %02X: %s (%s %d)\n", cert->ps_slot,
-			    cert->ps_subj, sshkey_type(cert->ps_pubkey),
-			    sshkey_size(cert->ps_pubkey));
+
+		printf("PIV card in '%s': guid = %s\n",
+		    pk->pt_rdrname, buf);
+		if (pk->pt_nochuid) {
+			printf("  * No CHUID file (needs initialization)\n");
+		}
+		if (pk->pt_ykpiv) {
+			printf("  * YubicoPIV-compatible (v%d.%d.%d)\n",
+			    pk->pt_ykver[0], pk->pt_ykver[1], pk->pt_ykver[2]);
+		}
+		if (pk->pt_alg_count > 0) {
+			printf("  * Algo support: ");
+			for (i = 0; i < pk->pt_alg_count; ++i) {
+				printf("%s ", alg_to_string(pk->pt_algs[i]));
+			}
+			printf("\n");
+		}
+		for (slot = pk->pt_slots; slot != NULL; slot = slot->ps_next) {
+			printf("  * Slot %02X: '%s' (%s %d)\n", slot->ps_slot,
+			    slot->ps_subj, sshkey_type(slot->ps_pubkey),
+			    sshkey_size(slot->ps_pubkey));
 		}
 	}
+}
+
+static void
+cmd_init(void)
+{
+	int rv;
+	struct tlv_state *ccc, *chuid;
+	uint8_t guid[16];
+	uint8_t fascn[25];
+	uint8_t expiry[8] = { '2', '0', '5', '0', '0', '1', '0', '1' };
+	uint8_t cardId[21] = {
+		/* GSC-RID: GSC-IS data model */
+		0xa0, 0x00, 0x00, 0x01, 0x16,
+		/* Manufacturer: ff (unknown) */
+		0xff,
+		/* Card type: JavaCard */
+		0x02,
+		0x00
+	};
+
+	arc4random_buf(guid, sizeof (guid));
+	arc4random_buf(&cardId[6], sizeof (cardId) - 6);
+	bzero(fascn, sizeof (fascn));
+
+	/* First, the CCC */
+	ccc = tlv_init_write();
+
+	/* Our card ID */
+	tlv_push(ccc, 0xF0);
+	tlv_write(ccc, cardId, 0, sizeof (cardId));
+	tlv_pop(ccc);
+
+	/* Container version numbers */
+	tlv_push(ccc, 0xF1);
+	tlv_write_byte(ccc, 0x21);
+	tlv_pop(ccc);
+	tlv_push(ccc, 0xF2);
+	tlv_write_byte(ccc, 0x21);
+	tlv_pop(ccc);
+
+	tlv_push(ccc, 0xF3);
+	tlv_pop(ccc);
+	tlv_push(ccc, 0xF4);
+	tlv_pop(ccc);
+
+	/* Data Model number */
+	tlv_push(ccc, 0xF5);
+	tlv_write_byte(ccc, 0x10);
+	tlv_pop(ccc);
+
+	tlv_push(ccc, 0xF6);
+	tlv_pop(ccc);
+	tlv_push(ccc, 0xF7);
+	tlv_pop(ccc);
+	tlv_push(ccc, 0xFA);
+	tlv_pop(ccc);
+	tlv_push(ccc, 0xFB);
+	tlv_pop(ccc);
+	tlv_push(ccc, 0xFC);
+	tlv_pop(ccc);
+	tlv_push(ccc, 0xFD);
+	tlv_pop(ccc);
+	tlv_push(ccc, 0xFE);
+	tlv_pop(ccc);
+
+	/* Now, set up the CHUID file */
+	chuid = tlv_init_write();
+
+	tlv_push(chuid, 0x30);
+	tlv_write(chuid, fascn, 0, sizeof (fascn));
+	tlv_pop(chuid);
+
+	tlv_push(chuid, 0x34);
+	tlv_write(chuid, guid, 0, sizeof (guid));
+	tlv_pop(chuid);
+
+	tlv_push(chuid, 0x35);
+	tlv_write(chuid, expiry, 0, sizeof (expiry));
+	tlv_pop(chuid);
+
+	tlv_push(chuid, 0x3E);
+	tlv_pop(chuid);
+	tlv_push(chuid, 0xFE);
+	tlv_pop(chuid);
+
+	piv_txn_begin(selk);
+	rv = piv_auth_admin(selk, admin_key, 24);
+	if (rv == 0) {
+		rv = piv_write_file(selk, PIV_TAG_CARDCAP,
+		    tlv_buf(ccc), tlv_len(ccc));
+	}
+	if (rv == 0) {
+		rv = piv_write_file(selk, PIV_TAG_CHUID,
+		    tlv_buf(chuid), tlv_len(chuid));
+	}
+	piv_txn_end(selk);
+
+	tlv_free(ccc);
+	tlv_free(chuid);
+
+	if (rv == ENOMEM) {
+		fprintf(stderr, "error: card is out of EEPROM\n");
+		exit(1);
+	} else if (rv == EPERM) {
+		fprintf(stderr, "error: admin authentication failed\n");
+		exit(1);
+	} else if (rv != 0) {
+		fprintf(stderr, "error: failed to write to card\n");
+		exit(1);
+	}
+
+	exit(0);
 }
 
 static void
@@ -319,7 +464,7 @@ cmd_generate(uint slotid, enum piv_alg alg)
 		piv_txn_end(selk);
 		fprintf(stderr, "error: slot in %02X requires a PIN\n",
 		    slotid);
-		exit(1);
+		exit(4);
 	} else if (rv != 0) {
 		piv_txn_end(selk);
 		fprintf(stderr, "error: failed to sign cert with key\n");
@@ -461,7 +606,7 @@ cmd_sign(uint slotid)
 	if (rv == EPERM) {
 		fprintf(stderr, "error: key in slot %02X requires PIN\n",
 		    slotid);
-		exit(1);
+		exit(4);
 	} else if (rv != 0) {
 		fprintf(stderr, "error: piv_sign_hash returned %d\n", rv);
 		exit(1);
@@ -550,7 +695,7 @@ cmd_unbox(void)
 	if (rv == ENOENT) {
 		fprintf(stderr, "error: no token found on system that can "
 		    "unlock this box\n");
-		exit(1);
+		exit(5);
 	} else if (rv != 0) {
 		fprintf(stderr, "error: failed to communicate with token\n");
 		exit(1);
@@ -566,7 +711,7 @@ cmd_unbox(void)
 		fprintf(stderr, "error: token %s slot %02X requires a PIN\n",
 		    guid, sl->ps_slot);
 		free(guid);
-		exit(1);
+		exit(4);
 	} else if (rv != 0) {
 		fprintf(stderr, "error: failed to communicate with token\n");
 		exit(1);
@@ -651,7 +796,7 @@ cmd_ecdh(uint slotid)
 	if (rv == EPERM) {
 		fprintf(stderr, "error: key in slot %02X requires PIN\n",
 		    slotid);
-		exit(1);
+		exit(4);
 	} else if (rv != 0) {
 		fprintf(stderr, "error: piv_ecdh returned %d\n", rv);
 		exit(1);
@@ -675,12 +820,14 @@ usage(void)
 	    "usage: pivtool [options] <operation>\n"
 	    "Available operations:\n"
 	    "  list                   Lists PIV tokens present\n"
+	    "  init                   Writes GUID and card capabilities\n"
+	    "                         (used to init a new Yubico PIV)\n"
 	    "  pubkey <slot>          Outputs a public key in SSH format\n"
 	    "  sign <slot>            Signs data on stdin\n"
 	    "  ecdh <slot>            Do ECDH with pubkey on stdin\n"
 	    "  generate <slot>        Generate a new private key and a\n"
 	    "                         self-signed cert\n"
-	    "  box <slot>             Encrypts stdin data with an ECDH box\n"
+	    "  box [slot]             Encrypts stdin data with an ECDH box\n"
 	    "  unbox                  Decrypts stdin data with an ECDH box\n"
 	    "                         Chooses token and slot automatically\n"
 	    "\n"
@@ -700,14 +847,22 @@ usage(void)
 static void
 check_select_key(void)
 {
+	struct piv_token *t;
 	if (ks == NULL) {
 		fprintf(stderr, "error: no PIV cards present\n");
 		exit(1);
 	}
 	if (guid != NULL) {
-		for (selk = ks; selk != NULL; selk = selk->pt_next) {
-			if (bcmp(selk->pt_guid, guid, 16) == 0)
-				break;
+		for (t = ks; t != NULL; t = t->pt_next) {
+			if (bcmp(t->pt_guid, guid, guid_len) == 0) {
+				if (selk == NULL) {
+					selk = t;
+				} else {
+					fprintf(stderr, "error: GUID prefix "
+					    "specified is not unique\n");
+					exit(3);
+				}
+			}
 		}
 	}
 	if (selk == NULL) {
@@ -779,9 +934,10 @@ main(int argc, char *argv[])
 			break;
 		case 'g':
 			guid = parse_hex(optarg, &len);
-			if (len != 16) {
-				fprintf(stderr, "error: GUID must be 16 bytes "
-				    "in length (you gave %d)\n", len);
+			guid_len = len;
+			if (len > 16) {
+				fprintf(stderr, "error: GUID must be <=16 bytes"
+				    " in length (you gave %d)\n", len);
 				exit(3);
 			}
 			break;
@@ -825,12 +981,16 @@ main(int argc, char *argv[])
 		if (optind < argc)
 			usage();
 		cmd_list(ctx);
-		return (0);
-	}
 
+	} else if (strcmp(op, "init") == 0) {
+		if (optind < argc) {
+			fprintf(stderr, "error: too many arguments\n");
+			usage();
+		}
+		check_select_key();
+		cmd_init();
 
-
-	if (strcmp(op, "sign") == 0) {
+	} else if (strcmp(op, "sign") == 0) {
 		uint slotid;
 
 		if (optind >= argc)
@@ -888,10 +1048,10 @@ main(int argc, char *argv[])
 
 		if (opubkey == NULL) {
 			if (optind >= argc) {
-				fprintf(stderr, "error: slot required\n");
-				usage();
+				slotid = PIV_SLOT_KEY_MGMT;
+			} else {
+				slotid = strtol(argv[optind++], NULL, 16);
 			}
-			slotid = strtol(argv[optind++], NULL, 16);
 			check_select_key();
 		} else {
 			slotid = 0;
@@ -901,9 +1061,6 @@ main(int argc, char *argv[])
 			fprintf(stderr, "error: too many arguments\n");
 			usage();
 		}
-
-		if (override != NULL)
-			override->ps_slot = slotid;
 
 		cmd_box(slotid);
 

@@ -43,6 +43,42 @@ const uint8_t AID_PIV[] = {
 };
 
 static int
+piv_probe_ykpiv(struct piv_token *pk)
+{
+	int rv;
+	struct apdu *apdu;
+
+	apdu = piv_apdu_make(CLA_ISO, INS_GET_VER, 0x00, 0x00);
+
+	rv = piv_apdu_transceive(pk, apdu);
+	if (rv != 0) {
+		bunyan_log(WARN, "piv_probe_ykpiv.transceive_apdu failed",
+		    "reader", BNY_STRING, pk->pt_rdrname,
+		    "err", BNY_STRING, pcsc_stringify_error(rv),
+		    NULL);
+		piv_apdu_free(apdu);
+		return (EIO);
+	}
+
+	if (apdu->a_sw == SW_NO_ERROR) {
+		const uint8_t *reply =
+		    &apdu->a_reply.b_data[apdu->a_reply.b_offset];
+		if (apdu->a_reply.b_len < 3) {
+			piv_apdu_free(apdu);
+			return (ENOTSUP);
+		}
+		pk->pt_ykpiv = B_TRUE;
+		bcopy(reply, pk->pt_ykver, 3);
+		rv = 0;
+	} else {
+		rv = ENOTSUP;
+	}
+
+	piv_apdu_free(apdu);
+	return (rv);
+}
+
+static int
 piv_read_chuid(struct piv_token *pk)
 {
 	int rv;
@@ -192,8 +228,18 @@ piv_enumerate(SCARDCONTEXT ctx)
 
 		piv_txn_begin(key);
 		rv = piv_select(key);
-		if (rv == 0)
+		if (rv == 0) {
 			rv = piv_read_chuid(key);
+			if (rv == ENOENT) {
+				rv = 0;
+				key->pt_nochuid = B_TRUE;
+			}
+		}
+		if (rv == 0) {
+			rv = piv_probe_ykpiv(key);
+			if (rv == ENOTSUP)
+				rv = 0;
+		}
 		piv_txn_end(key);
 
 		if (rv == 0) {
@@ -695,6 +741,57 @@ piv_auth_admin(struct piv_token *pt, const uint8_t *key, size_t keylen)
 }
 
 int
+piv_write_file(struct piv_token *pt, uint tag, const char *data, size_t len)
+{
+	int rv;
+	struct apdu *apdu;
+	struct tlv_state *tlv;
+
+	assert(pt->pt_intxn == B_TRUE);
+
+	tlv = tlv_init_write();
+	tlv_push(tlv, 0x5C);
+	tlv_write_uint(tlv, tag);
+	tlv_pop(tlv);
+	tlv_pushl(tlv, 0x53, len + 8);
+	tlv_write(tlv, data, 0, len);
+	tlv_pop(tlv);
+
+	apdu = piv_apdu_make(CLA_ISO, INS_PUT_DATA, 0x3F, 0xFF);
+	apdu->a_cmd.b_data = tlv_buf(tlv);
+	apdu->a_cmd.b_len = tlv_len(tlv);
+
+	rv = piv_apdu_transceive_chain(pt, apdu);
+	if (rv != 0) {
+		bunyan_log(WARN, "piv_write_file.transceive_chain failed",
+		    "reader", BNY_STRING, pt->pt_rdrname,
+		    "err", BNY_STRING, pcsc_stringify_error(rv),
+		    NULL);
+		tlv_free(tlv);
+		piv_apdu_free(apdu);
+		return (EIO);
+	}
+
+	tlv_free(tlv);
+
+	if (apdu->a_sw == SW_NO_ERROR) {
+		rv = 0;
+	} else if (apdu->a_sw == SW_OUT_OF_MEMORY) {
+		rv = ENOMEM;
+	} else if (apdu->a_sw == SW_SECURITY_STATUS_NOT_SATISFIED) {
+		rv = EPERM;
+	} else if (apdu->a_sw == SW_FUNC_NOT_SUPPORTED) {
+		rv = ENOENT;
+	} else {
+		rv = EINVAL;
+	}
+
+	piv_apdu_free(apdu);
+
+	return (rv);
+}
+
+int
 piv_generate(struct piv_token *pt, enum piv_slotid slotid, enum piv_alg alg,
     struct sshkey **pubkey)
 {
@@ -829,7 +926,6 @@ piv_write_cert(struct piv_token *pk, enum piv_slotid slotid,
     const uint8_t *data, size_t datalen, uint flags)
 {
 	int rv;
-	struct apdu *apdu;
 	struct tlv_state *tlv;
 	uint tag;
 
@@ -853,48 +949,16 @@ piv_write_cert(struct piv_token *pk, enum piv_slotid slotid,
 	}
 
 	tlv = tlv_init_write();
-	tlv_push(tlv, 0x5C);
-	tlv_write_uint(tlv, tag);
-	tlv_pop(tlv);
-	tlv_pushl(tlv, 0x53, datalen + 8);
 	tlv_pushl(tlv, 0x70, datalen + 3);
 	tlv_write(tlv, data, 0, datalen);
 	tlv_pop(tlv);
 	tlv_push(tlv, 0x71);
 	tlv_write_byte(tlv, (uint8_t)flags);
 	tlv_pop(tlv);
-	tlv_pop(tlv);
 
-	apdu = piv_apdu_make(CLA_ISO, INS_PUT_DATA, 0x3F, 0xFF);
-	apdu->a_cmd.b_data = tlv_buf(tlv);
-	apdu->a_cmd.b_len = tlv_len(tlv);
-
-	rv = piv_apdu_transceive_chain(pk, apdu);
-	if (rv != 0) {
-		bunyan_log(WARN, "piv_write_cert.transceive_chain failed",
-		    "reader", BNY_STRING, pk->pt_rdrname,
-		    "err", BNY_STRING, pcsc_stringify_error(rv),
-		    NULL);
-		tlv_free(tlv);
-		piv_apdu_free(apdu);
-		return (EIO);
-	}
+	rv = piv_write_file(pk, tag, tlv_buf(tlv), tlv_len(tlv));
 
 	tlv_free(tlv);
-
-	if (apdu->a_sw == SW_NO_ERROR) {
-		rv = 0;
-	} else if (apdu->a_sw == SW_OUT_OF_MEMORY) {
-		rv = ENOMEM;
-	} else if (apdu->a_sw == SW_SECURITY_STATUS_NOT_SATISFIED) {
-		rv = EPERM;
-	} else if (apdu->a_sw == SW_FUNC_NOT_SUPPORTED) {
-		rv = ENOENT;
-	} else {
-		rv = EINVAL;
-	}
-
-	piv_apdu_free(apdu);
 
 	return (rv);
 }

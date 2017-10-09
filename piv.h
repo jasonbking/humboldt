@@ -176,6 +176,9 @@ struct piv_token {
 	enum piv_alg pt_algs[32];
 	size_t pt_alg_count;
 	uint pt_pinretries;
+	boolean_t pt_ykpiv;
+	boolean_t pt_nochuid;
+	uint8_t pt_ykver[3];
 
 	struct piv_slot *pt_slots;
 };
@@ -383,5 +386,8 @@ int piv_box_open(struct piv_token *tk, struct piv_slot *slot,
 int piv_box_open_offline(struct sshkey *privkey, struct piv_ecdh_box *box);
 int piv_box_take_data(struct piv_ecdh_box *box, uint8_t **data, size_t *len);
 void piv_box_free(struct piv_ecdh_box *box);
+
+int piv_write_file(struct piv_token *pt, uint tag,
+    const char *data, size_t len);
 
 #endif
