@@ -56,6 +56,6 @@ d lib/svc/method 0755 root sys
 f lib/svc/method/unlock-rfd77-zfs 0755 root sys
 d smartdc 0755 root bin
 d smartdc/bin 0755 root bin
-f smartdb/bin/softtokend 0755 root sys
+f smartdc/bin/softtokend 0755 root sys
 d smartdc/lib 0755 root bin
 f smartdc/lib/piv-prompt-pin.sh 0755 root bin
