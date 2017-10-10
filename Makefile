@@ -315,6 +315,7 @@ install: $(DEPS_INSTALLED) world
 	cp yktool $(DESTDIR)/usr/sbin
 	mkdir -p $(DESTDIR)/usr/sbin/amd64
 	cp pivtool $(DESTDIR)/usr/sbin/amd64
+	ln -sf amd64/pivtool $(DESTDIR)/usr/sbin/pivtool
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system
 	cp pcscd.xml $(DESTDIR)/lib/svc/manifest/system
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system/filesystem

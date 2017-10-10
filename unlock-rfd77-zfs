@@ -9,12 +9,21 @@
 # Copyright (c) 2017, Joyent, Inc.
 #
 
-set -ex
 set -o pipefail
 
 . /lib/svc/share/smf_include.sh
 
 smf_is_globalzone || exit $SMF_EXIT_OK
+
+fatal() {
+	echo "fatal:" "$@" >&2
+	exit $SMF_EXIT_ERR_FATAL
+}
+
+stop() {
+	echo "skipping unlock:" "$@" >&2
+	exit $SMF_EXIT_OK
+}
 
 #
 # Check that we're on a PI that has zfs encryption at all before going any
@@ -22,8 +31,27 @@ smf_is_globalzone || exit $SMF_EXIT_OK
 #
 read _ _ encstatus _ < <(zpool get -Hp feature@encryption zones)
 if [[ "z${encstatus}" == "z" ]]; then
-	exit $SMF_EXIT_OK
+	stop "ZFS encryption not enabled on this system"
 fi
+
+#
+# If we booted in noimport mode, then don't do any unlocking.
+#
+/bin/bootparams | grep "^noimport=true" >/dev/null
+if [[ $? -eq 0 ]]; then
+	stop "system booted noimport mode"
+fi
+
+#
+# We need the links to /dev/dsk. Rather than trying to play games with manually
+# invoking syseventd ask devfsadm to do some work.
+#
+/usr/sbin/devfsadm -c disk
+
+#
+# Make sure the pool is imported
+#
+zpool import -f zones
 
 #
 # Get the PIN code for the PIV applet we need to use out of our boot args
@@ -35,41 +63,34 @@ read pivpin < <(bootparams | awk -F= '$1 == "piv-pin" { print $2; exit(0); }')
 # out of sync with us. Doing a list command will cause PCSC to reset it and
 # bring it back into sync.
 #
-pivtool list >/dev/null 2>/dev/null || true
-
-unlock_fs() {
-	local fs="$1"
-	local box="$2"
-	if ! try_unlock "$fs" "$box"; then
-		exit $SMF_EXIT_ERROR
-	fi
-}
+pivtool list >/dev/null 2>/dev/null
 
 try_unlock() {
 	local fs="$1"
 	local box="$2"
-	local opts=""
-	if [[ "z${pivpin}" != "z" ]]; then
-		opts="${opts} -P ${pivpin}"
+	local opts="$3"
+	if [[ "z${opts}" == "z" && "z${pivpin}" != "z" ]]; then
+		opts="-P ${pivpin}"
 	fi
-	set +e
 	echo "$box" | \
 	    openssl enc -base64 -d | \
 	    pivtool ${opts} unbox >/dev/null 2>/tmp/pivtool.err.out.$$
-	set -e
-	if [[ $? -eq 0 ]]; then
+	local pivret="$?"
+	if [[ $pivret -eq 0 ]]; then
 		echo "$box" | \
 		    openssl enc -base64 -d | \
 		    pivtool ${opts} unbox | \
-		    zfs unlock "${fs}"
-	elif [[ $? -eq 4 ]]; then
+		    zfs load-key "${fs}"
+		return $?
+	elif [[ $pivret -eq 4 ]]; then
 		mkfifo /tmp/pivpin.pipe.$$
 		/smartdc/lib/sdc-on-tty -d /dev/console \
 		    /smartdc/lib/piv-prompt-pin.sh "/tmp/pivpin.pipe.$$" \
-		    "$(cat /tmp/pivtool.err.out.$$)"
-		read pivpin < /tmp/pivpin.pipe.$$
+		    "$(cat /tmp/pivtool.err.out.$$)" &
+		read pin < /tmp/pivpin.pipe.$$
 		rm -f /tmp/pivpin.pipe.$$ /tmp/pivtool.err.out.$$
-		try_unlock "$fs" "$box"
+		try_unlock "$fs" "$box" "-P ${pin}"
+		return $?
 	fi
 }
 
@@ -79,8 +100,22 @@ try_unlock() {
 zfs list -p -H -o name,encryptionroot,rfd77:local-box | \
     while read name encroot box; do
 	if [[ "${name}" == "${encroot}" && "${box}" != "-" ]]; then
-		unlock_fs "$name" "$box"
+		if ! try_unlock "$name" "$box"; then
+			fatal "failed to unlock $name"
+		fi
 	fi
 done
+
+#
+# Re-create the swap zvol at each boot with a unique key for that boot.
+# This way it's unreadable after a reboot.
+#
+read sz < <(zfs get -pH -o value volsize zones/swap)
+if [[ $? -eq 0 && $sz -gt 0 ]]; then
+	zfs destroy zones/swap || fatal "zfs destroy swap failed"
+	dd if=/dev/random bs=32 count=1 | \
+	    zfs create -V $sz -o encryption=on -o keyformat=raw zones/swap \
+	    || fatal "creating swap zvol failed"
+fi
 
 exit $SMF_EXIT_OK

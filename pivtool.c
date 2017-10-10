@@ -136,14 +136,18 @@ assert_pin(struct piv_token *pk, boolean_t prompt)
 		char *guid;
 		guid = buf_to_hex(pk->pt_guid, 4, B_FALSE);
 		snprintf(prompt, 64, "Enter PIV PIN for token %s: ", guid);
-		free(guid);
 		do {
 			pin = getpass(prompt);
 		} while (pin == NULL && errno == EINTR);
-		if (pin == NULL) {
+		if (pin == NULL && errno == ENXIO) {
+			fprintf(stderr, "error: a PIN code is required to "
+			    "unlock token %s\n", guid);
+			exit(4);
+		} else if (pin == NULL) {
 			perror("getpass");
 			exit(3);
 		}
+		free(guid);
 	}
 	rv = piv_verify_pin(pk, pin, &retries);
 	if (rv == EACCES) {
