@@ -1194,7 +1194,7 @@ piv_change_pin(struct piv_token *pk, const char *pin, const char *newpin)
 	for (i = 0; i < 8, pin[i] != 0; ++i)
 		pinbuf[i] = pin[i];
 	assert(pin[i] == 0);
-	for (i = 8; i < 16; newpin[i - 8] != 0; ++i)
+	for (i = 8; i < 16, newpin[i - 8] != 0; ++i)
 		pinbuf[i] = newpin[i - 8];
 	assert(newpin[i - 8] == 0);
 
@@ -1217,8 +1217,6 @@ piv_change_pin(struct piv_token *pk, const char *pin, const char *newpin)
 		pk->pt_reset = B_TRUE;
 
 	} else if ((apdu->a_sw & 0xFFF0) == SW_INCORRECT_PIN) {
-		if (retries != NULL)
-			*retries = (apdu->a_sw & 0x000F);
 		rv = EACCES;
 
 	} else {

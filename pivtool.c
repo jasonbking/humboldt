@@ -55,6 +55,8 @@ static struct piv_token *ks = NULL;
 static struct piv_token *selk = NULL;
 static struct piv_slot *override = NULL;
 
+extern char *buf_to_hex(const uint8_t *buf, size_t len, boolean_t spaces);
+
 static uint8_t *
 parse_hex(const char *str, uint *outlen)
 {
@@ -154,7 +156,6 @@ assert_pin(struct piv_token *pk, boolean_t prompt)
 	}
 }
 
-extern char *buf_to_hex(const uint8_t *buf, size_t len, boolean_t spaces);
 
 static const char *
 alg_to_string(uint alg)
@@ -370,7 +371,7 @@ cmd_change_pin(void)
 	char prompt[64];
 	char *newpin, *guid;
 
-	guid = buf_to_hex(pk->pt_guid, 4, B_FALSE);
+	guid = buf_to_hex(selk->pt_guid, 4, B_FALSE);
 	snprintf(prompt, 64, "Enter current PIV PIN (%s): ", guid);
 	do {
 		pin = getpass(prompt);
