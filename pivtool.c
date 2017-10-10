@@ -121,21 +121,36 @@ read_stdin(size_t limit, size_t *outlen)
 }
 
 static void
-assert_pin(struct piv_token *pk)
+assert_pin(struct piv_token *pk, boolean_t prompt)
 {
 	int rv;
 	uint retries = min_retries;
 
-	if (pin != NULL) {
-		rv = piv_verify_pin(pk, pin, &retries);
-		if (rv == EACCES) {
-			fprintf(stderr, "error: invalid PIN code (%d attempts "
-			    "remaining)\n", retries);
-			exit(4);
-		} else if (rv != 0) {
-			fprintf(stderr, "error: failed to verify PIN\n");
-			exit(4);
+	if (pin == NULL && !prompt)
+		return;
+
+	if (prompt) {
+		char prompt[64];
+		char *guid;
+		guid = buf_to_hex(pk->pt_guid, 4, B_FALSE);
+		snprintf(prompt, 64, "Enter PIV PIN for token %s: ", guid);
+		free(guid);
+		do {
+			pin = getpass(prompt);
+		} while (pin == NULL && errno == EINTR);
+		if (pin == NULL) {
+			perror("getpass");
+			exit(3);
 		}
+	}
+	rv = piv_verify_pin(pk, pin, &retries);
+	if (rv == EACCES) {
+		fprintf(stderr, "error: invalid PIN code (%d attempts "
+		    "remaining)\n", retries);
+		exit(4);
+	} else if (rv != 0) {
+		fprintf(stderr, "error: failed to verify PIN\n");
+		exit(4);
 	}
 }
 
@@ -349,6 +364,47 @@ cmd_init(void)
 }
 
 static void
+cmd_change_pin(void)
+{
+	int rv;
+	char prompt[64];
+	char *newpin, *guid;
+
+	guid = buf_to_hex(pk->pt_guid, 4, B_FALSE);
+	snprintf(prompt, 64, "Enter current PIV PIN (%s): ", guid);
+	do {
+		pin = getpass(prompt);
+	} while (pin == NULL && errno == EINTR);
+	if (pin == NULL) {
+		perror("getpass");
+		exit(1);
+	}
+	snprintf(prompt, 64, "Enter new PIV PIN (%s): ", guid);
+	do {
+		newpin = getpass(prompt);
+	} while (newpin == NULL && errno == EINTR);
+	if (newpin == NULL) {
+		perror("getpass");
+		exit(1);
+	}
+	free(guid);
+
+	VERIFY0(piv_txn_begin(selk));
+	rv = piv_change_pin(selk, pin, newpin);
+	piv_txn_end(selk);
+
+	if (rv == EACCES) {
+		fprintf(stderr, "error: current PIN was incorrect; PIN change "
+		    "attempt failed\n");
+		exit(4);
+	} else if (rv != 0) {
+		fprintf(stderr, "error: failed to set new PIN\n");
+		exit(1);
+	}
+	exit(0);
+}
+
+static void
 cmd_generate(uint slotid, enum piv_alg alg)
 {
 	struct piv_slot *slot;
@@ -457,14 +513,15 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	assert(tbslen > 0);
 
 	hashalg = SSH_DIGEST_SHA256;
-	assert_pin(selk);
+
+	assert_pin(selk, B_FALSE);
+
+signagain:
 	rv = piv_sign(selk, override, tbs, tbslen, &hashalg, &sig, &siglen);
 
 	if (rv == EPERM) {
-		piv_txn_end(selk);
-		fprintf(stderr, "error: slot in %02X requires a PIN\n",
-		    slotid);
-		exit(4);
+		assert_pin(selk, B_TRUE);
+		goto signagain;
 	} else if (rv != 0) {
 		piv_txn_end(selk);
 		fprintf(stderr, "error: failed to sign cert with key\n");
@@ -599,9 +656,14 @@ cmd_sign(uint slotid)
 	assert(buf != NULL);
 
 	piv_txn_begin(selk);
-	assert_pin(selk);
+	assert_pin(selk, B_FALSE);
+again:
 	hashalg = 0;
 	rv = piv_sign(selk, cert, buf, inplen, &hashalg, &sig, &siglen);
+	if (rv == EPERM) {
+		assert_pin(selk, B_TRUE);
+		goto again;
+	}
 	piv_txn_end(selk);
 	if (rv == EPERM) {
 		fprintf(stderr, "error: key in slot %02X requires PIN\n",
@@ -702,8 +764,13 @@ cmd_unbox(void)
 	}
 
 	piv_txn_begin(tk);
-	assert_pin(tk);
+	assert_pin(tk, B_FALSE);
+again:
 	rv = piv_box_open(tk, sl, box);
+	if (rv == EPERM) {
+		assert_pin(tk, B_TRUE);
+		goto again;
+	}
 	piv_txn_end(tk);
 
 	if (rv == EPERM) {
@@ -790,8 +857,13 @@ cmd_ecdh(uint slotid)
 	}
 
 	piv_txn_begin(selk);
-	assert_pin(selk);
+	assert_pin(selk, B_FALSE);
+again:
 	rv = piv_ecdh(selk, cert, pubkey, &secret, &seclen);
+	if (rv == EPERM) {
+		assert_pin(selk, B_TRUE);
+		goto again;
+	}
 	piv_txn_end(selk);
 	if (rv == EPERM) {
 		fprintf(stderr, "error: key in slot %02X requires PIN\n",
@@ -827,6 +899,7 @@ usage(void)
 	    "  ecdh <slot>            Do ECDH with pubkey on stdin\n"
 	    "  generate <slot>        Generate a new private key and a\n"
 	    "                         self-signed cert\n"
+	    "  change-pin             Changes the PIV PIN\n"
 	    "  box [slot]             Encrypts stdin data with an ECDH box\n"
 	    "  unbox                  Decrypts stdin data with an ECDH box\n"
 	    "                         Chooses token and slot automatically\n"
@@ -989,6 +1062,14 @@ main(int argc, char *argv[])
 		}
 		check_select_key();
 		cmd_init();
+
+	} else if (strcmp(op, "change-pin") == 0) {
+		if (optind < argc) {
+			fprintf(stderr, "error: too many arguments\n");
+			usage();
+		}
+		check_select_key();
+		cmd_change_pin();
 
 	} else if (strcmp(op, "sign") == 0) {
 		uint slotid;

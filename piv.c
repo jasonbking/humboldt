@@ -1181,6 +1181,59 @@ piv_read_all_certs(struct piv_token *tk)
 }
 
 int
+piv_change_pin(struct piv_token *pk, const char *pin, const char *newpin)
+{
+	int rv;
+	struct apdu *apdu;
+	char pinbuf[16];
+	size_t i;
+
+	assert(pk->pt_intxn == B_TRUE);
+
+	memset(pinbuf, 0xFF, sizeof (pinbuf));
+	for (i = 0; i < 8, pin[i] != 0; ++i)
+		pinbuf[i] = pin[i];
+	assert(pin[i] == 0);
+	for (i = 8; i < 16; newpin[i - 8] != 0; ++i)
+		pinbuf[i] = newpin[i - 8];
+	assert(newpin[i - 8] == 0);
+
+	apdu = piv_apdu_make(CLA_ISO, INS_CHANGE_PIN, 0x00, 0x80);
+	apdu->a_cmd.b_data = pinbuf;
+	apdu->a_cmd.b_len = 16;
+
+	rv = piv_apdu_transceive(pk, apdu);
+	if (rv != 0) {
+		bunyan_log(WARN, "piv_change_pin.transceive_apdu failed",
+		    "reader", BNY_STRING, pk->pt_rdrname,
+		    "err", BNY_STRING, pcsc_stringify_error(rv),
+		    NULL);
+		piv_apdu_free(apdu);
+		return (EIO);
+	}
+
+	if (apdu->a_sw == SW_NO_ERROR) {
+		rv = 0;
+		pk->pt_reset = B_TRUE;
+
+	} else if ((apdu->a_sw & 0xFFF0) == SW_INCORRECT_PIN) {
+		if (retries != NULL)
+			*retries = (apdu->a_sw & 0x000F);
+		rv = EACCES;
+
+	} else {
+		bunyan_log(DEBUG, "card did not accept INS_CHANGE_PIN for PIV",
+		    "reader", BNY_STRING, pk->pt_rdrname,
+		    "sw", BNY_UINT, (uint)apdu->a_sw, NULL);
+		rv = EINVAL;
+	}
+
+	piv_apdu_free(apdu);
+
+	return (rv);
+}
+
+int
 piv_verify_pin(struct piv_token *pk, const char *pin, uint *retries)
 {
 	int rv;

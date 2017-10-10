@@ -325,6 +325,19 @@ int piv_write_cert(struct piv_token *tk, enum piv_slotid slotid,
 int piv_verify_pin(struct piv_token *tk, const char *pin, uint *retries);
 
 /*
+ * Changes the PIV PIN on a token.
+ *
+ * The "pin" and "newpin" arguments should be a NULL-terminated ASCII numeric
+ * string of the PIN to use. Max length is 10 digits.
+ *
+ * Errors:
+ *  - EIO: general card communication failure
+ *  - EINVAL: the card rejected the command (e.g. because applet not selected)
+ *  - EACCES: the old PIN code was incorrect.
+ */
+int piv_change_pin(struct piv_token *tk, const char *pin, const char *newpin);
+
+/*
  * Signs a payload using a private key stored on the card.
  *
  * "data" must contain "datalen" bytes of payload that will be signed.
