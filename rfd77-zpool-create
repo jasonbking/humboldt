@@ -1,11 +1,53 @@
 #!/usr/bin/bash
+
+usage() {
+	echo "usage: rfd77-zpool-create [-g GUID] [-p POOLNAME] [-s SLOT] <args to zpool create>" >&2
+	exit 1
+}
+
+guid=""
+pool="zones"
+slot="9d"
+
+while getopts ":g:p:" opt; do
+	case $opt in
+	g)
+		guid="$OPTARG"
+		;;
+	p)
+		pool="$OPTARG"
+		;;
+	s)
+		slot="$OPTARG"
+		;;
+	:)
+		usage
+		;;
+	\?)
+		echo "error: invalid option -$OPTARG" >&2
+		usage
+		;;
+	esac
+done
+shift $((OPTIND - 1))
+if [[ $# -lt 1 ]]; then
+	echo "error: args to zpool create are required" >&2
+	usage
+fi
+
+pivopts=""
+if [[ "z$guid" != "z" ]]; then
+	pivopts="-g $guid"
+fi
+
 box=$(dd if=/dev/random bs=32 count=1 2>/dev/null | \
-    pivtool box 9d | openssl enc -base64 | tr -d '\n')
+    pivtool $pivopts box $slot | openssl enc -base64 | tr -d '\n')
+
 echo "$box" | openssl enc -d -base64 | pivtool unbox | \
     zpool create -O encryption=on -O keyformat=raw \
-    -O rfd77:local-box="$box" zones "$@"
+    -O rfd77:local-box="$box" $pool "$@"
 if [[ $? -eq 0 ]]; then
 	ramsize=$(sysinfo | json 'MiB of Memory')
 	zfs create -V "${ramsize}M" -o encryption=off -o checksum=noparity \
-	    zones/dump
+	    ${pool}/dump
 fi
