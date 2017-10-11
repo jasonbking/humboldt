@@ -103,7 +103,7 @@ try_unlock() {
 #
 zfs list -p -H -o name,encryptionroot,rfd77:local-box | \
     while read name encroot box; do
-	if [[ "${name}" == "${encroot}" && "${box}" != "-" ]]; then
+	if [[ "${name}" == "${encroot}" && "${name}" != "zones/swap" && "${box}" != "-" ]]; then
 		if ! try_unlock "$name" "$box"; then
 			fatal "failed to unlock $name"
 		fi
