@@ -313,6 +313,7 @@ install: $(DEPS_INSTALLED) world
 	mkdir -p $(DESTDIR)/usr/sbin
 	cp yubihmac-bench $(DESTDIR)/usr/sbin
 	cp yktool $(DESTDIR)/usr/sbin
+	cp rfd77-zpool-create $(DESTDIR)/usr/sbin
 	mkdir -p $(DESTDIR)/usr/sbin/amd64
 	cp pivtool $(DESTDIR)/usr/sbin/amd64
 	ln -sf amd64/pivtool $(DESTDIR)/usr/sbin/pivtool

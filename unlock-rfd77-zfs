@@ -26,15 +26,6 @@ stop() {
 }
 
 #
-# Check that we're on a PI that has zfs encryption at all before going any
-# further.
-#
-read _ _ encstatus _ < <(zpool get -Hp feature@encryption zones)
-if [[ "z${encstatus}" == "z" ]]; then
-	stop "ZFS encryption not enabled on this system"
-fi
-
-#
 # If we booted in noimport mode, then don't do any unlocking.
 #
 /bin/bootparams | grep "^noimport=true" >/dev/null
@@ -52,6 +43,15 @@ fi
 # Make sure the pool is imported
 #
 zpool import -f zones
+
+#
+# Check that we're on a PI that has zfs encryption at all before going any
+# further.
+#
+read encstatus < <(zpool get -o value -pH feature@encryption zones)
+if [[ "z${encstatus}" == "z" ]]; then
+	stop "ZFS encryption not enabled on this system"
+fi
 
 #
 # Get the PIN code for the PIV applet we need to use out of our boot args
@@ -110,12 +110,12 @@ done
 # Re-create the swap zvol at each boot with a unique key for that boot.
 # This way it's unreadable after a reboot.
 #
-read sz < <(zfs get -pH -o value volsize zones/swap)
-if [[ $? -eq 0 && $sz -gt 0 ]]; then
-	zfs destroy zones/swap || fatal "zfs destroy swap failed"
-	dd if=/dev/random bs=32 count=1 | \
-	    zfs create -V $sz -o encryption=on -o keyformat=raw zones/swap \
-	    || fatal "creating swap zvol failed"
-fi
+#read sz < <(zfs get -pH -o value volsize zones/swap)
+#if [[ $? -eq 0 && $sz -gt 0 ]]; then
+#	zfs destroy zones/swap || fatal "zfs destroy swap failed"
+#	dd if=/dev/random bs=32 count=1 | \
+#	    zfs create -V $sz -o encryption=on -o keyformat=raw zones/swap \
+#	    || fatal "creating swap zvol failed"
+#fi
 
 exit $SMF_EXIT_OK

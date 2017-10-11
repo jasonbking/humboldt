@@ -18,6 +18,7 @@ d usr/sbin/amd64 0755 root sys
 f usr/sbin/amd64/pcscd 0755 root sys
 f usr/sbin/pcscd 0755 root sys
 f usr/sbin/yktool 0755 root sys
+f usr/sbin/rfd77-zpool-create 0755 root sys
 f usr/sbin/yubihmac-bench 0755 root sys
 f usr/sbin/amd64/pivtool 0755 root sys
 s usr/sbin/pivtool=amd64/pivtool
