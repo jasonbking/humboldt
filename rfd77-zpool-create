@@ -3,4 +3,9 @@ box=$(dd if=/dev/random bs=32 count=1 | \
     pivtool box 9d | openssl enc -base64 | tr -d '\n')
 echo "$box" | openssl enc -d -base64 | pivtool unbox | \
     zpool create -O encryption=on -O keyformat=raw \
-    -O rfd77:box="$box" "$@"
+    -O rfd77:local-box="$box" zones "$@"
+if [[ $? -eq 0 ]]; then
+	ramsize=$(sysinfo | json 'MiB of Memory')
+	zfs create -V "${ramsize}M" -o encryption=off -o checksum=noparity \
+	    zones/dump
+fi

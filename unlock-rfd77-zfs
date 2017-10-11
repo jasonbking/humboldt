@@ -81,7 +81,11 @@ try_unlock() {
 		    openssl enc -base64 -d | \
 		    pivtool ${opts} unbox | \
 		    zfs load-key "${fs}"
-		return $?
+		local loadret="$?"
+		if [[ $loadret -eq 0 ]]; then
+			zfs mount "$fs"
+		fi
+		return $loadret
 	elif [[ $pivret -eq 4 ]]; then
 		mkfifo /tmp/pivpin.pipe.$$
 		/smartdc/lib/sdc-on-tty -d /dev/console \
@@ -110,12 +114,12 @@ done
 # Re-create the swap zvol at each boot with a unique key for that boot.
 # This way it's unreadable after a reboot.
 #
-#read sz < <(zfs get -pH -o value volsize zones/swap)
-#if [[ $? -eq 0 && $sz -gt 0 ]]; then
-#	zfs destroy zones/swap || fatal "zfs destroy swap failed"
-#	dd if=/dev/random bs=32 count=1 | \
-#	    zfs create -V $sz -o encryption=on -o keyformat=raw zones/swap \
-#	    || fatal "creating swap zvol failed"
-#fi
+read sz < <(zfs get -pH -o value volsize zones/swap)
+if [[ $? -eq 0 && $sz -gt 0 ]]; then
+	zfs destroy zones/swap || fatal "zfs destroy swap failed"
+	dd if=/dev/random bs=32 count=1 | \
+	    zfs create -V $sz -o encryption=on -o keyformat=raw zones/swap \
+	    || fatal "creating swap zvol failed"
+fi
 
 exit $SMF_EXIT_OK
