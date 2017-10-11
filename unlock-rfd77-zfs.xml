@@ -4,9 +4,6 @@
   <service name='system/filesystem/unlock-rfd77-zfs' type='service' version='0'>
     <create_default_instance enabled='true'/>
     <single_instance/>
-    <dependency name='pcscd' grouping='require_all' restart_on='error' type='service'>
-      <service_fmri value='svc:/system/pcscd'/>
-    </dependency>
     <dependency name='fs-usr' grouping='require_all' restart_on='error' type='service'>
       <service_fmri value='svc:/system/filesystem/usr'/>
     </dependency>

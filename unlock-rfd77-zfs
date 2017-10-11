@@ -34,15 +34,40 @@ if [[ $? -eq 0 ]]; then
 fi
 
 #
-# We need the links to /dev/dsk. Rather than trying to play games with manually
-# invoking syseventd ask devfsadm to do some work.
+# We need dsk and usb devices.
 #
-/usr/sbin/devfsadm -c disk
+/usr/sbin/devfsadm
 
 #
 # Make sure the pool is imported
 #
 zpool import -f zones
+
+#
+# We have to start our own pcscd here temporarily, since /var/run hasn't been
+# mounted over yet by fs-minimal. If we let the actual pcscd SMF service start
+# now, that mount would hide its socket and make it useless later.
+#
+# So instead we start one just for unlocking here and then kill it when we
+# exit.
+#
+/usr/sbin/amd64/pcscd --force-reader-polling
+while [[ ! -f /var/run/pcscd/pcscd.pid ]]; do
+	sleep 0.1
+done
+pcscd_pid=$(cat /var/run/pcscd/pcscd.pid)
+
+kill_pcscd() {
+	kill $pcscd_pid
+}
+trap kill_pcscd EXIT
+
+#
+# If we're in a qemu VM with the emulated CCID device, after reboot it's often
+# out of sync with us. Doing a list command will cause PCSC to reset it and
+# bring it back into sync.
+#
+pivtool list >/dev/null 2>/dev/null
 
 #
 # Check that we're on a PI that has zfs encryption at all before going any
@@ -57,13 +82,6 @@ fi
 # Get the PIN code for the PIV applet we need to use out of our boot args
 #
 read pivpin < <(bootparams | awk -F= '$1 == "piv-pin" { print $2; exit(0); }')
-
-#
-# If we're in a qemu VM with the emulated CCID device, after reboot it's often
-# out of sync with us. Doing a list command will cause PCSC to reset it and
-# bring it back into sync.
-#
-pivtool list >/dev/null 2>/dev/null
 
 try_unlock() {
 	local fs="$1"
@@ -117,7 +135,7 @@ done
 read sz < <(zfs get -pH -o value volsize zones/swap)
 if [[ $? -eq 0 && $sz -gt 0 ]]; then
 	zfs destroy zones/swap || fatal "zfs destroy swap failed"
-	dd if=/dev/random bs=32 count=1 | \
+	dd if=/dev/random bs=32 count=1 2>/dev/null | \
 	    zfs create -V $sz -o encryption=on -o keyformat=raw zones/swap \
 	    || fatal "creating swap zvol failed"
 fi
