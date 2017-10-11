@@ -21,7 +21,7 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
-#include "digest.h"
+#include "libssh/digest.h"
 
 enum iso_class {
 	CLA_ISO = 0x00,

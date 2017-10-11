@@ -40,18 +40,21 @@ YKTOOL_LDFLAGS=		-L$(PROTO_AREA)/usr/lib
 YKTOOL_DEPS=		pcsclite
 
 
-ED25519_SOURCES=		\
+_ED25519_SOURCES=		\
 	ed25519.c		\
 	fe25519.c		\
 	ge25519.c		\
 	sc25519.c		\
 	hash.c			\
 	blocks.c
-CHAPOLY_SOURCES=		\
+ED25519_SOURCES=$(_ED25519_SOURCES:%=ed25519/%)
+
+_CHAPOLY_SOURCES=		\
 	chacha.c		\
 	poly1305.c
+CHAPOLY_SOURCES=$(_CHAPOLY_SOURCES:%=chapoly/%)
 
-LIBSSH_SOURCES=			\
+_LIBSSH_SOURCES=		\
 	sshbuf.c		\
 	sshkey.c		\
 	ssh-ed25519.c		\
@@ -62,8 +65,10 @@ LIBSSH_SOURCES=			\
 	bcrypt-pbkdf.c		\
 	blowfish.c		\
 	rsa.c			\
-	base64.c		\
-	$(ED25519_SOURCES)	\
+	base64.c
+LIBSSH_SOURCES=				\
+	$(_LIBSSH_SOURCES:%=libssh/%)	\
+	$(ED25519_SOURCES)		\
 	$(CHAPOLY_SOURCES)
 
 TOKEN_SOURCES=			\

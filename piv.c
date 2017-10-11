@@ -25,10 +25,10 @@
 #include <sys/types.h>
 #include <sys/debug.h>
 
-#include "sshkey.h"
-#include "sshbuf.h"
-#include "digest.h"
-#include "cipher.h"
+#include "libssh/sshkey.h"
+#include "libssh/sshbuf.h"
+#include "libssh/digest.h"
+#include "libssh/cipher.h"
 
 #include <openssl/err.h>
 #include <openssl/x509.h>

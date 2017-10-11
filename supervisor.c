@@ -39,13 +39,12 @@
 
 #include "softtoken.h"
 #include "bunyan.h"
-#include "sshkey.h"
 #include "piv.h"
 
-#include "sshkey.h"
-#include "cipher.h"
-#include "sshbuf.h"
-#include "crypto_api.h"
+#include "libssh/sshkey.h"
+#include "libssh/cipher.h"
+#include "libssh/sshbuf.h"
+#include "ed25519/crypto_api.h"
 
 /*
  * The "supervisor" process is a child of the soft-token manager. There is one

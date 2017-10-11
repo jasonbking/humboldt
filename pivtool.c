@@ -25,9 +25,9 @@
 #include <sys/errno.h>
 #include <sys/debug.h>
 
-#include "sshkey.h"
-#include "sshbuf.h"
-#include "digest.h"
+#include "libssh/sshkey.h"
+#include "libssh/sshbuf.h"
+#include "libssh/digest.h"
 
 #include <openssl/err.h>
 #include <openssl/x509.h>

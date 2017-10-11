@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <synch.h>
 #include <thread.h>
+#include <strings.h>
 
 #include <zone.h>
 #include <libsysevent.h>

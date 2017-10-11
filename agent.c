@@ -33,8 +33,8 @@
 
 #include "softtoken.h"
 #include "bunyan.h"
-#include "sshbuf.h"
-#include "sshkey.h"
+#include "libssh/sshbuf.h"
+#include "libssh/sshkey.h"
 
 /*
  * This is the "agent" process in the soft-token. It is forked off by the

@@ -18,7 +18,7 @@
 #include <sys/types.h>
 #include <limits.h>
 
-#include "crypto_api.h"
+#include "../ed25519/crypto_api.h"
 
 #include <string.h>
 #include <stdarg.h>

@@ -23,7 +23,7 @@
 
 #include "blf.h"
 
-#include "crypto_api.h"
+#include "../ed25519/crypto_api.h"
 #ifdef SHA512_DIGEST_LENGTH
 # undef SHA512_DIGEST_LENGTH
 #endif

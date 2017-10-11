@@ -12,7 +12,7 @@
 
 #include <zone.h>
 #include <libnvpair.h>
-#include "sshkey.h"
+#include "libssh/sshkey.h"
 
 #define	TOKEN_CHROOT_DIR	"/var/run/softtokend"
 #define	TOKEN_SOCKET_DIR	"/var/zonecontrol/%s"

@@ -41,8 +41,8 @@
 #include <openssl/evp.h>
 
 /*#include "cipher-chachapoly.h"*/
-#include "chacha.h"
-#include "poly1305.h"
+#include "../chapoly/chacha.h"
+#include "../chapoly/poly1305.h"
 
 #define CHACHA_KEYLEN	32 /* Only 256 bit keys used here */
 

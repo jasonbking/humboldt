@@ -32,7 +32,7 @@
 #include <openssl/err.h>
 #include <openssl/pem.h>
 
-#include "crypto_api.h"
+#include "../ed25519/crypto_api.h"
 
 #include <errno.h>
 #include <limits.h>
