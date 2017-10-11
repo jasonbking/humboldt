@@ -328,6 +328,7 @@ install: $(DEPS_INSTALLED) world
 	cp unlock-rfd77-zfs.xml $(DESTDIR)/lib/svc/manifest/system/filesystem
 	mkdir -p $(DESTDIR)/lib/svc/method
 	cp unlock-rfd77-zfs $(DESTDIR)/lib/svc/method
+	cp system-pcscd $(DESTDIR)/lib/svc/method
 	mkdir -p $(DESTDIR)/smartdc/bin
 	cp softtokend $(DESTDIR)/smartdc/bin
 	mkdir -p $(DESTDIR)/smartdc/lib
