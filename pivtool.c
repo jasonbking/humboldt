@@ -41,7 +41,7 @@ boolean_t debug = B_FALSE;
 static boolean_t parseable = B_FALSE;
 static uint8_t *guid = NULL;
 static size_t guid_len = 0;
-static uint min_retries = 2;
+static uint min_retries = 1;
 static struct sshkey *opubkey = NULL;
 static const char *pin = NULL;
 static const uint8_t DEFAULT_ADMIN_KEY[] = {
@@ -123,6 +123,20 @@ read_stdin(size_t limit, size_t *outlen)
 }
 
 static void
+assert_select(struct piv_token *tk)
+{
+	int rv;
+
+	rv = piv_select(tk);
+	if (rv != 0) {
+		piv_txn_end(tk);
+		fprintf(stderr, "error: failed to select PIV applet "
+		    "(rv = %d)\n", rv);
+		exit(1);
+	}
+}
+
+static void
 assert_pin(struct piv_token *pk, boolean_t prompt)
 {
 	int rv;
@@ -140,10 +154,12 @@ assert_pin(struct piv_token *pk, boolean_t prompt)
 			pin = getpass(prompt);
 		} while (pin == NULL && errno == EINTR);
 		if (pin == NULL && errno == ENXIO) {
+			piv_txn_end(pk);
 			fprintf(stderr, "error: a PIN code is required to "
 			    "unlock token %s\n", guid);
 			exit(4);
 		} else if (pin == NULL) {
+			piv_txn_end(pk);
 			perror("getpass");
 			exit(3);
 		}
@@ -151,10 +167,12 @@ assert_pin(struct piv_token *pk, boolean_t prompt)
 	}
 	rv = piv_verify_pin(pk, pin, &retries);
 	if (rv == EACCES) {
+		piv_txn_end(pk);
 		fprintf(stderr, "error: invalid PIN code (%d attempts "
 		    "remaining)\n", retries);
 		exit(4);
 	} else if (rv != 0) {
+		piv_txn_end(pk);
 		fprintf(stderr, "error: failed to verify PIN\n");
 		exit(4);
 	}
@@ -201,6 +219,7 @@ cmd_list(SCARDCONTEXT ctx)
 
 	for (pk = ks; pk != NULL; pk = pk->pt_next) {
 		assert(piv_txn_begin(pk) == 0);
+		assert_select(pk);
 		piv_read_all_certs(pk);
 		piv_txn_end(pk);
 
@@ -340,6 +359,7 @@ cmd_init(void)
 	tlv_pop(chuid);
 
 	piv_txn_begin(selk);
+	assert_select(selk);
 	rv = piv_auth_admin(selk, admin_key, 24);
 	if (rv == 0) {
 		rv = piv_write_file(selk, PIV_TAG_CARDCAP,
@@ -373,28 +393,48 @@ cmd_change_pin(void)
 {
 	int rv;
 	char prompt[64];
-	char *newpin, *guid;
+	char *p, *newpin, *guid;
 
 	guid = buf_to_hex(selk->pt_guid, 4, B_FALSE);
 	snprintf(prompt, 64, "Enter current PIV PIN (%s): ", guid);
 	do {
-		pin = getpass(prompt);
-	} while (pin == NULL && errno == EINTR);
-	if (pin == NULL) {
+		p = getpass(prompt);
+	} while (p == NULL && errno == EINTR);
+	if (p == NULL) {
 		perror("getpass");
 		exit(1);
 	}
+	pin = strdup(p);
+again:
 	snprintf(prompt, 64, "Enter new PIV PIN (%s): ", guid);
 	do {
-		newpin = getpass(prompt);
-	} while (newpin == NULL && errno == EINTR);
-	if (newpin == NULL) {
+		p = getpass(prompt);
+	} while (p == NULL && errno == EINTR);
+	if (p == NULL) {
 		perror("getpass");
 		exit(1);
+	}
+	if (strlen(p) < 6 || strlen(p) > 10) {
+		fprintf(stderr, "error: PIN must be 6-10 digits\n");
+		goto again;
+	}
+	newpin = strdup(p);
+	snprintf(prompt, 64, "Confirm new PIV PIN (%s): ", guid);
+	do {
+		p = getpass(prompt);
+	} while (p == NULL && errno == EINTR);
+	if (p == NULL) {
+		perror("getpass");
+		exit(1);
+	}
+	if (strcmp(p, newpin) != 0) {
+		fprintf(stderr, "error: PINs do not match\n");
+		goto again;
 	}
 	free(guid);
 
 	VERIFY0(piv_txn_begin(selk));
+	assert_select(selk);
 	rv = piv_change_pin(selk, pin, newpin);
 	piv_txn_end(selk);
 
@@ -420,12 +460,13 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	EVP_PKEY *pkey;
 	X509_NAME *subj;
 	const char *name;
-	enum sshdigest_types hashalg;
+	enum sshdigest_types wantalg, hashalg;
 	int nid;
 	ASN1_TYPE null_parameter;
 	uint8_t *tbs = NULL, *sig, *cdata = NULL;
 	size_t tbslen, siglen, cdlen;
 	uint flags;
+	uint i;
 	BIGNUM *serial;
 	ASN1_INTEGER *serial_asn1;
 
@@ -449,6 +490,7 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	}
 
 	piv_txn_begin(selk);
+	assert_select(selk);
 	rv = piv_auth_admin(selk, admin_key, 24);
 	if (rv == 0)
 		rv = piv_generate(selk, slotid, alg, &pub);
@@ -471,11 +513,29 @@ cmd_generate(uint slotid, enum piv_alg alg)
 		rv = EVP_PKEY_assign_RSA(pkey, copy);
 		assert(rv == 1);
 		nid = NID_sha256WithRSAEncryption;
+		wantalg = SSH_DIGEST_SHA256;
 	} else if (pub->type == KEY_ECDSA) {
+		boolean_t haveSha256 = B_FALSE;
+		boolean_t haveSha1 = B_FALSE;
+
 		EC_KEY *copy = EC_KEY_dup(pub->ecdsa);
 		rv = EVP_PKEY_assign_EC_KEY(pkey, copy);
 		assert(rv == 1);
-		nid = NID_ecdsa_with_SHA256;
+
+		for (i = 0; i < selk->pt_alg_count; ++i) {
+			if (selk->pt_algs[i] == PIV_ALG_ECCP256_SHA256) {
+				haveSha256 = B_TRUE;
+			} else if (selk->pt_algs[i] == PIV_ALG_ECCP256_SHA1) {
+				haveSha1 = B_TRUE;
+			}
+		}
+		if (haveSha1 && !haveSha256) {
+			nid = NID_ecdsa_with_SHA1;
+			wantalg = SSH_DIGEST_SHA1;
+		} else {
+			nid = NID_ecdsa_with_SHA256;
+			wantalg = SSH_DIGEST_SHA256;
+		}
 	} else {
 		assert(0);
 	}
@@ -517,7 +577,7 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	assert(tbs != NULL);
 	assert(tbslen > 0);
 
-	hashalg = SSH_DIGEST_SHA256;
+	hashalg = wantalg;
 
 	assert_pin(selk, B_FALSE);
 
@@ -533,10 +593,10 @@ signagain:
 		exit(1);
 	}
 
-	if (hashalg != SSH_DIGEST_SHA256) {
+	if (hashalg != wantalg) {
 		piv_txn_end(selk);
-		fprintf(stderr, "error: card requires hash-on-card and does "
-		    "not support SHA256\n");
+		fprintf(stderr, "error: card could not sign with the "
+		    "requested hash algorithm\n");
 		exit(1);
 	}
 
@@ -588,6 +648,7 @@ cmd_pubkey(uint slotid)
 	}
 
 	piv_txn_begin(selk);
+	assert_select(selk);
 	rv = piv_read_cert(selk, slotid);
 	piv_txn_end(selk);
 
@@ -639,6 +700,7 @@ cmd_sign(uint slotid)
 
 	if (override == NULL) {
 		piv_txn_begin(selk);
+		assert_select(selk);
 		rv = piv_read_cert(selk, slotid);
 		piv_txn_end(selk);
 
@@ -661,6 +723,7 @@ cmd_sign(uint slotid)
 	assert(buf != NULL);
 
 	piv_txn_begin(selk);
+	assert_select(selk);
 	assert_pin(selk, B_FALSE);
 again:
 	hashalg = 0;
@@ -696,6 +759,7 @@ cmd_box(uint slotid)
 
 	if (slotid != 0 || opubkey == NULL) {
 		piv_txn_begin(selk);
+		assert_select(selk);
 		rv = piv_read_cert(selk, slotid);
 		piv_txn_end(selk);
 		if (rv == ENOENT) {
@@ -769,6 +833,7 @@ cmd_unbox(void)
 	}
 
 	piv_txn_begin(tk);
+	assert_select(tk);
 	assert_pin(tk, B_FALSE);
 again:
 	rv = piv_box_open(tk, sl, box);
@@ -785,7 +850,8 @@ again:
 		free(guid);
 		exit(4);
 	} else if (rv != 0) {
-		fprintf(stderr, "error: failed to communicate with token\n");
+		fprintf(stderr, "error: failed to communicate with token "
+		    "(rv = %d)\n", rv);
 		exit(1);
 	}
 
@@ -819,6 +885,7 @@ cmd_ecdh(uint slotid)
 
 	if (override == NULL) {
 		piv_txn_begin(selk);
+		assert_select(selk);
 		rv = piv_read_cert(selk, slotid);
 		piv_txn_end(selk);
 
@@ -862,6 +929,7 @@ cmd_ecdh(uint slotid)
 	}
 
 	piv_txn_begin(selk);
+	assert_select(selk);
 	assert_pin(selk, B_FALSE);
 again:
 	rv = piv_ecdh(selk, cert, pubkey, &secret, &seclen);

@@ -1530,7 +1530,7 @@ piv_sign_prehash(struct piv_token *pk, struct piv_slot *pc,
 
 		rv = 0;
 
-	} else if (apdu->a_sw = SW_SECURITY_STATUS_NOT_SATISFIED) {
+	} else if (apdu->a_sw == SW_SECURITY_STATUS_NOT_SATISFIED) {
 		rv = EPERM;
 
 	} else {
@@ -1901,6 +1901,9 @@ piv_box_seal_offline(struct sshkey *pubk, struct piv_ecdh_box *box)
 	seclen = ECDH_compute_key(sec, seclen,
 	    EC_KEY_get0_public_key(pubk->ecdsa), pkey->ecdsa, NULL);
 	VERIFY3U(seclen, >, 0);
+
+	bunyan_log(TRACE, "derived symmetric key",
+	    "secret", BNY_BIN_HEX, sec, seclen, NULL);
 
 	sshkey_free(pkey);
 
