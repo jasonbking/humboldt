@@ -32,6 +32,8 @@
 #include <openssl/dsa.h>
 #include <openssl/ec.h>
 
+#include "digest.h"
+
 #define SSH_RSA_MINIMUM_MODULUS_SIZE	768
 #define SSH_KEY_MAX_SIGN_DATA_SIZE	(1 << 20)
 
@@ -148,6 +150,7 @@ int		 sshkey_ec_validate_public(const EC_GROUP *, const EC_POINT *);
 int		 sshkey_ec_validate_private(const EC_KEY *);
 const char	*sshkey_ssh_name(const struct sshkey *);
 const char	*sshkey_ssh_name_plain(const struct sshkey *);
+const char	*sshkey_ssh_name_from_type_nid(int type, int nid);
 int		 sshkey_names_valid2(const char *, int);
 char		*sshkey_alg_list(int, int, char);
 
@@ -165,6 +168,10 @@ int	 sshkey_sign(const struct sshkey *, u_char **, size_t *,
     const u_char *, size_t, const char *, u_int);
 int	 sshkey_verify(const struct sshkey *, const u_char *, size_t,
     const u_char *, size_t, u_int);
+
+int	 sshkey_sig_from_asn1(enum sshkey_types ktype,
+    enum sshdigest_types dtype, const uchar_t *sig, size_t siglen,
+    struct sshbuf *buf);
 
 /* for debug */
 void	sshkey_dump_ec_point(const EC_GROUP *, const EC_POINT *);
@@ -208,6 +215,13 @@ int ssh_ed25519_sign(const struct sshkey *key, u_char **sigp, size_t *lenp,
 int ssh_ed25519_verify(const struct sshkey *key,
     const u_char *signature, size_t signaturelen,
     const u_char *data, size_t datalen, u_int compat);
+
+int ssh_ecdsa_sig_from_asn1(enum sshdigest_types dtype, const uchar_t *sig,
+    size_t siglen, struct sshbuf *buf);
+int ssh_rsa_sig_from_asn1(enum sshdigest_types dtype, const uchar_t *sig,
+    size_t siglen, struct sshbuf *buf);
+int ssh_ed25519_sig_from_asn1(enum sshdigest_types dtype, const uchar_t *sig,
+    size_t siglen, struct sshbuf *buf);
 #endif
 
 #endif /* SSHKEY_H */

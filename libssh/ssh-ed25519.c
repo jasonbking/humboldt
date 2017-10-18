@@ -33,6 +33,26 @@
 /*#include "log.h"*/
 
 int
+ssh_ed25519_sig_from_asn1(enum sshdigest_types dtype, const uchar_t *sig,
+    size_t siglen, struct sshbuf *buf)
+{
+	int r;
+
+	if (dtype != 0 && dtype != SSH_DIGEST_SHA512)
+		return (SSH_ERR_KEY_TYPE_MISMATCH);
+
+	if (siglen != crypto_sign_ed25519_BYTES)
+		return (SSH_ERR_INVALID_ARGUMENT);
+
+	if ((r = sshbuf_put_cstring(buf, "ssh-ed25519")) != 0 ||
+	    (r = sshbuf_put_string(buf, sig, siglen)) != 0) {
+		return (r);
+	}
+
+	return (0);
+}
+
+int
 ssh_ed25519_sign(const struct sshkey *key, u_char **sigp, size_t *lenp,
     const u_char *data, size_t datalen, u_int compat)
 {

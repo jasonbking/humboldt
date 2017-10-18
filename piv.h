@@ -338,6 +338,22 @@ int piv_verify_pin(struct piv_token *tk, const char *pin, uint *retries);
 int piv_change_pin(struct piv_token *tk, const char *pin, const char *newpin);
 
 /*
+ * Authenticates a PIV key slot by matching its public key against the given
+ * public key, and then asking it to sign randomly generated data to validate
+ * that the key does match.
+ *
+ * Errors:
+ *  - EIO: general card communication failure
+ *  - EINVAL: the card rejected the command (e.g. because applet not selected)
+ *  - EPERM: the key slot in question is locked
+ *  - ENOTSUP: the card returned a GEN_AUTH payload type that isn't supported
+ *  - ESRCH: the key validation failed (either because it doesn't match the
+ *           provided pubkey, or because the signature did not validate)
+ */
+int piv_auth_key(struct piv_token *tk, struct piv_slot *slot,
+    struct sshkey *pubkey);
+
+/*
  * Signs a payload using a private key stored on the card.
  *
  * "data" must contain "datalen" bytes of payload that will be signed.
@@ -402,5 +418,9 @@ void piv_box_free(struct piv_ecdh_box *box);
 
 int piv_write_file(struct piv_token *pt, uint tag,
     const char *data, size_t len);
+
+int piv_system_token_find(struct piv_token *pks, struct piv_token **outpk);
+int piv_system_token_set(struct piv_token *pk, const char *pin);
+int piv_system_token_auth(struct piv_token *pk);
 
 #endif

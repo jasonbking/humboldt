@@ -324,6 +324,7 @@ install: $(DEPS_INSTALLED) world
 	ln -sf amd64/pivtool $(DESTDIR)/usr/sbin/pivtool
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system
 	cp pcscd.xml $(DESTDIR)/lib/svc/manifest/system
+	cp soft-token.xml $(DESTDIR)/lib/svc/manifest/system
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system/filesystem
 	cp unlock-rfd77-zfs.xml $(DESTDIR)/lib/svc/manifest/system/filesystem
 	mkdir -p $(DESTDIR)/lib/svc/method

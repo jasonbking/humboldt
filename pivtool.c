@@ -53,6 +53,7 @@ static const uint8_t *admin_key = DEFAULT_ADMIN_KEY;
 
 static struct piv_token *ks = NULL;
 static struct piv_token *selk = NULL;
+static struct piv_token *sysk = NULL;
 static struct piv_slot *override = NULL;
 
 extern char *buf_to_hex(const uint8_t *buf, size_t len, boolean_t spaces);
@@ -142,6 +143,12 @@ assert_pin(struct piv_token *pk, boolean_t prompt)
 	int rv;
 	uint retries = min_retries;
 
+	if (pin == NULL && pk == sysk) {
+		rv = piv_system_token_auth(pk);
+		if (rv == 0)
+			return;
+	}
+
 	if (pin == NULL && !prompt)
 		return;
 
@@ -170,6 +177,11 @@ assert_pin(struct piv_token *pk, boolean_t prompt)
 		piv_txn_end(pk);
 		fprintf(stderr, "error: invalid PIN code (%d attempts "
 		    "remaining)\n", retries);
+		exit(4);
+	} else if (rv == EAGAIN) {
+		piv_txn_end(pk);
+		fprintf(stderr, "error: insufficient retries remaining "
+		    "(%d left)\n", retries);
 		exit(4);
 	} else if (rv != 0) {
 		piv_txn_end(pk);
@@ -382,6 +394,50 @@ cmd_init(void)
 		exit(1);
 	} else if (rv != 0) {
 		fprintf(stderr, "error: failed to write to card\n");
+		exit(1);
+	}
+
+	exit(0);
+}
+
+static void
+cmd_set_system(void)
+{
+	int rv;
+	char prompt[64];
+	char *guid;
+
+	if (pin == NULL) {
+		guid = buf_to_hex(selk->pt_guid, 4, B_FALSE);
+		snprintf(prompt, 64, "Enter PIV PIN for token %s: ", guid);
+		do {
+			pin = getpass(prompt);
+		} while (pin == NULL && errno == EINTR);
+		if (pin == NULL && errno == ENXIO) {
+			fprintf(stderr, "error: a PIN code is required to "
+			    "unlock token %s\n", guid);
+			exit(4);
+		} else if (pin == NULL) {
+			perror("getpass");
+			exit(3);
+		}
+		free(guid);
+	}
+
+	VERIFY0(piv_txn_begin(selk));
+	assert_select(selk);
+	rv = piv_system_token_set(selk, pin);
+	piv_txn_end(selk);
+
+	if (rv == EACCES) {
+		fprintf(stderr, "error: invalid PIN code\n");
+		exit(4);
+	} else if (rv == EAGAIN) {
+		fprintf(stderr, "error: insufficient retries remaining\n");
+		exit(4);
+	} else if (rv != 0) {
+		fprintf(stderr, "error: failed to set system token (rv = %d)\n",
+		    rv);
 		exit(1);
 	}
 
@@ -994,10 +1050,13 @@ static void
 check_select_key(void)
 {
 	struct piv_token *t;
+	int rv;
+
 	if (ks == NULL) {
 		fprintf(stderr, "error: no PIV cards present\n");
 		exit(1);
 	}
+
 	if (guid != NULL) {
 		for (t = ks; t != NULL; t = t->pt_next) {
 			if (bcmp(t->pt_guid, guid, guid_len) == 0) {
@@ -1011,11 +1070,16 @@ check_select_key(void)
 			}
 		}
 	}
+
+	if (selk == NULL)
+		selk = sysk;
+
 	if (selk == NULL) {
 		selk = ks;
 		if (selk->pt_next != NULL) {
-			fprintf(stderr, "error: multiple PIV cards present; "
-			    "you must provide -g|--guid to select one\n");
+			fprintf(stderr, "error: multiple PIV cards "
+			    "present and no system token set; you "
+			    "must provide -g|--guid to select one\n");
 			exit(3);
 		}
 	}
@@ -1123,6 +1187,9 @@ main(int argc, char *argv[])
 
 	ks = piv_enumerate(ctx);
 
+	if (piv_system_token_find(ks, &sysk) != 0)
+		sysk = NULL;
+
 	if (strcmp(op, "list") == 0) {
 		if (optind < argc)
 			usage();
@@ -1135,6 +1202,14 @@ main(int argc, char *argv[])
 		}
 		check_select_key();
 		cmd_init();
+
+	} else if (strcmp(op, "set-system") == 0) {
+		if (optind < argc) {
+			fprintf(stderr, "error: too many arguments\n");
+			usage();
+		}
+		check_select_key();
+		cmd_set_system();
 
 	} else if (strcmp(op, "change-pin") == 0) {
 		if (optind < argc) {

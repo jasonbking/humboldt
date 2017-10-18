@@ -74,6 +74,24 @@ rsa_hash_alg_nid(int type)
 	}
 }
 
+int
+ssh_rsa_sig_from_asn1(enum sshdigest_types dtype, const uchar_t *sig,
+    size_t siglen, struct sshbuf *buf)
+{
+	int r;
+	const char *algid = rsa_hash_alg_ident(dtype);
+
+	if (algid == NULL)
+		return (SSH_ERR_KEY_TYPE_MISMATCH);
+
+	if ((r = sshbuf_put_cstring(buf, algid)) != 0 ||
+	    (r = sshbuf_put_string(buf, sig, siglen)) != 0) {
+		return (r);
+	}
+
+	return (0);
+}
+
 /* RSASSA-PKCS1-v1_5 (PKCS #1 v2.0 signature) with SHA1 */
 int
 ssh_rsa_sign(const struct sshkey *key, u_char **sigp, size_t *lenp,

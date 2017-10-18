@@ -116,7 +116,7 @@ sshkey_type(const struct sshkey *k)
 	return "unknown";
 }
 
-static const char *
+const char *
 sshkey_ssh_name_from_type_nid(int type, int nid)
 {
 	const struct keytype *kt;
@@ -2127,6 +2127,27 @@ sshkey_sign(const struct sshkey *key,
 	case KEY_ED25519:
 	case KEY_ED25519_CERT:
 		return ssh_ed25519_sign(key, sigp, lenp, data, datalen, compat);
+	default:
+		return SSH_ERR_KEY_TYPE_UNKNOWN;
+	}
+}
+
+int
+sshkey_sig_from_asn1(enum sshkey_types ktype, enum sshdigest_types dtype,
+    const uchar_t *sig, size_t siglen, struct sshbuf *buf)
+{
+	if (siglen == 0)
+		return SSH_ERR_INVALID_ARGUMENT;
+	switch (ktype) {
+	case KEY_ECDSA_CERT:
+	case KEY_ECDSA:
+		return ssh_ecdsa_sig_from_asn1(dtype, sig, siglen, buf);
+	case KEY_RSA_CERT:
+	case KEY_RSA:
+		return ssh_rsa_sig_from_asn1(dtype, sig, siglen, buf);
+	case KEY_ED25519:
+	case KEY_ED25519_CERT:
+		return ssh_ed25519_sig_from_asn1(dtype, sig, siglen, buf);
 	default:
 		return SSH_ERR_KEY_TYPE_UNKNOWN;
 	}

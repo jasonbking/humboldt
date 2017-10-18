@@ -39,6 +39,66 @@
 #define SSHKEY_INTERNAL
 #include "sshkey.h"
 
+int
+ssh_ecdsa_sig_from_asn1(enum sshdigest_types dtype, const uchar_t *sig,
+    size_t siglen, struct sshbuf *buf)
+{
+	ECDSA_SIG *esig = NULL;
+	struct sshbuf *b;
+	int nid;
+	const char *type;
+	const uchar_t *ptr;
+	int rv;
+
+	switch (dtype) {
+	case SSH_DIGEST_SHA256:
+		nid = NID_X9_62_prime256v1;
+		break;
+	case SSH_DIGEST_SHA384:
+		nid = NID_secp384r1;
+		break;
+	case SSH_DIGEST_SHA512:
+		nid = NID_secp521r1;
+		break;
+	default:
+		return (SSH_ERR_KEY_TYPE_MISMATCH);
+	}
+
+	b = sshbuf_new();
+	if (b == NULL)
+		return (SSH_ERR_ALLOC_FAIL);
+
+	type = sshkey_ssh_name_from_type_nid(KEY_ECDSA, nid);
+
+	ptr = sig;
+	if (d2i_ECDSA_SIG(&esig, (const uchar_t **)&ptr, siglen) == NULL) {
+		rv = SSH_ERR_INVALID_ARGUMENT;
+		goto out;
+	}
+	if (esig == NULL || (ptr - sig) < siglen) {
+		rv = SSH_ERR_INVALID_ARGUMENT;
+		goto out;
+	}
+
+	if ((rv = sshbuf_put_bignum2(b, esig->r)) != 0 ||
+	    (rv = sshbuf_put_bignum2(b, esig->s)) != 0) {
+		goto out;
+	}
+
+	if ((rv = sshbuf_put_cstring(buf, type)) != 0 ||
+	    (rv = sshbuf_put_stringb(buf, b)) != 0) {
+		goto out;
+	}
+
+	rv = 0;
+
+out:
+	sshbuf_free(b);
+	if (esig != NULL)
+		ECDSA_SIG_free(esig);
+	return (rv);
+}
+
 /* ARGSUSED */
 int
 ssh_ecdsa_sign(const struct sshkey *key, u_char **sigp, size_t *lenp,

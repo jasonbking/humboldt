@@ -20,10 +20,18 @@
 #include <stddef.h>
 #include <errno.h>
 #include <strings.h>
+#include <synch.h>
+#include <thread.h>
 
+#include <sys/mman.h>
 #include <sys/errno.h>
 #include <sys/types.h>
 #include <sys/debug.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+#include <zone.h>
+#include <libnvpair.h>
 
 #include "libssh/sshkey.h"
 #include "libssh/sshbuf.h"
@@ -38,15 +46,376 @@
 #include "piv.h"
 #include "bunyan.h"
 
+#define	PIV_STATE_SHM_ID		0x50495600
+#define PIV_STATE_SHM_MAX_SIZE		(1*1024*1024)
+#define	PIV_STATE_SHM_MAX_DATA		\
+    (PIV_STATE_SHM_MAX_SIZE - sizeof (struct piv_shm))
+
 const uint8_t AID_PIV[] = {
 	0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00
 };
+
+struct piv_shm_state {
+	int pss_shmid;
+	struct shmid_ds pss_ds;
+	struct piv_shm *pss_map;
+	nv_alloc_t pss_nva;
+	nvlist_t *pss_nvl;
+};
+
+struct piv_shm {
+	uint psh_version;
+	mutex_t psh_lock;
+	size_t psh_len;
+	char psh_data[1];
+};
+
+static void *
+nvzero_alloc(nv_alloc_t *nva, size_t sz)
+{
+	return (calloc(1, sz));
+}
+
+static void
+nvzero_free(nv_alloc_t *nva, void *buf, size_t sz)
+{
+	explicit_bzero(buf, sz);
+	free(buf);
+}
+
+static nv_alloc_ops_t nvzero = {
+	.nv_ao_init = NULL,
+	.nv_ao_fini = NULL,
+	.nv_ao_alloc = nvzero_alloc,
+	.nv_ao_free = nvzero_free,
+	.nv_ao_reset = NULL
+};
+
+static struct piv_shm_state *
+piv_shm_open(void)
+{
+	zoneid_t zid = getzoneid();
+	key_t k = PIV_STATE_SHM_ID ^ zid;
+	int shmid;
+	struct piv_shm_state *st;
+	nv_alloc_t nvz;
+	int rv;
+	boolean_t newseg = B_FALSE;
+
+	VERIFY0(mlockall(MCL_CURRENT | MCL_FUTURE));
+
+again:
+	shmid = shmget(k, PIV_STATE_SHM_MAX_SIZE, IPC_ALLOC);
+	if (shmid < 0 && errno == ENOENT) {
+		shmid = shmget(k, PIV_STATE_SHM_MAX_SIZE, IPC_CREAT | IPC_EXCL);
+		if (shmid < 0 && errno == EEXIST)
+			goto again;
+		newseg = B_TRUE;
+	}
+	if (shmid < 0) {
+		return (NULL);
+	}
+
+	st = calloc(1, sizeof (struct piv_shm_state));
+	VERIFY3P(st, !=, NULL);
+	st->pss_shmid = shmid;
+
+	VERIFY0(shmctl(shmid, IPC_STAT, &st->pss_ds));
+
+	st->pss_map = shmat(shmid, NULL, SHM_R | SHM_W);
+	if (st->pss_map == NULL) {
+		free(st);
+		return (NULL);
+	}
+
+	if (st->pss_ds.shm_cpid == getpid() && newseg) {
+		VERIFY0(shmctl(shmid, SHM_LOCK, &st->pss_ds));
+		explicit_bzero(st->pss_map, sizeof (struct piv_shm));
+		st->pss_map->psh_version = 100;
+		VERIFY0(mutex_init(&st->pss_map->psh_lock, USYNC_PROCESS |
+		    LOCK_ROBUST, NULL));
+	}
+
+	if (st->pss_map->psh_version != 100) {
+		VERIFY0(shmdt((void *)st->pss_map));
+		free(st);
+		return (NULL);
+	}
+
+	rv = mutex_lock(&st->pss_map->psh_lock);
+	if (rv == EOWNERDEAD) {
+		bunyan_log(DEBUG, "shm lock returned EOWNERDEAD");
+		if (st->pss_map->psh_len > 0 &&
+		    st->pss_map->psh_len < PIV_STATE_SHM_MAX_DATA) {
+			explicit_bzero(st->pss_map->psh_data,
+			    st->pss_map->psh_len);
+		}
+		st->pss_map->psh_len = 0;
+		mutex_consistent(&st->pss_map->psh_lock);
+	} else {
+		VERIFY3S(rv, ==, 0);
+	}
+
+	VERIFY0(nv_alloc_init(&st->pss_nva, &nvzero));
+
+	if (st->pss_map->psh_len > 0 &&
+	    st->pss_map->psh_len < PIV_STATE_SHM_MAX_DATA) {
+		rv = nvlist_xunpack(st->pss_map->psh_data, st->pss_map->psh_len,
+		    &st->pss_nvl, &st->pss_nva);
+		if (rv != 0) {
+			VERIFY0(mutex_unlock(&st->pss_map->psh_lock));
+			VERIFY0(shmdt((void *)st->pss_map));
+			nv_alloc_fini(&st->pss_nva);
+			return (NULL);
+		}
+	} else {
+		VERIFY0(nvlist_xalloc(&st->pss_nvl, NV_UNIQUE_NAME,
+		    &st->pss_nva));
+	}
+
+	return (st);
+}
+
+static void
+piv_shm_update(struct piv_shm_state *st)
+{
+	char *tmp = NULL;
+	size_t tmplen = 0;
+
+	VERIFY3P(st->pss_map, !=, NULL);
+
+	VERIFY0(nvlist_xpack(st->pss_nvl, &tmp, &tmplen, NV_ENCODE_NATIVE,
+	    &st->pss_nva));
+	VERIFY3U(tmplen, >, 0);
+	VERIFY3U(tmplen, <, PIV_STATE_SHM_MAX_DATA);
+
+	st->pss_map->psh_len = tmplen;
+	bcopy(tmp, st->pss_map->psh_data, tmplen);
+
+	explicit_bzero(tmp, tmplen);
+	free(tmp);
+}
+
+static void
+piv_shm_detach(struct piv_shm_state *st)
+{
+	VERIFY0(mutex_unlock(&st->pss_map->psh_lock));
+	VERIFY0(shmdt((void *)st->pss_map));
+	st->pss_map = NULL;
+}
+
+static void
+piv_shm_free(struct piv_shm_state *st)
+{
+	if (st->pss_map != NULL)
+		piv_shm_detach(st);
+	nvlist_free(st->pss_nvl);
+	st->pss_nvl = NULL;
+	nv_alloc_fini(&st->pss_nva);
+	bzero(&st->pss_nva, sizeof (st->pss_nva));
+	free(st);
+}
+
+int
+piv_system_token_set(struct piv_token *pk, const char *pin)
+{
+	struct piv_shm_state *st;
+	struct piv_slot *slot;
+	uint retries = 1;
+	int rv;
+	uchar_t *pubkey;
+	size_t pklen;
+
+	assert(pk->pt_intxn == B_TRUE);
+
+	rv = piv_verify_pin(pk, pin, &retries);
+	if (rv != 0)
+		return (rv);
+
+	st = piv_shm_open();
+	if (st == NULL)
+		return (ENOENT);
+
+	VERIFY0(nvlist_add_byte_array(st->pss_nvl, "guid", pk->pt_guid,
+	    sizeof (pk->pt_guid)));
+	VERIFY0(nvlist_add_string(st->pss_nvl, "pin", pin));
+
+	slot = piv_get_slot(pk, PIV_SLOT_CARD_AUTH);
+	if (slot == NULL) {
+		rv = piv_read_cert(pk, PIV_SLOT_CARD_AUTH);
+		slot = piv_get_slot(pk, PIV_SLOT_CARD_AUTH);
+	}
+	VERIFY3P(slot, !=, NULL);
+
+	VERIFY0(sshkey_to_blob(slot->ps_pubkey, &pubkey, &pklen));
+	VERIFY0(nvlist_add_byte_array(st->pss_nvl, "card-pubkey",
+	    pubkey, pklen));
+
+	piv_shm_update(st);
+
+	piv_shm_free(st);
+	free(pubkey);
+
+	return (0);
+}
+
+int
+piv_system_token_find(struct piv_token *pks, struct piv_token **outpk)
+{
+	struct piv_shm_state *st;
+	uchar_t *guid, *pubkey;
+	size_t guidlen, pklen;
+	struct sshkey *pkey;
+	struct piv_token *pk;
+	struct piv_slot *slot;
+	int rv;
+
+	st = piv_shm_open();
+	if (st == NULL)
+		return (ENOENT);
+	piv_shm_detach(st);
+
+	rv = nvlist_lookup_byte_array(st->pss_nvl, "guid", &guid, &guidlen);
+	if (rv != 0)
+		goto out;
+
+	rv = nvlist_lookup_byte_array(st->pss_nvl, "card-pubkey", &pubkey,
+	    &pklen);
+	if (rv != 0)
+		goto out;
+
+	rv = sshkey_from_blob(pubkey, pklen, &pkey);
+	if (rv != 0) {
+		rv = ENOENT;
+		goto out;
+	}
+
+	for (pk = pks; pk != NULL; pk = pk->pt_next) {
+		if (bcmp(pk->pt_guid, guid, guidlen) != 0)
+			continue;
+
+		VERIFY0(piv_txn_begin(pk));
+		rv = piv_select(pk);
+		slot = piv_get_slot(pk, PIV_SLOT_CARD_AUTH);
+		if (rv == 0 && slot == NULL) {
+			rv = piv_read_cert(pk, PIV_SLOT_CARD_AUTH);
+			slot = piv_get_slot(pk, PIV_SLOT_CARD_AUTH);
+		}
+		if (rv == 0 && slot != NULL) {
+			rv = piv_auth_key(pk, slot, pkey);
+		}
+		piv_txn_end(pk);
+
+		if (rv == 0 && slot != NULL)
+			break;
+	}
+	if (pk == NULL) {
+		rv = ESRCH;
+		goto out;
+	}
+
+	*outpk = pk;
+	rv = 0;
+
+out:
+	piv_shm_free(st);
+	return (rv);
+}
+
+int
+piv_system_token_auth(struct piv_token *pk)
+{
+	struct piv_shm_state *st;
+	uchar_t *guid;
+	char *pin;
+	size_t guidlen;
+	int rv;
+	uint retries;
+
+	assert(pk->pt_intxn == B_TRUE);
+
+	st = piv_shm_open();
+	if (st == NULL)
+		return (ENOENT);
+	piv_shm_detach(st);
+
+	rv = nvlist_lookup_byte_array(st->pss_nvl, "guid", &guid, &guidlen);
+	if (rv != 0)
+		goto out;
+
+	rv = nvlist_lookup_string(st->pss_nvl, "pin", &pin);
+	if (rv != 0)
+		goto out;
+
+	VERIFY0(bcmp(pk->pt_guid, guid, guidlen));
+
+	retries = 1;
+	rv = piv_verify_pin(pk, pin, &retries);
+
+out:
+	piv_shm_free(st);
+	return (rv);
+}
+
+int
+piv_auth_key(struct piv_token *tk, struct piv_slot *slot, struct sshkey *pubkey)
+{
+	int rv;
+	uint8_t *chal = NULL, *sig = NULL;
+	size_t challen, siglen;
+	enum sshdigest_types hashalg;
+	struct sshbuf *b = NULL;
+
+	assert(tk->pt_intxn == B_TRUE);
+
+	if (!sshkey_equal_public(pubkey, slot->ps_pubkey))
+		return (ESRCH);
+
+	challen = 64;
+	chal = calloc(1, challen);
+	VERIFY3P(chal, !=, NULL);
+	arc4random_buf(chal, challen);
+
+	hashalg = 0;
+	rv = piv_sign(tk, slot, chal, challen, &hashalg, &sig, &siglen);
+	if (rv != 0)
+		goto out;
+
+	b = sshbuf_new();
+	VERIFY3P(b, !=, NULL);
+
+	rv = sshkey_sig_from_asn1(pubkey->type, hashalg, sig, siglen, b);
+	if (rv != 0) {
+		rv = ENOTSUP;
+		goto out;
+	}
+
+	rv = sshkey_verify(pubkey, sshbuf_ptr(b), sshbuf_len(b),
+	    chal, challen, 0);
+	if (rv != 0) {
+		rv = ESRCH;
+		goto out;
+	}
+
+out:
+	sshbuf_free(b);
+	if (chal != NULL)
+		explicit_bzero(chal, challen);
+	free(chal);
+	if (sig != NULL)
+		explicit_bzero(sig, siglen);
+	free(sig);
+
+	return (rv);
+}
 
 static int
 piv_probe_ykpiv(struct piv_token *pk)
 {
 	int rv;
 	struct apdu *apdu;
+
+	assert(pk->pt_intxn == B_TRUE);
 
 	apdu = piv_apdu_make(CLA_ISO, INS_GET_VER, 0x00, 0x00);
 
@@ -1212,6 +1581,8 @@ piv_change_pin(struct piv_token *pk, const char *pin, const char *newpin)
 		return (EIO);
 	}
 
+	explicit_bzero(pinbuf, sizeof (pinbuf));
+
 	if (apdu->a_sw == SW_NO_ERROR) {
 		rv = 0;
 		pk->pt_reset = B_TRUE;
@@ -1286,6 +1657,8 @@ piv_verify_pin(struct piv_token *pk, const char *pin, uint *retries)
 		piv_apdu_free(apdu);
 		return (EIO);
 	}
+
+	explicit_bzero(pinbuf, sizeof (pinbuf));
 
 	if (apdu->a_sw == SW_NO_ERROR) {
 		rv = 0;

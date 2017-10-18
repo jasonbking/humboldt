@@ -1,5 +1,5 @@
 deps/*
-/*.o
+*.o
 /yktool
 /yubihmac-bench
 /softtokend
