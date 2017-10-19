@@ -79,54 +79,38 @@ if [[ "z${encstatus}" == "z" ]]; then
 fi
 
 #
-# Get the PIN code for the PIV applet we need to use out of our boot args
-#
-read pivpin < <(bootparams | awk -F= '$1 == "piv-pin" { print $2; exit(0); }')
-
-try_unlock() {
-	local fs="$1"
-	local box="$2"
-	local opts="$3"
-	if [[ "z${opts}" == "z" && "z${pivpin}" != "z" ]]; then
-		opts="-P ${pivpin}"
-	fi
-	echo "$box" | \
-	    openssl enc -base64 -d | \
-	    pivtool ${opts} unbox >/dev/null 2>/tmp/pivtool.err.out.$$
-	local pivret="$?"
-	if [[ $pivret -eq 0 ]]; then
-		echo "$box" | \
-		    openssl enc -base64 -d | \
-		    pivtool ${opts} unbox | \
-		    zfs load-key "${fs}"
-		local loadret="$?"
-		if [[ $loadret -eq 0 ]]; then
-			zfs mount "$fs"
-		fi
-		return $loadret
-	elif [[ $pivret -eq 4 ]]; then
-		mkfifo /tmp/pivpin.pipe.$$
-		/smartdc/lib/sdc-on-tty -d /dev/console \
-		    /smartdc/lib/piv-prompt-pin.sh "/tmp/pivpin.pipe.$$" \
-		    "$(cat /tmp/pivtool.err.out.$$)" &
-		read pin < /tmp/pivpin.pipe.$$
-		rm -f /tmp/pivpin.pipe.$$ /tmp/pivtool.err.out.$$
-		try_unlock "$fs" "$box" "-P ${pin}"
-		return $?
-	fi
-}
-
-#
 # Now run around any encrypted datasets on the system and unlock them.
 #
-zfs list -p -H -o name,encryptionroot,rfd77:local-box | \
-    while read name encroot box; do
-	if [[ "${name}" == "${encroot}" && "${name}" != "zones/swap" && "${box}" != "-" ]]; then
-		if ! try_unlock "$name" "$box"; then
-			fatal "failed to unlock $name"
+# The piv-system-token service should have already set up the system token
+# and unlocked it (stored the PIN in the SHM segment), so we should not require
+# a PIN here.
+#
+while read name encroot box; do
+	if [[ "${name}" == "${encroot}" && "${name}" != "zones/swap" && \
+	    "${box}" != "-" ]]; then
+		echo "$box" | \
+		    openssl enc -d -base64 | \
+		    pivtool unbox | \
+		    zfs load-key "${name}"
+		st=("${PIPESTATUS[@]}")
+		if [[ ${st[0]} -ne 0 || ${st[1]} -ne 0 ]]; then
+			fatal "base64 decode failed: box is invalid?"
+		fi
+		case ${st[2]} in
+		0)
+			;;
+		4)
+			fatal "pivtool unbox wants a PIN: did sys-token fail?"
+			;;
+		*)
+			fatal "pivtool unbox failed"
+			;;
+		esac
+		if [[ ${st[3]} -ne 0 ]]; then
+			fatal "zfs load-key failed"
 		fi
 	fi
-done
+done < <(zfs list -p -H -o name,encryptionroot,rfd77:local-box)
 
 #
 # Re-create the swap zvol at each boot with a unique key for that boot.

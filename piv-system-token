@@ -1,0 +1,165 @@
+#!/bin/bash
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+
+#
+# Copyright (c) 2017, Joyent, Inc.
+#
+
+set -o pipefail
+
+. /lib/svc/share/smf_include.sh
+
+smf_is_globalzone || exit $SMF_EXIT_OK
+
+fatal() {
+	echo "fatal:" "$@" >&2
+	exit $SMF_EXIT_ERR_FATAL
+}
+
+stop() {
+	echo "skipping unlock:" "$@" >&2
+	exit $SMF_EXIT_OK
+}
+
+#
+# If we booted in noimport mode, then don't do any unlocking.
+#
+/bin/bootparams | grep "^noimport=true" >/dev/null
+if [[ $? -eq 0 ]]; then
+	stop "system booted noimport mode"
+fi
+
+#
+# We need dsk and usb devices.
+#
+/usr/sbin/devfsadm
+
+#
+# We have to start our own pcscd here temporarily, since /var/run hasn't been
+# mounted over yet by fs-minimal. If we let the actual pcscd SMF service start
+# now, that mount would hide its socket and make it useless later.
+#
+# So instead we start one just for unlocking here and then kill it when we
+# exit.
+#
+/usr/sbin/amd64/pcscd --force-reader-polling
+while [[ ! -f /var/run/pcscd/pcscd.pid ]]; do
+	sleep 0.1
+done
+pcscd_pid=$(cat /var/run/pcscd/pcscd.pid)
+
+kill_pcscd() {
+	kill $pcscd_pid
+}
+trap kill_pcscd EXIT
+
+#
+# If we're in a qemu VM with the emulated CCID device, after reboot it's often
+# out of sync with us. Doing a list command will cause PCSC to reset it and
+# bring it back into sync.
+#
+pivtool list >/dev/null 2>/dev/null
+
+guid=""
+pin=""
+
+#
+# Check for the system boot module. If we have this, it will tell us which
+# PIV token to use and maybe the PIN for it.
+#
+if [[ -f /system/boot/piv-config.json ]]; then
+	guid=$(json guid < /system/boot/piv-config.json)
+	cardpubkey="$(json card-pubkey < /system/boot/piv-config.json)"
+	pin=$(json pin < /system/boot/piv-config.json)
+
+	IFS=: read rdr rguid nochuid isyk ykver < <(pivtool -g "$guid" -p list)
+
+	if ! pivtool -g "$guid" auth 9e < <(echo "$cardpubkey"); then
+		fatal "Card authentication keys do not match"
+	fi
+
+	if [[ -z "$pin" ]]; then
+		/smartdc/lib/sdc-on-tty -d /dev/console \
+		    /smartdc/lib/piv-prompt-pin.sh "$rguid" "$rdr"
+		if [[ $? -ne 0 ]]; then
+			fatal "piv-prompt-pin failed"
+		fi
+		exit $SMF_EXIT_OK
+	fi
+
+	if ! pivtool -g "$guid" -P "$pin" set-system; then
+		fatal "failed to set system token"
+	fi
+	exit $SMF_EXIT_OK
+fi
+
+#
+# If that didn't work, look in the ZFS pool to see if we have a local-box
+# set at the pool root. If we do, we're using pool-wide encryption and we can
+# get the GUID and public key of the token from that.
+#
+export_pool() {
+	zpool export zones
+}
+zpool import -N -o readonly=on zones
+if [[ $? -eq 0 ]]; then
+	trap export_pool EXIT
+fi
+
+health=$(zpool get -pH -o value health zones)
+if [[ ! -z "$health" ]]; then
+	box="$(zfs get -pH -o value rfd77:local-box zones)"
+	if [[ ! -z "$box" ]]; then
+		boxinfo="$(echo "$box" | \
+		    openssl enc -d -base64 | pivtool box-info)"
+		guid="$(echo "$boxinfo" | \
+		    awk -F': +' '$1 == "guid" { print $2; }')"
+
+		if [[ ! -z "$guid" ]]; then
+			IFS=: read rdr rguid nochuid isyk ykver \
+			    < <(pivtool -g "$guid" -p list)
+
+			/smartdc/lib/sdc-on-tty -d /dev/console \
+			    /smartdc/lib/piv-prompt-pin.sh "$rguid" "$rdr"
+			if [[ $? -ne 0 ]]; then
+				fatal "piv-prompt-pin failed"
+			fi
+			exit $SMF_EXIT_OK
+		fi
+	fi
+fi
+
+#
+# Otherwise we're an unencrypted system with no boot module pinning us to
+# a particular token. Let's see if we have any at all -- if we have exactly
+# one valid token, pin that so that softtokend works. Otherwise we do nothing.
+#
+frdr=""
+while IFS=: read rdr rguid nochuid isyk ykver _algs _9a _9b _9c k9d k9e; do
+	IFS=";" read _ dn9d t9d sz9d < <(echo "$k9d")
+	if [[ "$nochuid" == "false" && \
+	    "$t9d" == "ECDSA" && \
+	    "$k9e" != "9E" ]]; then
+		if [[ -z "$guid" ]]; then
+			guid="$rguid"
+			frdr="$rdr"
+		else
+			stop "multiple candidate tokens fpimd"
+		fi
+	fi
+done < <(pivtool -p list)
+
+if [[ -z "$guid" ]]; then
+	stop "no suitable tokens found"
+fi
+
+/smartdc/lib/sdc-on-tty -d /dev/console \
+    /smartdc/lib/piv-prompt-pin.sh "$guid" "$frdr"
+if [[ $? -ne 0 ]]; then
+	fatal "piv-prompt-pin failed"
+fi
+exit $SMF_EXIT_OK

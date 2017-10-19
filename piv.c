@@ -113,6 +113,10 @@ again:
 		newseg = B_TRUE;
 	}
 	if (shmid < 0) {
+		bunyan_log(DEBUG, "piv_shm_open shmget failed",
+		    "errno", BNY_INT, errno,
+		    "err", BNY_STRING, strerror(errno),
+		    NULL);
 		return (NULL);
 	}
 
@@ -120,15 +124,27 @@ again:
 	VERIFY3P(st, !=, NULL);
 	st->pss_shmid = shmid;
 
-	VERIFY0(shmctl(shmid, IPC_STAT, &st->pss_ds));
+	if (shmctl(shmid, IPC_STAT, &st->pss_ds)) {
+		bunyan_log(DEBUG, "piv_shm_open shmctl failed",
+		    "errno", BNY_INT, errno,
+		    "err", BNY_STRING, strerror(errno),
+		    NULL);
+		return (NULL);
+	}
 
 	st->pss_map = shmat(shmid, NULL, SHM_R | SHM_W);
 	if (st->pss_map == NULL) {
+		bunyan_log(DEBUG, "piv_shm_open shmat failed",
+		    "errno", BNY_INT, errno,
+		    "err", BNY_STRING, strerror(errno),
+		    NULL);
 		free(st);
 		return (NULL);
 	}
 
 	if (st->pss_ds.shm_cpid == getpid() && newseg) {
+		bunyan_log(TRACE, "piv_shm_open init'ing shm region for "
+		    "first time", NULL);
 		VERIFY0(shmctl(shmid, SHM_LOCK, &st->pss_ds));
 		explicit_bzero(st->pss_map, sizeof (struct piv_shm));
 		st->pss_map->psh_version = 100;
@@ -217,18 +233,17 @@ piv_shm_free(struct piv_shm_state *st)
 }
 
 int
-piv_system_token_set(struct piv_token *pk, const char *pin)
+piv_system_token_set(struct piv_token *pk, const char *pin, uint *retries)
 {
 	struct piv_shm_state *st;
 	struct piv_slot *slot;
-	uint retries = 1;
 	int rv;
 	uchar_t *pubkey;
 	size_t pklen;
 
 	assert(pk->pt_intxn == B_TRUE);
 
-	rv = piv_verify_pin(pk, pin, &retries);
+	rv = piv_verify_pin(pk, pin, retries);
 	if (rv != 0)
 		return (rv);
 
@@ -1612,12 +1627,9 @@ piv_verify_pin(struct piv_token *pk, const char *pin, uint *retries)
 
 	assert(pk->pt_intxn == B_TRUE);
 
-	memset(pinbuf, 0xFF, sizeof (pinbuf));
-	for (i = 0; i < 8, pin[i] != 0; ++i)
-		pinbuf[i] = pin[i];
-	assert(pin[i] == 0);
+	if (pin == NULL || (retries != NULL && *retries > 0)) {
+		VERIFY3P(retries, !=, NULL);
 
-	if (retries != NULL && *retries > 0) {
 		apdu = piv_apdu_make(CLA_ISO, INS_VERIFY, 0x00, 0x80);
 
 		rv = piv_apdu_transceive(pk, apdu);
@@ -1632,7 +1644,12 @@ piv_verify_pin(struct piv_token *pk, const char *pin, uint *retries)
 
 		if ((apdu->a_sw & 0xFFF0) == SW_INCORRECT_PIN) {
 			if ((apdu->a_sw & 0x000F) <= *retries) {
+				*retries = (apdu->a_sw & 0x000F);
 				rv = EAGAIN;
+			} else if (pin == NULL) {
+				*retries = (apdu->a_sw & 0x000F);
+				piv_apdu_free(apdu);
+				return (0);
 			} else {
 				rv = 0;
 			}
@@ -1643,6 +1660,11 @@ piv_verify_pin(struct piv_token *pk, const char *pin, uint *retries)
 		if (rv != 0)
 			return (rv);
 	}
+
+	memset(pinbuf, 0xFF, sizeof (pinbuf));
+	for (i = 0; i < 8, pin[i] != 0; ++i)
+		pinbuf[i] = pin[i];
+	assert(pin[i] == 0);
 
 	apdu = piv_apdu_make(CLA_ISO, INS_VERIFY, 0x00, 0x80);
 	apdu->a_cmd.b_data = pinbuf;

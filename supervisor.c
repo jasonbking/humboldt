@@ -248,7 +248,7 @@ lock_key(struct token_slot *slot)
 static int
 unlock_key(struct token_slot *slot)
 {
-	struct piv_token *tk, *tks;
+	struct piv_token *tk, *tks, *systk = NULL;
 	struct piv_slot *sl;
 	struct piv_ecdh_box *box;
 	nvlist_t *nv = slot->ts_nvl;
@@ -283,14 +283,33 @@ unlock_key(struct token_slot *slot)
 	VERIFY0(piv_box_from_binary(boxd, boxdlen, &box));
 	VERIFY0(piv_box_find_token(tks, box, &tk, &sl));
 
+	rv = piv_system_token_find(tks, &systk);
+	if (rv != 0) {
+		bunyan_log(WARN, "failed to get a system PIV token", NULL);
+	}
+	if (tk != systk && systk != NULL) {
+		bunyan_log(WARN, "attempting to decrypt key using a PIV "
+		    "token that is not the system token",
+		    "box_guid", BNY_BIN_HEX,
+		    tk->pt_guid, sizeof (tk->pt_guid),
+		    "system_guid", BNY_BIN_HEX,
+		    systk->pt_guid, sizeof (systk->pt_guid),
+		    NULL);
+	}
+
 	VERIFY0(bny_timer_next(tms, "select_yubikey"));
 
-	attempts = 2;
-	pin = getenv("PIV_LOCAL_PIN");
-	if (pin == NULL)
-		pin = "123456";
+	attempts = 1;
+
 	VERIFY0(piv_txn_begin(tk));
-	VERIFY0(piv_verify_pin(tk, pin, &attempts));
+	if (tk == systk) {
+		VERIFY0(piv_system_token_auth(tk));
+	} else {
+		pin = getenv("PIV_LOCAL_PIN");
+		if (pin == NULL)
+			pin = "123456";
+		VERIFY0(piv_verify_pin(tk, pin, &attempts));
+	}
 	VERIFY0(piv_box_open(tk, sl, box));
 	piv_txn_end(tk);
 
@@ -348,7 +367,7 @@ generate_keys(const char *zonename, const char *keydir)
 {
 	struct sshkey *authkey;
 	struct sshkey *certkey;
-	struct piv_token *tks;
+	struct piv_token *tks, *tk = NULL;
 	int rv, i;
 	SCARDCONTEXT ctx;
 	struct token_slot tpl;
@@ -360,12 +379,15 @@ generate_keys(const char *zonename, const char *keydir)
 	tks = piv_enumerate(ctx);
 	assert(tks != NULL);
 
+	VERIFY0(piv_system_token_find(tks, &tk));
+	VERIFY3P(tk, !=, NULL);
+
 	rv = sshkey_generate(KEY_ED25519, 256, &authkey);
 	VERIFY0(rv);
 	tpl.ts_type = SLOT_ASYM_AUTH;
 	tpl.ts_algo = ALGO_ED_25519;
 	tpl.ts_name = "auth.key";
-	encrypt_and_write_key(authkey, tks, keydir, &tpl);
+	encrypt_and_write_key(authkey, tk, keydir, &tpl);
 	sshkey_free(authkey);
 
 	rv = sshkey_generate(KEY_RSA, 2048, &certkey);
@@ -373,7 +395,7 @@ generate_keys(const char *zonename, const char *keydir)
 	tpl.ts_type = SLOT_ASYM_CERT_SIGN;
 	tpl.ts_algo = ALGO_RSA_2048;
 	tpl.ts_name = "cert.key";
-	encrypt_and_write_key(certkey, tks, keydir, &tpl);
+	encrypt_and_write_key(certkey, tk, keydir, &tpl);
 	sshkey_free(certkey);
 
 	piv_release(tks);
@@ -675,6 +697,8 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	VERIFY0(priv_addset(pset, PRIV_FILE_DAC_READ));
 	VERIFY0(priv_addset(pset, PRIV_FILE_DAC_WRITE));
 	VERIFY0(priv_addset(pset, PRIV_FILE_DAC_SEARCH));
+	VERIFY0(priv_addset(pset, PRIV_IPC_DAC_READ));
+	VERIFY0(priv_addset(pset, PRIV_IPC_DAC_WRITE));
 	/* Our child will need these to do mlockall() and drop privs. */
 	VERIFY0(priv_addset(pset, PRIV_PROC_LOCK_MEMORY));
 	VERIFY0(priv_addset(pset, PRIV_PROC_CHROOT));

@@ -325,10 +325,12 @@ install: $(DEPS_INSTALLED) world
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system
 	cp pcscd.xml $(DESTDIR)/lib/svc/manifest/system
 	cp soft-token.xml $(DESTDIR)/lib/svc/manifest/system
+	cp piv-system-token.xml $(DESTDIR)/lib/svc/manifest/system
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system/filesystem
 	cp unlock-rfd77-zfs.xml $(DESTDIR)/lib/svc/manifest/system/filesystem
 	mkdir -p $(DESTDIR)/lib/svc/method
 	cp unlock-rfd77-zfs $(DESTDIR)/lib/svc/method
+	cp piv-system-token $(DESTDIR)/lib/svc/method
 	cp system-pcscd $(DESTDIR)/lib/svc/method
 	mkdir -p $(DESTDIR)/smartdc/bin
 	cp softtokend $(DESTDIR)/smartdc/bin

@@ -53,11 +53,13 @@ d lib/svc/manifest 0755 root sys
 d lib/svc/manifest/system 0755 root sys
 f lib/svc/manifest/system/pcscd.xml 0644 root sys
 f lib/svc/manifest/system/soft-token.xml 0644 root sys
+f lib/svc/manifest/system/piv-system-token.xml 0644 root sys
 d lib/svc/manifest/system/filesystem 0755 root sys
 f lib/svc/manifest/system/filesystem/unlock-rfd77-zfs.xml 0644 root sys
 d lib/svc/method 0755 root sys
 f lib/svc/method/unlock-rfd77-zfs 0755 root sys
 f lib/svc/method/system-pcscd 0755 root sys
+f lib/svc/method/piv-system-token 0755 root sys
 d smartdc 0755 root bin
 d smartdc/bin 0755 root bin
 f smartdc/bin/softtokend 0755 root sys
