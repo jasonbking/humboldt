@@ -17,6 +17,10 @@ smf_is_globalzone || exit $SMF_EXIT_OK
 
 fatal() {
 	echo "fatal:" "$@" >&2
+	/smartdc/lib/sdc-on-tty -d /dev/console \
+	    echo "\nFatal error while setting up PIV crypto token:\n" "$@" \
+	    "Logs for the 'piv-system-token' SMF service may have further" \
+	    "details.\n"
 	exit $SMF_EXIT_ERR_FATAL
 }
 
@@ -64,9 +68,6 @@ trap kill_pcscd EXIT
 #
 pivtool list >/dev/null 2>/dev/null
 
-guid=""
-pin=""
-
 #
 # Check for the system boot module. If we have this, it will tell us which
 # PIV token to use and maybe the PIN for it.
@@ -76,10 +77,19 @@ if [[ -f /system/boot/piv-config.json ]]; then
 	cardpubkey="$(json card-pubkey < /system/boot/piv-config.json)"
 	pin=$(json pin < /system/boot/piv-config.json)
 
+	if [[ -z "$guid" || -z "$cardpubkey" ]]; then
+		fatal "Contents of boot module invalid"
+	fi
+
 	IFS=: read rdr rguid nochuid isyk ykver < <(pivtool -g "$guid" -p list)
+	if [[ -z "$rguid" ]]; then
+		fatal "PIV token '$guid' (pinned by boot module) could not" \
+		    "be found."
+	fi
 
 	if ! pivtool -g "$guid" auth 9e < <(echo "$cardpubkey"); then
-		fatal "Card authentication keys do not match"
+		fatal "Card authentication keys for '$rguid' (obtained from" \
+		    "boot-time module) do not match"
 	fi
 
 	if [[ -z "$pin" ]]; then
@@ -92,7 +102,7 @@ if [[ -f /system/boot/piv-config.json ]]; then
 	fi
 
 	if ! pivtool -g "$guid" -P "$pin" set-system; then
-		fatal "failed to set system token"
+		fatal "Failure while running 'set-system' command"
 	fi
 	exit $SMF_EXIT_OK
 fi
@@ -111,9 +121,37 @@ if [[ $? -eq 0 ]]; then
 fi
 
 health=$(zpool get -pH -o value health zones)
-if [[ ! -z "$health" ]]; then
+if [[ ! -z "$health" && "$health" != "-" ]]; then
+	guid="$(zfs get -pH -o value rfd77:piv-guid zones)"
+	cardpubkey="$(zfs get -pH -o value rfd77:piv-9e zones)"
+	if [[ ! -z "$guid" && "$guid" != "-" ]]; then
+		IFS=: read rdr rguid nochuid isyk ykver \
+		    < <(pivtool -g "$guid" -p list)
+
+		if [[ -z "$rguid" ]]; then
+			fatal "PIV token '$guid' (pinned by ZFS prop) could" \
+			    "not be found."
+		fi
+
+		if [[ ! -z "$cardpubkey" && "$cardpubkey" != "-" ]]; then
+			if ! pivtool -g "$guid" auth 9e \
+			    < <(echo "$cardpubkey"); then
+				fatal "Card authentication keys do not match"
+			fi
+		else
+			echo "warning: no card public key pinned in zfs props"
+		fi
+
+		/smartdc/lib/sdc-on-tty -d /dev/console \
+		    /smartdc/lib/piv-prompt-pin.sh "$rguid" "$rdr"
+		if [[ $? -ne 0 ]]; then
+			fatal "piv-prompt-pin failed"
+		fi
+		exit $SMF_EXIT_OK
+	fi
+
 	box="$(zfs get -pH -o value rfd77:local-box zones)"
-	if [[ ! -z "$box" ]]; then
+	if [[ ! -z "$box" && "$box" != "-" ]]; then
 		boxinfo="$(echo "$box" | \
 		    openssl enc -d -base64 | pivtool box-info)"
 		guid="$(echo "$boxinfo" | \
@@ -122,6 +160,11 @@ if [[ ! -z "$health" ]]; then
 		if [[ ! -z "$guid" ]]; then
 			IFS=: read rdr rguid nochuid isyk ykver \
 			    < <(pivtool -g "$guid" -p list)
+
+			if [[ -z "$rguid" ]]; then
+				fatal "PIV token '$guid' (pinned by" \
+				    "local-box) could not be found."
+			fi
 
 			/smartdc/lib/sdc-on-tty -d /dev/console \
 			    /smartdc/lib/piv-prompt-pin.sh "$rguid" "$rdr"
@@ -133,33 +176,5 @@ if [[ ! -z "$health" ]]; then
 	fi
 fi
 
-#
-# Otherwise we're an unencrypted system with no boot module pinning us to
-# a particular token. Let's see if we have any at all -- if we have exactly
-# one valid token, pin that so that softtokend works. Otherwise we do nothing.
-#
-frdr=""
-while IFS=: read rdr rguid nochuid isyk ykver _algs _9a _9b _9c k9d k9e; do
-	IFS=";" read _ dn9d t9d sz9d < <(echo "$k9d")
-	if [[ "$nochuid" == "false" && \
-	    "$t9d" == "ECDSA" && \
-	    "$k9e" != "9E" ]]; then
-		if [[ -z "$guid" ]]; then
-			guid="$rguid"
-			frdr="$rdr"
-		else
-			stop "multiple candidate tokens fpimd"
-		fi
-	fi
-done < <(pivtool -p list)
 
-if [[ -z "$guid" ]]; then
-	stop "no suitable tokens found"
-fi
-
-/smartdc/lib/sdc-on-tty -d /dev/console \
-    /smartdc/lib/piv-prompt-pin.sh "$guid" "$frdr"
-if [[ $? -ne 0 ]]; then
-	fatal "piv-prompt-pin failed"
-fi
-exit $SMF_EXIT_OK
+stop "No properties or boot modules found to pin system token."

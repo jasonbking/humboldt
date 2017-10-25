@@ -60,6 +60,8 @@ struct token_slot {
 	const char *ts_name;
 	struct token_slot *ts_next;
 	struct token_slot_data *ts_data;
+	struct token_slot_data *ts_certdata;
+	struct token_slot_data *ts_chaindata;
 	size_t ts_datasize;
 	struct sshkey *ts_public;
 	nvlist_t *ts_nvl;
@@ -68,6 +70,7 @@ struct token_slot {
 
 struct token_slot_data {
 	volatile uint32_t tsd_len;
+	mutex_t tsd_lock;
 	volatile char tsd_data[1];
 };
 

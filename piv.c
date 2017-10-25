@@ -64,10 +64,10 @@ struct piv_shm_state {
 };
 
 struct piv_shm {
-	uint psh_version;
+	volatile uint32_t psh_version;
 	mutex_t psh_lock;
-	size_t psh_len;
-	char psh_data[1];
+	volatile uint32_t psh_len;
+	volatile char psh_data[1];
 };
 
 static void *
