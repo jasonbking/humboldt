@@ -19,6 +19,11 @@
 #define	TOKEN_SOCKET_PATH	TOKEN_SOCKET_DIR "/token.sock"
 #define	TOKEN_KEYS_DIR		"/zones/%s/keys"
 
+#define	MAX_LOG_LINE	(4*1024)
+
+#define	MAX_CERT_LEN	(8*1024)
+#define	MAX_CHAIN_LEN	(16*1024)
+
 enum slot_type {
 	SLOT_ASYM_AUTH = 0x01,
 	SLOT_ASYM_CERT_SIGN = 0x02,
@@ -39,7 +44,8 @@ enum ctl_cmd_type {
 	CMD_STATUS = 0xa0,
 	CMD_UNLOCK_KEY,
 	CMD_LOCK_KEY,
-	CMD_SHUTDOWN
+	CMD_SHUTDOWN,
+	CMD_RENEW_CERT
 };
 
 enum ctl_cmd_status {
@@ -70,7 +76,6 @@ struct token_slot {
 
 struct token_slot_data {
 	volatile uint32_t tsd_len;
-	mutex_t tsd_lock;
 	volatile char tsd_data[1];
 };
 

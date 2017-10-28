@@ -20,6 +20,7 @@
 #include <thread.h>
 #include <string.h>
 #include <strings.h>
+#include <signal.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -67,6 +68,9 @@ struct token_slot *token_slots = NULL;
 size_t slot_n = 0;
 
 static pid_t agent_pid;
+static uint8_t id_seed;
+
+extern mutex_t *bunyan_wrmutex;
 
 static inline char
 hex_digit(char nybble)
@@ -235,7 +239,8 @@ encrypt_and_write_key(struct sshkey *skey, struct piv_token *tk,
 static int
 lock_key(struct token_slot *slot)
 {
-	explicit_bzero(slot->ts_data, slot->ts_datasize);
+	explicit_bzero(slot->ts_data, slot->ts_datasize +
+	    sizeof (struct token_slot_data));
 	bunyan_log(DEBUG, "locked key",
 	    "keyname", BNY_STRING, slot->ts_name, NULL);
 	return (0);
@@ -439,9 +444,9 @@ read_key_file(const char *nm, const char *fn)
 	}
 
 	buf = calloc(1, sz);
-	assert(buf != NULL);
+	VERIFY(buf != NULL);
 
-	assert(fread(buf, sz, 1, f) == 1);
+	VERIFY3S(fread(buf, sz, 1, f), ==, 1);
 	fclose(f);
 
 	if ((rv = nvlist_unpack(buf, sz, &nvl, 0)) != 0) {
@@ -467,19 +472,31 @@ read_key_file(const char *nm, const char *fn)
 	 */
 	shm = mmap(0, sz + sizeof (struct token_slot_data),
 	    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-	assert(shm != NULL);
+	VERIFY(shm != NULL);
 	explicit_bzero(shm, sz);
 	VERIFY0(mlock(shm, sz));
 
 	ts = calloc(1, sizeof (struct token_slot));
-	assert(ts != NULL);
+	VERIFY(ts != NULL);
 	name = calloc(1, strlen(nm) + 1);
-	assert(name != NULL);
+	VERIFY(name != NULL);
 	strcpy(name, nm);
 	ts->ts_name = name;
 	ts->ts_nvl = nvl;
 	ts->ts_data = (struct token_slot_data *)shm;
 	ts->ts_datasize = sz;
+
+	shm = mmap(0, MAX_CERT_LEN, PROT_READ | PROT_WRITE,
+	    MAP_SHARED | MAP_ANON, -1, 0);
+	VERIFY(shm != NULL);
+	explicit_bzero(shm, sizeof (struct token_slot_data));
+	ts->ts_certdata = (struct token_slot_data *)shm;
+
+	shm = mmap(0, MAX_CHAIN_LEN, PROT_READ | PROT_WRITE,
+	    MAP_SHARED | MAP_ANON, -1, 0);
+	VERIFY(shm != NULL);
+	explicit_bzero(shm, sizeof (struct token_slot_data));
+	ts->ts_chaindata = (struct token_slot_data *)shm;
 
 	VERIFY0(nvlist_lookup_uint8(nvl, "type", &val));
 	VERIFY3U(val, >, 0);
@@ -498,7 +515,7 @@ read_key_file(const char *nm, const char *fn)
 
 	ts->ts_next = token_slots;
 	token_slots = ts;
-	ts->ts_id = (++slot_n);
+	ts->ts_id = (++slot_n) ^ id_seed;
 }
 
 static void
@@ -555,7 +572,32 @@ again:
 }
 
 static void
-supervisor_loop(int ctlfd, int kidfd, int listensock)
+supervisor_panic(void)
+{
+	struct token_slot *ts;
+	pid_t w;
+	int rv;
+
+	bunyan_log(ERROR, "panic!", NULL);
+
+	for (ts = token_slots; ts != NULL; ts = ts->ts_next) {
+		(void) lock_key(ts);
+	}
+	(void) kill(agent_pid, SIGABRT);
+	do {
+		w = waitpid(agent_pid, &rv, 0);
+	} while (w == -1 && errno == EINTR);
+
+	bunyan_log(INFO, "agent child stopped",
+	    "exit_status", BNY_INT, WEXITSTATUS(rv),
+	    NULL);
+	assert(WIFEXITED(rv));
+
+	abort();
+}
+
+static void
+supervisor_loop(zoneid_t zid, int ctlfd, int kidfd, int logfd, int listensock)
 {
 	int portfd;
 	port_event_t ev;
@@ -567,16 +609,26 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 	int idx;
 	struct token_slot *ts;
 	pid_t w;
+	FILE *logf;
+	char *logline;
 
 	bzero(&to, sizeof (to));
 
 	portfd = port_create();
 	assert(portfd > 0);
 
+	logf = fdopen(logfd, "r");
+	VERIFY(logf != NULL);
+
+	logline = calloc(1, MAX_LOG_LINE);
+	VERIFY(logline != NULL);
+
 	VERIFY0(port_associate(portfd,
 	    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
 	VERIFY0(port_associate(portfd,
 	    PORT_SOURCE_FD, kidfd, POLLIN, NULL));
+	VERIFY0(port_associate(portfd,
+	    PORT_SOURCE_FD, logfd, POLLIN, NULL));
 
 	while (1) {
 		rv = port_get(portfd, &ev, NULL);
@@ -628,36 +680,59 @@ supervisor_loop(int ctlfd, int kidfd, int listensock)
 					if (ts->ts_id == cmd.cc_p1)
 						break;
 				}
-				if (ts != NULL) {
-					if (cmdtype == CMD_UNLOCK_KEY)
-						rv = unlock_key(ts);
-					else
-						rv = lock_key(ts);
-					if (rv == 0) {
-						bzero(&rcmd, sizeof (rcmd));
-						rcmd.cc_cookie = cmd.cc_cookie;
-						rcmd.cc_type = CMD_STATUS;
-						rcmd.cc_p1 = STATUS_OK;
-						VERIFY0(write_cmd(kidfd,
-						    &rcmd));
-						break;
-					}
+				if (ts == NULL) {
+					bunyan_log(ERROR,
+					    "child sent cmd for invalid key",
+					    "key_id", BNY_INT, cmd.cc_p1,
+					    NULL);
+					supervisor_panic();
 				}
 
-				bzero(&rcmd, sizeof (rcmd));
-				rcmd.cc_cookie = cmd.cc_cookie;
-				rcmd.cc_type = CMD_STATUS;
-				rcmd.cc_p1 = STATUS_ERROR;
-				VERIFY0(write_cmd(kidfd, &rcmd));
+				if (cmdtype == CMD_UNLOCK_KEY)
+					rv = unlock_key(ts);
+				else
+					rv = lock_key(ts);
+				if (rv == 0) {
+					bzero(&rcmd, sizeof (rcmd));
+					rcmd.cc_cookie = cmd.cc_cookie;
+					rcmd.cc_type = CMD_STATUS;
+					rcmd.cc_p1 = STATUS_OK;
+					VERIFY0(write_cmd(kidfd,
+					    &rcmd));
+					break;
+				}
+				break;
+			case CMD_RENEW_CERT:
+				for (ts = token_slots; ts != NULL;
+				    ts = ts->ts_next) {
+					if (ts->ts_id == cmd.cc_p1)
+						break;
+				}
+				if (ts == NULL) {
+					bunyan_log(ERROR,
+					    "child sent cmd for invalid key",
+					    "key_id", BNY_INT, cmd.cc_p1,
+					    NULL);
+					supervisor_panic();
+				}
 				break;
 			default:
 				bunyan_log(ERROR,
 				    "child sent unknown cmd type",
 				    "type", BNY_INT, cmdtype, NULL);
-				continue;
+				supervisor_panic();
 			}
 			VERIFY0(port_associate(portfd,
 			    PORT_SOURCE_FD, kidfd, POLLIN, NULL));
+
+		} else if (ev.portev_object == logfd) {
+			fgets(logline, MAX_LOG_LINE, logf);
+			mutex_enter(bunyan_wrmutex);
+			fputs(logline, stderr);
+			fputs("\n", stderr);
+			mutex_exit(bunyan_wrmutex);
+			VERIFY0(port_associate(portfd,
+			    PORT_SOURCE_FD, logfd, POLLIN, NULL));
 
 		} else {
 			assert(0);
@@ -673,11 +748,13 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	struct sockaddr_un addr;
 	int listensock;
 	ssize_t len;
-	int kidpipe[2];
+	int kidpipe[2], logpipe[2];
 	struct token_slot *slot;
 	priv_set_t *pset;
 
 	bunyan_set_name("supervisor");
+
+	id_seed = arc4random_uniform(255);
 
 	/*
 	 * Early drop of privs before we fork our child or do any work.
@@ -745,6 +822,7 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	make_slots(zonename);
 
 	VERIFY0(pipe(kidpipe));
+	VERIFY0(pipe(logpipe));
 
 	/* And create the actual agent process. */
 	agent_pid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
@@ -752,11 +830,18 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	if (agent_pid == 0) {
 		VERIFY0(close(kidpipe[0]));
 		VERIFY0(close(ctlfd));
+		VERIFY0(close(logpipe[0]));
+
+		VERIFY3S(dup2(logpipe[1], 1), ==, 1);
+		VERIFY3S(dup2(logpipe[1], 2), ==, 2);
+		bunyan_unshare();
+
 		agent_main(zid, listensock, kidpipe[1]);
 		bunyan_log(ERROR, "agent_main returned", NULL);
 		exit(1);
 	}
 	VERIFY0(close(kidpipe[1]));
+	VERIFY0(close(logpipe[1]));
 
 	/*
 	 * Now that we've finished forking we can give up the privs we only
@@ -773,5 +858,5 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	VERIFY0(setppriv(PRIV_SET, PRIV_EFFECTIVE, pset));
 	priv_freeset(pset);
 
-	supervisor_loop(ctlfd, kidpipe[0], listensock);
+	supervisor_loop(zid, ctlfd, kidpipe[0], logpipe[0], listensock);
 }

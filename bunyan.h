@@ -31,6 +31,7 @@ enum bunyan_arg_type {
 };
 
 void bunyan_init(void);
+void bunyan_unshare(void);
 void bunyan_set_name(const char *name);
 void bunyan_set_level(enum bunyan_log_level level);
 void bunyan_log(enum bunyan_log_level level, const char *msg, ...);

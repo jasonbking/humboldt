@@ -556,7 +556,14 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 		 * Set all the shared pages to PROT_NONE until we unlock the
 		 * keys.
 		 */
-		VERIFY0(mprotect(slot->ts_data, slot->ts_datasize, PROT_NONE));
+		VERIFY0(mprotect(slot->ts_data,
+		    slot->ts_datasize + sizeof (struct token_slot_data),
+		    PROT_NONE));
+
+		/* Reading certs is ok */
+		VERIFY0(mprotect(slot->ts_certdata, MAX_CERT_SIZE, PROT_READ));
+		VERIFY0(mprotect(slot->ts_chaindata, MAX_CHAIN_SIZE,
+		    PROT_READ));
 
 		/*
 		 * Allocate the local agent-side state about each key and

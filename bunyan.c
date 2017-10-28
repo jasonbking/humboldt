@@ -34,7 +34,7 @@
 static const char *bunyan_name = NULL;
 static char *bunyan_hostname = NULL;
 static mutex_t bunyan_bmutex;
-static mutex_t *bunyan_wrmutex = NULL;
+mutex_t *bunyan_wrmutex = NULL;
 static void *bunyan_shmem = NULL;
 static nvlist_t *bunyan_base = NULL;
 static enum bunyan_log_level bunyan_min_level = INFO;
@@ -189,8 +189,24 @@ bny_timers_free(struct bunyan_timers *tms)
 }
 
 void
+bunyan_unshare(void)
+{
+	assert(bunyan_shmem != NULL);
+	VERIFY0(munmap(bunyan_shmem, sizeof (mutex_t)));
+	bunyan_shmem = NULL;
+	bunyan_shmem = mmap(0, sizeof (mutex_t), PROT_READ | PROT_WRITE,
+	    MAP_SHARED | MAP_ANON, -1, 0);
+	assert(bunyan_shmem != NULL);
+	bzero(bunyan_shmem, sizeof (mutex_t));
+	bunyan_wrmutex = (mutex_t *)bunyan_shmem;
+	VERIFY0(mutex_init(bunyan_wrmutex, USYNC_PROCESS | LOCK_ERRORCHECK,
+	    NULL));
+}
+
+void
 bunyan_init(void)
 {
+	assert(bunyan_shmem == NULL);
 	bunyan_shmem = mmap(0, sizeof (mutex_t), PROT_READ | PROT_WRITE,
 	    MAP_SHARED | MAP_ANON, -1, 0);
 	assert(bunyan_shmem != NULL);
