@@ -561,8 +561,8 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 		    PROT_NONE));
 
 		/* Reading certs is ok */
-		VERIFY0(mprotect(slot->ts_certdata, MAX_CERT_SIZE, PROT_READ));
-		VERIFY0(mprotect(slot->ts_chaindata, MAX_CHAIN_SIZE,
+		VERIFY0(mprotect(slot->ts_certdata, MAX_CERT_LEN, PROT_READ));
+		VERIFY0(mprotect(slot->ts_chaindata, MAX_CHAIN_LEN,
 		    PROT_READ));
 
 		/*
