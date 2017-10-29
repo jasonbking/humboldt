@@ -48,9 +48,9 @@ box=$(dd if=/dev/random bs=32 count=1 2>/dev/null | \
 
 echo "$box" | openssl enc -d -base64 | pivtool unbox | \
     zpool create -O encryption=on -O keyformat=raw \
-    -o rfd77:local-box="$box" \
-    -o rfd77:piv-guid="$pguid" \
-    -o rfd77:piv-9e="$pub9e" \
+    -O rfd77:local-box="$box" \
+    -O rfd77:piv-guid="$pguid" \
+    -O rfd77:piv-9e="$pub9e" \
     $pool "$@"
 if [[ $? -eq 0 ]]; then
 	ramsize=$(sysinfo | json 'MiB of Memory')
