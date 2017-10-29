@@ -78,6 +78,40 @@ if [[ "z${encstatus}" == "z" ]]; then
 	stop "ZFS encryption not enabled on this system"
 fi
 
+unlock_ds() {
+	local name="$1"
+	local box="$2"
+	echo "$box" | \
+	    openssl enc -d -base64 | \
+	    pivtool unbox | \
+	    zfs load-key "${name}"
+	local st=("${PIPESTATUS[@]}")
+	if [[ ${st[0]} -ne 0 || ${st[1]} -ne 0 ]]; then
+		fatal "base64 decode failed: box is invalid?"
+	fi
+	case ${st[2]} in
+	0)
+		;;
+	4)
+		fatal "pivtool unbox wants a PIN: did sys-token fail?"
+		;;
+	*)
+		fatal "pivtool unbox failed"
+		;;
+	esac
+	if [[ ${st[3]} -ne 0 ]]; then
+		fatal "zfs load-key failed"
+	fi
+}
+
+#
+# Unlock pool root level encryption if we have it.
+#
+box="$(zpool get -p -H -o value rfd77:local-box zones)"
+if [[ ! -z "$box" ]]; then
+	unlock_ds zones "$box"
+fi
+
 #
 # Now run around any encrypted datasets on the system and unlock them.
 #
@@ -88,27 +122,7 @@ fi
 while read name encroot box; do
 	if [[ "${name}" == "${encroot}" && "${name}" != "zones/swap" && \
 	    "${box}" != "-" ]]; then
-		echo "$box" | \
-		    openssl enc -d -base64 | \
-		    pivtool unbox | \
-		    zfs load-key "${name}"
-		st=("${PIPESTATUS[@]}")
-		if [[ ${st[0]} -ne 0 || ${st[1]} -ne 0 ]]; then
-			fatal "base64 decode failed: box is invalid?"
-		fi
-		case ${st[2]} in
-		0)
-			;;
-		4)
-			fatal "pivtool unbox wants a PIN: did sys-token fail?"
-			;;
-		*)
-			fatal "pivtool unbox failed"
-			;;
-		esac
-		if [[ ${st[3]} -ne 0 ]]; then
-			fatal "zfs load-key failed"
-		fi
+		unlock_ds "$name" "$box"
 	fi
 done < <(zfs list -p -H -o name,encryptionroot,rfd77:local-box)
 

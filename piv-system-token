@@ -122,8 +122,8 @@ fi
 
 health=$(zpool get -pH -o value health zones)
 if [[ ! -z "$health" && "$health" != "-" ]]; then
-	guid="$(zfs get -pH -o value rfd77:piv-guid zones)"
-	cardpubkey="$(zfs get -pH -o value rfd77:piv-9e zones)"
+	guid="$(zpool get -pH -o value rfd77:piv-guid zones)"
+	cardpubkey="$(zpool get -pH -o value rfd77:piv-9e zones)"
 	if [[ ! -z "$guid" && "$guid" != "-" ]]; then
 		IFS=: read rdr rguid nochuid isyk ykver \
 		    < <(pivtool -g "$guid" -p list)
@@ -150,7 +150,7 @@ if [[ ! -z "$health" && "$health" != "-" ]]; then
 		exit $SMF_EXIT_OK
 	fi
 
-	box="$(zfs get -pH -o value rfd77:local-box zones)"
+	box="$(zpool get -pH -o value rfd77:local-box zones)"
 	if [[ ! -z "$box" && "$box" != "-" ]]; then
 		boxinfo="$(echo "$box" | \
 		    openssl enc -d -base64 | pivtool box-info)"

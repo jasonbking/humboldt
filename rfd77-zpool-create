@@ -40,12 +40,18 @@ if [[ "z$guid" != "z" ]]; then
 	pivopts="-g $guid"
 fi
 
+IFS=: read rdr pguid _ < <(pivtool $pivopts -p list)
+pub9e="$(pivtool $pivopts pubkey 9e)"
+
 box=$(dd if=/dev/random bs=32 count=1 2>/dev/null | \
     pivtool $pivopts box $slot | openssl enc -base64 | tr -d '\n')
 
 echo "$box" | openssl enc -d -base64 | pivtool unbox | \
     zpool create -O encryption=on -O keyformat=raw \
-    -O rfd77:local-box="$box" $pool "$@"
+    -o rfd77:local-box="$box" \
+    -o rfd77:piv-guid="$pguid" \
+    -o rfd77:piv-9e="$pub9e" \
+    $pool "$@"
 if [[ $? -eq 0 ]]; then
 	ramsize=$(sysinfo | json 'MiB of Memory')
 	zfs create -V "${ramsize}M" -o encryption=off -o checksum=noparity \
