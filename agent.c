@@ -190,12 +190,19 @@ process_request_identities(struct client_state *cl)
 {
 	struct sshbuf *msg;
 	struct token_slot *slot;
+	size_t n = 0;
 
 	msg = sshbuf_new();
 	VERIFY3P(msg, !=, NULL);
 
+	for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
+		n++;
+		if (slot->ts_certdata->tsd_len > 0)
+			n++;
+	}
+
 	VERIFY0(sshbuf_put_u8(msg, SSH2_AGENT_IDENTITIES_ANSWER));
-	VERIFY0(sshbuf_put_u32(msg, slot_n));
+	VERIFY0(sshbuf_put_u32(msg, n));
 
 	for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
 		u_char *blob;
@@ -206,6 +213,13 @@ process_request_identities(struct client_state *cl)
 		free(blob);
 
 		VERIFY0(sshbuf_put_cstring(msg, slot->ts_name));
+
+		if (slot->ts_certdata->tsd_len > 0) {
+			VERIFY0(sshbuf_put_string(msg,
+			    slot->ts_certdata->tsd_data,
+			    slot->ts_certdata->tsd_len));
+			VERIFY0(sshbuf_put_cstring(msg, slot->ts_name));
+		}
 	}
 	VERIFY0(sshbuf_put_stringb(cl->cs_out, msg));
 	sshbuf_free(msg);

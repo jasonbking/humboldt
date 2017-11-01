@@ -79,11 +79,15 @@ TOKEN_SOURCES=			\
 	piv.c			\
 	tlv.c			\
 	ykccid.c		\
+	custr.c			\
+	json.c			\
 	$(LIBSSH_SOURCES)
 TOKEN_HEADERS=			\
 	softtoken.h		\
 	bunyan.h		\
 	piv.h			\
+	custr.h			\
+	json.h			\
 	tlv.h
 
 TOKEN_OBJS=		$(TOKEN_SOURCES:%.c=%.o)
@@ -332,6 +336,7 @@ install: $(DEPS_INSTALLED) world
 	cp unlock-rfd77-zfs $(DESTDIR)/lib/svc/method
 	cp piv-system-token $(DESTDIR)/lib/svc/method
 	cp system-pcscd $(DESTDIR)/lib/svc/method
+	cp system-soft-token $(DESTDIR)/lib/svc/method
 	mkdir -p $(DESTDIR)/smartdc/bin
 	cp softtokend $(DESTDIR)/smartdc/bin
 	mkdir -p $(DESTDIR)/smartdc/lib

@@ -45,6 +45,8 @@
 #include "libssh/sshkey.h"
 #include "libssh/cipher.h"
 #include "libssh/sshbuf.h"
+#include "libssh/ssherr.h"
+#include "libssh/ssh2.h"
 #include "ed25519/crypto_api.h"
 
 /*
@@ -230,6 +232,161 @@ encrypt_and_write_key(struct sshkey *skey, struct piv_token *tk,
 	explicit_bzero(boxd, boxdlen);
 	free(boxd);
 	sshbuf_free(buf);
+}
+
+struct certsign_ctx {
+	struct piv_token *csc_tk;
+	struct piv_slot *csc_slot;
+};
+
+static int
+piv_cert_signer(const struct sshkey *key, u_char **sigp, size_t *lenp,
+    const u_char *data, size_t datalen, const char *alg, u_int compat,
+    void *vctx)
+{
+	struct certsign_ctx *ctx;
+	enum sshdigest_types hashalg;
+	size_t siglen;
+	uint8_t *sig = NULL;
+	struct sshbuf *buf;
+	int rv;
+
+	VERIFY(vctx != NULL);
+	ctx = (struct certsign_ctx *)vctx;
+	VERIFY(ctx->csc_tk != NULL);
+	VERIFY(ctx->csc_slot != NULL);
+
+	hashalg = SSH_DIGEST_SHA256;
+
+	rv = piv_sign(ctx->csc_tk, ctx->csc_slot, data, datalen, &hashalg, 
+	    &sig, &siglen);
+	if (rv != 0) {
+		bunyan_log(ERROR, "piv_sign failed",
+		    "rv", BNY_INT, rv, NULL);
+		return (SSH_ERR_SYSTEM_ERROR);
+	}
+	if (hashalg != SSH_DIGEST_SHA256) {
+		explicit_bzero(sig, siglen);
+		free(sig);
+		return (SSH_ERR_KEY_TYPE_MISMATCH);
+	}
+
+	buf = sshbuf_new();
+	VERIFY(buf != NULL);
+	VERIFY0(sshkey_sig_from_asn1(ctx->csc_slot->ps_pubkey->type,
+	    SSH_DIGEST_SHA256, sig, siglen, buf));
+	explicit_bzero(sig, siglen);
+	free(sig);
+
+	*sigp = calloc(1, sshbuf_len(buf));
+	*lenp = sshbuf_len(buf);
+	VERIFY0(sshbuf_get(buf, *sigp, *lenp));
+	sshbuf_free(buf);
+
+	return (0);
+}
+
+static int
+new_cert_global(struct token_slot *slot)
+{
+	struct sshkey *certk;
+	struct sshkey_cert *cert;
+	struct sshbuf *b;
+	const char *uuid;
+	time_t now;
+	int rv;
+	SCARDCONTEXT ctx;
+	struct piv_token *tk, *tks;
+	struct piv_slot *sl;
+	struct certsign_ctx csc;
+	uint8_t *blob;
+	size_t bloblen;
+
+	bzero(&csc, sizeof (csc));
+
+	VERIFY3U(slot->ts_type, ==, SLOT_ASYM_AUTH);
+	VERIFY3U(slot->ts_algo, ==, ALGO_ED_25519);
+	VERIFY3U(slot->ts_public->type, ==, KEY_ED25519);
+
+	VERIFY0(sshkey_demote(slot->ts_public, &certk));
+	VERIFY(certk != NULL);
+	VERIFY0(sshkey_to_certified(certk));
+
+	cert = certk->cert;
+	VERIFY(cert != NULL);
+
+	cert->type = SSH2_CERT_TYPE_HOST;
+	arc4random_buf(&cert->serial, sizeof (cert->serial));
+	cert->key_id = strdup(slot->ts_name);
+	VERIFY(cert->key_id != NULL);
+	cert->nprincipals = 1;
+	cert->principals = (char **)calloc(1, sizeof (char *));
+	VERIFY(cert->principals != NULL);
+
+	uuid = getenv("SYSTEM_UUID");
+	VERIFY(uuid != NULL);
+	VERIFY3U(strlen(uuid), >, 0);
+	cert->principals[0] = strdup(uuid);
+
+	now = time(NULL);
+	cert->valid_after = ((now - 59) / 60) * 60;
+	cert->valid_before = now + 60;
+
+	cert->extensions = sshbuf_new();
+	VERIFY(cert->extensions != NULL);
+
+	b = sshbuf_new();
+	VERIFY(b != NULL);
+
+	VERIFY0(sshbuf_put_cstring(cert->extensions, "hostname"));
+	VERIFY0(sshbuf_put_cstring(b, getenv("SYSTEM_HOSTNAME")));
+	VERIFY0(sshbuf_put_stringb(cert->extensions, b));
+	sshbuf_reset(b);
+
+	VERIFY0(sshbuf_put_cstring(cert->extensions, "datacenter"));
+	VERIFY0(sshbuf_put_cstring(b, getenv("SYSTEM_DC")));
+	VERIFY0(sshbuf_put_stringb(cert->extensions, b));
+	sshbuf_reset(b);
+
+	sshbuf_free(b);
+
+	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
+	assert(rv == SCARD_S_SUCCESS);
+
+	tks = piv_enumerate(ctx);
+	assert(tks != NULL);
+	VERIFY0(piv_system_token_find(tks, &tk));
+
+	VERIFY0(piv_txn_begin(tk));
+	sl = piv_get_slot(tk, PIV_SLOT_SIGNATURE);
+	if (sl == NULL) {
+		rv = piv_read_cert(tk, PIV_SLOT_SIGNATURE);
+		sl = piv_get_slot(tk, PIV_SLOT_SIGNATURE);
+	}
+	VERIFY(sl != NULL);
+
+	csc.csc_tk = tk;
+	csc.csc_slot = sl;
+	VERIFY0(piv_system_token_auth(tk));
+	VERIFY0(sshkey_certify_custom(certk, sl->ps_pubkey, NULL,
+	    piv_cert_signer, &csc));
+
+	piv_txn_end(tk);
+	piv_release(tks);
+
+	VERIFY0(sshkey_to_blob(certk, &blob, &bloblen));
+	VERIFY3U(bloblen, >, 0);
+	VERIFY3U(bloblen, <, MAX_CERT_LEN);
+	bcopy(blob, slot->ts_certdata->tsd_data, bloblen);
+	slot->ts_certdata->tsd_len = bloblen;
+
+	return (0);
+}
+
+static int
+new_cert_zone(zoneid_t zid, struct token_slot *slot)
+{
+	return (0);
 }
 
 /*
@@ -715,6 +872,20 @@ supervisor_loop(zoneid_t zid, int ctlfd, int kidfd, int logfd, int listensock)
 					    NULL);
 					supervisor_panic();
 				}
+				if (zid == GLOBAL_ZONEID) {
+					rv = new_cert_global(ts);
+				} else {
+					rv = new_cert_zone(zid, ts);
+				}
+				if (rv == 0) {
+					bzero(&rcmd, sizeof (rcmd));
+					rcmd.cc_cookie = cmd.cc_cookie;
+					rcmd.cc_type = CMD_STATUS;
+					rcmd.cc_p1 = STATUS_OK;
+					VERIFY0(write_cmd(kidfd,
+					    &rcmd));
+					break;
+				}
 				break;
 			default:
 				bunyan_log(ERROR,
@@ -848,7 +1019,8 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	 * kept to give to our child.
 	 */
 	VERIFY0(priv_delset(pset, PRIV_PROC_FORK));
-	VERIFY0(priv_delset(pset, PRIV_PROC_LOCK_MEMORY));
+	/* we still need this for piv shm code */
+	/*VERIFY0(priv_delset(pset, PRIV_PROC_LOCK_MEMORY));*/
 	VERIFY0(priv_delset(pset, PRIV_PROC_CHROOT));
 	VERIFY0(priv_delset(pset, PRIV_PROC_SETID));
 	/* We still need this for PCSCd */
@@ -857,6 +1029,10 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	VERIFY0(setppriv(PRIV_SET, PRIV_PERMITTED, pset));
 	VERIFY0(setppriv(PRIV_SET, PRIV_EFFECTIVE, pset));
 	priv_freeset(pset);
+
+	if (zid == GLOBAL_ZONEID) {
+		VERIFY0(new_cert_global(token_slots));
+	}
 
 	supervisor_loop(zid, ctlfd, kidpipe[0], logpipe[0], listensock);
 }
