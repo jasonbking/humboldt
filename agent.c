@@ -197,8 +197,10 @@ process_request_identities(struct client_state *cl)
 
 	for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
 		n++;
-		if (slot->ts_certdata->tsd_len > 0)
+		if (slot->ts_type == SLOT_ASYM_AUTH &&
+		    slot->ts_certdata->tsd_len > 0) {
 			n++;
+		}
 	}
 
 	VERIFY0(sshbuf_put_u8(msg, SSH2_AGENT_IDENTITIES_ANSWER));
@@ -214,7 +216,8 @@ process_request_identities(struct client_state *cl)
 
 		VERIFY0(sshbuf_put_cstring(msg, slot->ts_name));
 
-		if (slot->ts_certdata->tsd_len > 0) {
+		if (slot->ts_type == SLOT_ASYM_AUTH &&
+		    slot->ts_certdata->tsd_len > 0) {
 			VERIFY0(sshbuf_put_string(msg,
 			    slot->ts_certdata->tsd_data,
 			    slot->ts_certdata->tsd_len));

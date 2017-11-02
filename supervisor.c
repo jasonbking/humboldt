@@ -240,7 +240,7 @@ struct certsign_ctx {
 };
 
 static int
-piv_cert_signer(const struct sshkey *key, u_char **sigp, size_t *lenp,
+piv_ssh_cert_signer(const struct sshkey *key, u_char **sigp, size_t *lenp,
     const u_char *data, size_t datalen, const char *alg, u_int compat,
     void *vctx)
 {
@@ -287,7 +287,176 @@ piv_cert_signer(const struct sshkey *key, u_char **sigp, size_t *lenp,
 }
 
 static int
-new_cert_global(struct token_slot *slot)
+new_cert_global_x509(struct token_slot *slot)
+{
+	SCARDCONTEXT ctx;
+	struct piv_token *tk, *tks;
+	struct piv_slot *sl;
+	EVP_PKEY *pkey;
+	RSA *rsacp;
+	int nid;
+	enum sshdigest_types hashalg;
+	BIGNUM *serial;
+	ASN1_INTEGER *serial_asn1;
+	X509 *cert;
+	X509_NAME *subj, *issu;
+	X509_EXTENSION *ext;
+	X509V3_CTX x509ctx;
+	ASN1_TYPE null_parameter;
+	uint8_t *tbs, *sig, *cdata;
+	size_t tbslen, siglen, cdlen;
+	uint flags;
+	int rv;
+	const char *uuid, *hostname;
+
+	VERIFY3U(slot->ts_type, ==, SLOT_ASYM_CERT_SIGN);
+	VERIFY3U(slot->ts_algo, ==, ALGO_RSA_2048);
+	VERIFY3U(slot->ts_public->type, ==, KEY_RSA);
+
+	pkey = EVP_PKEY_new();
+	VERIFY(pkey != NULL);
+
+	rsacp = RSA_new();
+	VERIFY(rsacp != NULL);
+	rsacp->e = BN_dup(slot->ts_public->rsa->e);
+	VERIFY(rsacp->e != NULL);
+	rsacp->n = BN_dup(slot->ts_public->rsa->n);
+	VERIFY(rsacp->n != NULL);
+	/*
+	 * NOTE: this takes ownership of the RSA. Freeing it and its BNs is
+	 * no longer our problem
+	 */
+	rv = EVP_PKEY_assign_RSA(pkey, rsacp);
+	VERIFY3S(rv, ==, 1);
+	rsacp = NULL;
+
+	nid = NID_sha256WithRSAEncryption;
+	hashalg = SSH_DIGEST_SHA256;
+
+	serial = BN_new();
+	serial_asn1 = ASN1_INTEGER_new();
+	VERIFY(serial != NULL);
+	VERIFY3S(BN_pseudo_rand(serial, 64, 0, 0), ==, 1);
+	VERIFY(BN_to_ASN1_INTEGER(serial, serial_asn1) != NULL);
+	BN_free(serial);
+
+	cert = X509_new();
+	VERIFY(cert != NULL);
+	VERIFY3S(X509_set_version(cert, 2), ==, 1);
+	VERIFY3S(X509_set_serialNumber(cert, serial_asn1), ==, 1);
+	ASN1_INTEGER_free(serial_asn1);
+	VERIFY(X509_gmtime_adj(X509_get_notBefore(cert), 0) != NULL);
+	VERIFY(X509_gmtime_adj(X509_get_notAfter(cert), 300) != NULL);
+
+	uuid = getenv("SYSTEM_UUID");
+	VERIFY(uuid != NULL);
+	VERIFY3U(strlen(uuid), >, 0);
+
+	hostname = getenv("SYSTEM_HOSTNAME");
+	VERIFY(hostname != NULL);
+
+	subj = X509_NAME_new();
+	VERIFY(subj != NULL);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "T", MBSTRING_ASC,
+	    (unsigned char *)slot->ts_name, -1, -1, 0), ==, 1);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
+	    (unsigned char *)hostname, -1, -1, 0), ==, 1);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "UID", MBSTRING_ASC,
+	    (unsigned char *)uuid, -1, -1, 0), ==, 1);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "DC", MBSTRING_ASC,
+	    (unsigned char *)getenv("SYSTEM_DC"), -1, -1, 0), ==, 1);
+	VERIFY3S(X509_set_subject_name(cert, subj), ==, 1);
+	X509_NAME_free(subj);
+
+	issu = X509_NAME_new();
+	VERIFY(issu != NULL);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "T", MBSTRING_ASC,
+	    (unsigned char *)"piv-9c", -1, -1, 0), ==, 1);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
+	    (unsigned char *)hostname, -1, -1, 0), ==, 1);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "UID", MBSTRING_ASC,
+	    (unsigned char *)uuid, -1, -1, 0), ==, 1);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "DC", MBSTRING_ASC,
+	    (unsigned char *)getenv("SYSTEM_DC"), -1, -1, 0), ==, 1);
+	VERIFY3S(X509_set_issuer_name(cert, issu), ==, 1);
+	X509_NAME_free(issu);
+
+	X509V3_set_ctx_nodb(&x509ctx);
+	X509V3_set_ctx(&x509ctx, cert, cert, NULL, NULL, 0);
+
+	ext = X509V3_EXT_conf_nid(NULL, &x509ctx, NID_basic_constraints,
+	    "critical,CA:TRUE");
+	VERIFY(ext != NULL);
+	X509_add_ext(cert, ext, -1);
+	X509_EXTENSION_free(ext);
+
+	ext = X509V3_EXT_conf_nid(NULL, &x509ctx, NID_key_usage,
+	    "critical,keyCertSign,cRLSign");
+	VERIFY(ext != NULL);
+	X509_add_ext(cert, ext, -1);
+	X509_EXTENSION_free(ext);
+
+	VERIFY3S(X509_set_pubkey(cert, pkey), ==, 1);
+	EVP_PKEY_free(pkey);
+
+	cert->sig_alg->algorithm = OBJ_nid2obj(nid);
+	cert->cert_info->signature->algorithm = cert->sig_alg->algorithm;
+
+	bzero(&null_parameter, sizeof (null_parameter));
+	null_parameter.type = V_ASN1_NULL;
+	null_parameter.value.ptr = NULL;
+	cert->sig_alg->parameter = &null_parameter;
+	cert->cert_info->signature->parameter = &null_parameter;
+
+	cert->cert_info->enc.modified = 1;
+	tbslen = i2d_X509_CINF(cert->cert_info, &tbs);
+	VERIFY(tbs != NULL);
+	VERIFY3U(tbslen, >, 0);
+
+	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
+	VERIFY3S(rv, ==, SCARD_S_SUCCESS);
+
+	tks = piv_enumerate(ctx);
+	VERIFY(tks != NULL);
+	VERIFY0(piv_system_token_find(tks, &tk));
+
+	VERIFY0(piv_txn_begin(tk));
+	sl = piv_get_slot(tk, PIV_SLOT_SIGNATURE);
+	if (sl == NULL) {
+		rv = piv_read_cert(tk, PIV_SLOT_SIGNATURE);
+		sl = piv_get_slot(tk, PIV_SLOT_SIGNATURE);
+	}
+	VERIFY(sl != NULL);
+
+	VERIFY0(piv_system_token_auth(tk));
+	VERIFY0(piv_sign(tk, sl, tbs, tbslen, &hashalg, &sig, &siglen));
+	VERIFY3U(hashalg, ==, SSH_DIGEST_SHA256);
+
+	piv_txn_end(tk);
+	piv_release(tks);
+	SCardReleaseContext(ctx);
+
+	M_ASN1_BIT_STRING_set(cert->signature, sig, siglen);
+	cert->signature->flags = ASN1_STRING_FLAG_BITS_LEFT;
+
+	cdlen = i2d_X509(cert, &cdata);
+	VERIFY(cdata != NULL);
+	VERIFY3U(cdlen, >, 0);
+	VERIFY3U(cdlen, <, MAX_CERT_LEN);
+
+	X509_free(cert);
+
+	slot->ts_certdata->tsd_len = 0;
+	bcopy(cdata, slot->ts_certdata->tsd_data, cdlen);
+	slot->ts_certdata->tsd_len = cdlen;
+
+	OPENSSL_free(cdata);
+
+	return (0);
+}
+
+static int
+new_cert_global_ssh(struct token_slot *slot)
 {
 	struct sshkey *certk;
 	struct sshkey_cert *cert;
@@ -329,8 +498,8 @@ new_cert_global(struct token_slot *slot)
 	cert->principals[0] = strdup(uuid);
 
 	now = time(NULL);
-	cert->valid_after = ((now - 59) / 60) * 60;
-	cert->valid_before = now + 60;
+	cert->valid_after = now;
+	cert->valid_before = now + 300;
 
 	cert->extensions = sshbuf_new();
 	VERIFY(cert->extensions != NULL);
@@ -351,10 +520,10 @@ new_cert_global(struct token_slot *slot)
 	sshbuf_free(b);
 
 	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
-	assert(rv == SCARD_S_SUCCESS);
+	VERIFY3S(rv, ==, SCARD_S_SUCCESS);
 
 	tks = piv_enumerate(ctx);
-	assert(tks != NULL);
+	VERIFY(tks != NULL);
 	VERIFY0(piv_system_token_find(tks, &tk));
 
 	VERIFY0(piv_txn_begin(tk));
@@ -369,7 +538,7 @@ new_cert_global(struct token_slot *slot)
 	csc.csc_slot = sl;
 	VERIFY0(piv_system_token_auth(tk));
 	VERIFY0(sshkey_certify_custom(certk, sl->ps_pubkey, NULL,
-	    piv_cert_signer, &csc));
+	    piv_ssh_cert_signer, &csc));
 
 	piv_txn_end(tk);
 	piv_release(tks);
@@ -377,10 +546,27 @@ new_cert_global(struct token_slot *slot)
 	VERIFY0(sshkey_to_blob(certk, &blob, &bloblen));
 	VERIFY3U(bloblen, >, 0);
 	VERIFY3U(bloblen, <, MAX_CERT_LEN);
+	slot->ts_certdata->tsd_len = 0;
 	bcopy(blob, slot->ts_certdata->tsd_data, bloblen);
 	slot->ts_certdata->tsd_len = bloblen;
 
+	VERIFY0(SCardReleaseContext(ctx));
+
+	sshkey_free(certk);
+	free(blob);
+
 	return (0);
+}
+
+static int
+new_cert_global(struct token_slot *slot)
+{
+	if (slot->ts_type == SLOT_ASYM_AUTH) {
+		return (new_cert_global_ssh(slot));
+	} else if (slot->ts_type == SLOT_ASYM_CERT_SIGN) {
+		return (new_cert_global_x509(slot));
+	}
+	VERIFY(0);
 }
 
 static int
