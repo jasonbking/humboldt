@@ -36,6 +36,11 @@
 #include "libssh/sshbuf.h"
 #include "libssh/sshkey.h"
 
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/objects.h>
+
 /*
  * This is the "agent" process in the soft-token. It is forked off by the
  * "supervisor" process and is responsible for listening for clients on the
@@ -110,6 +115,7 @@ enum port_events {
 };
 
 struct client_state {
+	zoneid_t cs_zid;
 	int cs_fd;
 	struct sockaddr_un cs_peer;
 	ucred_t *cs_ucred;
@@ -142,6 +148,11 @@ static uint8_t last_cookie;
 static mutex_t clients_mtx;
 static struct client_state *clients;
 static int clport;
+
+static const char *zone_uuid;
+static const char *zone_alias;
+static const char *zone_owner;
+static nvlist_t *zone_tags;
 
 #define	N_THREADS	8
 static thread_t reactor_threads[N_THREADS];
@@ -228,6 +239,274 @@ process_request_identities(struct client_state *cl)
 	sshbuf_free(msg);
 }
 
+static int
+validate_cert_payload(struct client_state *cl, struct token_slot *slot,
+    u_char *data, size_t dlen)
+{
+	X509_CINF *cinf = NULL;
+	X509_NAME *issu, *subj, *nm;
+	X509_NAME_ENTRY *ent;
+	ASN1_OBJECT *obj;
+	X509_EXTENSION *ext;
+	time_t *tm;
+	ASN1_STRING *str;
+	const char *d, *ou;
+	u_char *ptr;
+	size_t len;
+	int nid, i, count, kcnt, ki;
+	char tmp[256];
+	const char *uuid = NULL, *hostname = NULL;
+	boolean_t issu_has_uuid = B_FALSE, subj_has_uuid = B_FALSE,
+	    subj_has_title = B_FALSE, has_basic = B_FALSE, has_ku = B_FALSE;
+
+	ptr = data;
+	if (d2i_X509_CINF(&cinf, &ptr, dlen) == NULL) {
+		char errbuf[128];
+		unsigned long err = ERR_peek_last_error();
+		ERR_load_crypto_strings();
+		ERR_error_string(err, errbuf);
+
+		bunyan_log(WARN, "d2i_X509_CINF on sign payload failed",
+		    "openssl_err", BNY_STRING, errbuf,
+		    NULL);
+		return (EINVAL);
+	}
+	VERIFY(cinf != NULL);
+
+	if (ptr < (data + dlen)) {
+		bunyan_log(WARN, "sign payload has extra data",
+		    "payload_len", BNY_UINT, dlen,
+		    "consumed", BNY_UINT, (ptr - data),
+		    NULL);
+		X509_CINF_free(cinf);
+		return (EINVAL);
+	}
+
+	if (OBJ_obj2nid(cinf->signature->algorithm) !=
+	    NID_sha256WithRSAEncryption) {
+		bunyan_log(WARN, "sign payload sets wrong algo",
+		    "nid", BNY_INT, cinf->signature->algorithm,
+		    NULL);
+		X509_CINF_free(cinf);
+		return (EINVAL);
+	}
+
+	if (X509_cmp_current_time(cinf->validity->notBefore) > 0)
+		goto err;
+	if (X509_cmp_current_time(cinf->validity->notAfter) <= 0)
+		goto err;
+
+	tm = time(NULL);
+	tm += 305;
+	if (X509_cmp_time(cinf->validity->notAfter, tm) >= 0)
+		goto err;
+
+	issu = cinf->issuer;
+	subj = cinf->subject;
+
+	if (cl->cs_zid == GLOBAL_ZONEID) {
+		uuid = getenv("SYSTEM_UUID");
+		VERIFY(uuid != NULL);
+		VERIFY3U(strlen(uuid), >, 0);
+
+		hostname = getenv("SYSTEM_HOSTNAME");
+		VERIFY(hostname != NULL);
+
+		count = X509_NAME_entry_count(issu);
+		for (i = 0; i < count; ++i) {
+			ent = X509_NAME_get_entry(issu, i);
+			VERIFY(ent != NULL);
+
+			obj = X509_NAME_ENTRY_get_object(ent);
+			VERIFY(obj != NULL);
+			str = X509_NAME_ENTRY_get_data(ent);
+			VERIFY(str != NULL);
+			d = ASN1_STRING_data(str);
+			VERIFY(d != NULL);
+
+			switch (OBJ_obj2nid(obj)) {
+			case NID_commonName:
+				if (strcmp(d, hostname) != 0)
+					goto err;
+				break;
+			case NID_title:
+				if (strcmp(d, slot->ts_name) != 0)
+					goto err;
+				break;
+			case NID_userId:
+				if (strcmp(d, uuid) != 0)
+					goto err;
+				issu_has_uuid = B_TRUE;
+				break;
+			case NID_domainComponent:
+				if (strcmp(d, getenv("SYSTEM_DC")) != 0)
+					goto err;
+				break;
+			default:
+				goto err;
+			}
+		}
+
+	} else {
+		count = X509_NAME_entry_count(issu);
+		for (i = 0; i < count; ++i) {
+			ent = X509_NAME_get_entry(issu, i);
+			VERIFY(ent != NULL);
+
+			obj = X509_NAME_ENTRY_get_object(ent);
+			VERIFY(obj != NULL);
+			str = X509_NAME_ENTRY_get_data(ent);
+			VERIFY(str != NULL);
+			d = ASN1_STRING_data(str);
+			VERIFY(d != NULL);
+
+			switch (OBJ_obj2nid(obj)) {
+			case NID_commonName:
+				if (strcmp(d, zone_uuid) != 0)
+					goto err;
+				issu_has_uuid = B_TRUE;
+				break;
+			case NID_title:
+				if (strcmp(d, slot->ts_name) != 0)
+					goto err;
+				break;
+			case NID_userId:
+				if (strcmp(d, zone_owner) != 0)
+					goto err;
+				break;
+			case NID_domainComponent:
+				if (strcmp(d, getenv("SYSTEM_DC")) != 0)
+					goto err;
+				break;
+			default:
+				goto err;
+			}
+		}
+	}
+
+	if (!issu_has_uuid)
+		goto err;
+
+	if (cl->cs_zid == GLOBAL_ZONEID) {
+		X509_CINF_free(cinf);
+		return (0);
+	}
+
+	count = X509_NAME_entry_count(subj);
+	for (i = 0; i < count; ++i) {
+		ent = X509_NAME_get_entry(subj, i);
+		VERIFY(ent != NULL);
+
+		obj = X509_NAME_ENTRY_get_object(ent);
+		VERIFY(obj != NULL);
+		str = X509_NAME_ENTRY_get_data(ent);
+		VERIFY(str != NULL);
+		d = ASN1_STRING_data(str);
+		VERIFY(d != NULL);
+
+		switch (OBJ_obj2nid(obj)) {
+		case NID_commonName:
+			if (strcmp(d, zone_uuid) != 0)
+				goto err;
+			subj_has_uuid = B_TRUE;
+			break;
+		case NID_title:
+			if (strcmp(d, "in-zone.key") != 0)
+				goto err;
+			subj_has_title = B_TRUE;
+			break;
+		case NID_userId:
+			if (strcmp(d, zone_owner) != 0)
+				goto err;
+			break;
+		case NID_domainComponent:
+			if (strcmp(d, getenv("SYSTEM_DC")) != 0)
+				goto err;
+			break;
+		case NID_organizationalUnitName:
+			if (!nvlist_lookup_string(zone_tags, "sdc_role", &ou) &&
+			    strcmp(d, ou) == 0) {
+				break;
+			}
+			if (!nvlist_lookup_string(zone_tags, "manta_role",
+			    &ou) && strcmp(d, ou) == 0) {
+				break;
+			}
+			if (!nvlist_lookup_string(zone_tags, "role", &ou)) {
+				const size_t rlen = strlen(d);
+				const char *ptr = strstr(ou, d);
+				if (ptr != NULL && (ptr == ou ||
+				    *(ptr - 1) == ',') && (ptr[rlen] == ',' ||
+				    ptr[rlen] == '\0')) {
+					break;
+				}
+			}
+			goto err;
+		default:
+			goto err;
+		}
+	}
+
+	if (!subj_has_uuid || !subj_has_title)
+		goto err;
+
+	count = X509v3_get_ext_count(cinf->extensions);
+	if (count < 1)
+		goto err;
+	for (i = 0; i < count; ++i) {
+		BASIC_CONSTRAINTS *basic;
+		ASN1_BIT_STRING *keyusage;
+
+		ext = X509v3_get_ext(cinf->extensions, i);
+		VERIFY(ext != NULL);
+
+		obj = X509_EXTENSION_get_object(ext);
+		VERIFY(obj != NULL);
+
+		switch (OBJ_obj2nid(obj)) {
+		case NID_basic_constraints:
+			basic = (BASIC_CONSTRAINTS *)X509V3_EXT_d2i(ext);
+			if (basic->ca != 0) {
+				BASIC_CONSTRAINTS_free(basic);
+				goto err;
+			}
+			has_basic = B_TRUE;
+			BASIC_CONSTRAINTS_free(basic);
+			break;
+		case NID_key_usage:
+			keyusage = (ASN1_BIT_STRING *)X509V3_EXT_d2i(ext);
+			/* Bit 5 = keyCertSign */
+			if (ASN1_BIT_STRING_get_bit(keyusage, 5)) {
+				ASN1_BIT_STRING_free(keyusage);
+				goto err;
+			}
+			/* Bit 6 = cRLSign */
+			if (ASN1_BIT_STRING_get_bit(keyusage, 6)) {
+				ASN1_BIT_STRING_free(keyusage);
+				goto err;
+			}
+			has_ku = B_TRUE;
+			ASN1_BIT_STRING_free(keyusage);
+			break;
+		case NID_ext_key_usage:
+			break;
+		default:
+			goto err;
+		}
+	}
+
+	if (!has_basic || !has_ku)
+		goto err;
+
+	X509_CINF_free(cinf);
+	return (0);
+
+err:
+	X509_CINF_free(cinf);
+	return (EPERM);
+
+}
+
 static void
 process_sign_request(struct client_state *cl)
 {
@@ -255,6 +534,21 @@ process_sign_request(struct client_state *cl)
 			break;
 	}
 	if (slot == NULL) {
+		send_status(cl, B_FALSE);
+		goto out;
+	}
+
+	switch (slot->ts_type) {
+	case SLOT_ASYM_CERT_SIGN:
+		rv = validate_cert_payload(cl, slot, data, dlen);
+		if (rv != 0) {
+			send_status(cl, B_FALSE);
+			goto out;
+		}
+		break;
+	case SLOT_ASYM_AUTH:
+		break;
+	default:
 		send_status(cl, B_FALSE);
 		goto out;
 	}
@@ -483,7 +777,7 @@ rearm:
 }
 
 void
-agent_main(zoneid_t zid, int listensock, int ctlfd)
+agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 {
 	int portfd;
 	struct ctl_cmd cmd;
@@ -559,6 +853,13 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 	VERIFY0(setppriv(PRIV_SET, PRIV_EFFECTIVE, pset));
 
 	priv_freeset(pset);
+
+	if (zinfo != NULL) {
+		VERIFY0(nvlist_lookup_string(zinfo, "uuid", &zone_uuid));
+		VERIFY0(nvlist_lookup_string(zinfo, "alias", &zone_alias));
+		VERIFY0(nvlist_lookup_string(zinfo, "owner_uuid", &zone_owner));
+		VERIFY0(nvlist_lookup_nvlist(zinfo, "tags", &zone_tags));
+	}
 
 	/*
 	 * This protects the list of client state structs (one per incoming UDS
@@ -743,6 +1044,7 @@ agent_main(zoneid_t zid, int listensock, int ctlfd)
 				VERIFY0(close(sockfd));
 				goto rearmlisten;
 			}
+			cl->cs_zid = zid;
 			cl->cs_fd = sockfd;
 			cl->cs_in = sshbuf_new();
 			assert(cl->cs_in != NULL);

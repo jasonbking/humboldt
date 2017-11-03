@@ -83,7 +83,7 @@ extern size_t slot_n;
 extern struct token_slot *token_slots;
 
 void supervisor_main(zoneid_t zid, int ctlfd);
-void agent_main(zoneid_t zid, int listensock, int ctlfd);
+void agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd);
 
 int read_cmd(int fd, struct ctl_cmd *cmd);
 int write_cmd(int fd, const struct ctl_cmd *cmd);

@@ -41,6 +41,7 @@
 #include "softtoken.h"
 #include "bunyan.h"
 #include "piv.h"
+#include "json.h"
 
 #include "libssh/sshkey.h"
 #include "libssh/cipher.h"
@@ -73,6 +74,11 @@ static pid_t agent_pid;
 static uint8_t id_seed;
 
 extern mutex_t *bunyan_wrmutex;
+
+static SCARDCONTEXT sup_ctx;
+static struct piv_token *sup_tks, *sup_systk;
+
+#define	MAX_ZINF_LEN	(32*1024)
 
 static inline char
 hex_digit(char nybble)
@@ -289,8 +295,7 @@ piv_ssh_cert_signer(const struct sshkey *key, u_char **sigp, size_t *lenp,
 static int
 new_cert_global_x509(struct token_slot *slot)
 {
-	SCARDCONTEXT ctx;
-	struct piv_token *tk, *tks;
+	struct piv_token *tk;
 	struct piv_slot *sl;
 	EVP_PKEY *pkey;
 	RSA *rsacp;
@@ -413,12 +418,7 @@ new_cert_global_x509(struct token_slot *slot)
 	VERIFY(tbs != NULL);
 	VERIFY3U(tbslen, >, 0);
 
-	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
-	VERIFY3S(rv, ==, SCARD_S_SUCCESS);
-
-	tks = piv_enumerate(ctx);
-	VERIFY(tks != NULL);
-	VERIFY0(piv_system_token_find(tks, &tk));
+	tk = sup_systk;
 
 	VERIFY0(piv_txn_begin(tk));
 	sl = piv_get_slot(tk, PIV_SLOT_SIGNATURE);
@@ -433,8 +433,6 @@ new_cert_global_x509(struct token_slot *slot)
 	VERIFY3U(hashalg, ==, SSH_DIGEST_SHA256);
 
 	piv_txn_end(tk);
-	piv_release(tks);
-	SCardReleaseContext(ctx);
 
 	M_ASN1_BIT_STRING_set(cert->signature, sig, siglen);
 	cert->signature->flags = ASN1_STRING_FLAG_BITS_LEFT;
@@ -464,8 +462,7 @@ new_cert_global_ssh(struct token_slot *slot)
 	const char *uuid;
 	time_t now;
 	int rv;
-	SCARDCONTEXT ctx;
-	struct piv_token *tk, *tks;
+	struct piv_token *tk;
 	struct piv_slot *sl;
 	struct certsign_ctx csc;
 	uint8_t *blob;
@@ -519,12 +516,7 @@ new_cert_global_ssh(struct token_slot *slot)
 
 	sshbuf_free(b);
 
-	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
-	VERIFY3S(rv, ==, SCARD_S_SUCCESS);
-
-	tks = piv_enumerate(ctx);
-	VERIFY(tks != NULL);
-	VERIFY0(piv_system_token_find(tks, &tk));
+	tk = sup_systk;
 
 	VERIFY0(piv_txn_begin(tk));
 	sl = piv_get_slot(tk, PIV_SLOT_SIGNATURE);
@@ -541,7 +533,6 @@ new_cert_global_ssh(struct token_slot *slot)
 	    piv_ssh_cert_signer, &csc));
 
 	piv_txn_end(tk);
-	piv_release(tks);
 
 	VERIFY0(sshkey_to_blob(certk, &blob, &bloblen));
 	VERIFY3U(bloblen, >, 0);
@@ -549,8 +540,6 @@ new_cert_global_ssh(struct token_slot *slot)
 	slot->ts_certdata->tsd_len = 0;
 	bcopy(blob, slot->ts_certdata->tsd_data, bloblen);
 	slot->ts_certdata->tsd_len = bloblen;
-
-	VERIFY0(SCardReleaseContext(ctx));
 
 	sshkey_free(certk);
 	free(blob);
@@ -601,7 +590,7 @@ unlock_key(struct token_slot *slot)
 	struct piv_ecdh_box *box;
 	nvlist_t *nv = slot->ts_nvl;
 	int rv, i;
-	SCARDCONTEXT ctx;
+
 	uchar_t *boxd, *key, *iv, *encdata;
 	uint_t boxdlen, keylen, ivlen, authlen, blocksz, enclen;
 	const struct sshcipher *cipher;
@@ -617,15 +606,7 @@ unlock_key(struct token_slot *slot)
 	VERIFY3P(tms, !=, NULL);
 	VERIFY0(bny_timer_begin(tms));
 
-	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
-	assert(rv == SCARD_S_SUCCESS);
-
-	VERIFY0(bny_timer_next(tms, "scard_establish"));
-
-	tks = piv_enumerate(ctx);
-	assert(tks != NULL);
-
-	VERIFY0(bny_timer_next(tms, "find_yubikeys"));
+	tks = sup_systk;
 
 	VERIFY0(nvlist_lookup_byte_array(nv, "local-box", &boxd, &boxdlen));
 	VERIFY0(piv_box_from_binary(boxd, boxdlen, &box));
@@ -663,7 +644,6 @@ unlock_key(struct token_slot *slot)
 
 	VERIFY0(piv_box_take_data(box, &key, &keylen));
 	piv_box_free(box);
-	piv_release(tks);
 
 	VERIFY0(bny_timer_next(tms, "ecdh_kd"));
 
@@ -715,19 +695,12 @@ generate_keys(const char *zonename, const char *keydir)
 {
 	struct sshkey *authkey;
 	struct sshkey *certkey;
-	struct piv_token *tks, *tk = NULL;
+	struct piv_token *tk = NULL;
 	int rv, i;
-	SCARDCONTEXT ctx;
 	struct token_slot tpl;
 	bzero(&tpl, sizeof (tpl));
 
-	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
-	assert(rv == SCARD_S_SUCCESS);
-
-	tks = piv_enumerate(ctx);
-	assert(tks != NULL);
-
-	VERIFY0(piv_system_token_find(tks, &tk));
+	tk = sup_systk;
 	VERIFY3P(tk, !=, NULL);
 
 	rv = sshkey_generate(KEY_ED25519, 256, &authkey);
@@ -745,8 +718,6 @@ generate_keys(const char *zonename, const char *keydir)
 	tpl.ts_name = "cert.key";
 	encrypt_and_write_key(certkey, tk, keydir, &tpl);
 	sshkey_free(certkey);
-
-	piv_release(tks);
 }
 
 static void
@@ -940,7 +911,8 @@ supervisor_panic(void)
 }
 
 static void
-supervisor_loop(zoneid_t zid, int ctlfd, int kidfd, int logfd, int listensock)
+supervisor_loop(zoneid_t zid, nvlist_t *zinfo, int ctlfd, int kidfd, int logfd,
+    int listensock)
 {
 	int portfd;
 	port_event_t ev;
@@ -1105,11 +1077,71 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	struct sockaddr_un addr;
 	int listensock;
 	ssize_t len;
-	int kidpipe[2], logpipe[2];
+	pid_t kid;
+	int kidpipe[2], logpipe[2], vmpipe[2];
 	struct token_slot *slot;
 	priv_set_t *pset;
+	int rv;
+	int32_t v;
+	nvlist_t *zinfo = NULL;
+	char *zinfbuf;
+	size_t zinflen;
+	FILE *vmpipef;
+	nvlist_parse_json_error_t jsonerr;
+	const char *uuid;
 
 	bunyan_set_name("supervisor");
+
+	len = getzonenamebyid(zid, zonename, sizeof (zonename));
+	VERIFY3U(len, >, 0);
+	zonename[len] = '\0';
+
+	VERIFY0(pipe(vmpipe));
+
+	if (zid != GLOBAL_ZONEID) {
+		/* Go fetch info about the zone from vmadm. */
+		kid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
+		VERIFY(kid != -1);
+		if (kid == 0) {
+			VERIFY0(close(vmpipe[0]));
+
+			VERIFY3S(dup2(vmpipe[1], 1), ==, 1);
+			VERIFY3S(dup2(vmpipe[1], 2), ==, 2);
+
+			VERIFY0(execlp("/usr/sbin/vmadm", "vmadm",
+			    "get", zonename, NULL));
+		}
+		VERIFY0(close(vmpipe[1]));
+
+		vmpipef = fdopen(vmpipe[0], "r");
+		VERIFY(vmpipef != NULL);
+		zinfbuf = calloc(1, MAX_ZINF_LEN);
+		VERIFY(zinfbuf != NULL);
+		zinflen = fread(zinfbuf, 1, MAX_ZINF_LEN, vmpipef);
+		VERIFY3U(zinflen, >, 0);
+		VERIFY3U(zinflen, <, MAX_ZINF_LEN);
+		VERIFY(feof(vmpipef));
+		VERIFY0(fclose(vmpipef));
+
+		zinfbuf[zinflen] = '\0';
+
+		if (nvlist_parse_json(zinfbuf, zinflen, &zinfo,
+		    NVJSON_FORCE_INTEGER, &jsonerr) != 0) {
+			bunyan_log(ERROR, "vmadm json parse failure",
+			    "errno", BNY_INT, jsonerr.nje_errno,
+			    "pos", BNY_INT, jsonerr.nje_pos,
+			    "err", BNY_STRING, jsonerr.nje_message,
+			    "json", BNY_STRING, zinfbuf,
+			    NULL);
+			VERIFY(0);
+		}
+		VERIFY(zinfo != NULL);
+
+		VERIFY0(nvlist_lookup_int32(zinfo, "v", &v));
+		VERIFY3S(v, ==, 1);
+		VERIFY0(nvlist_lookup_string(zinfo, "uuid", &uuid));
+		VERIFY0(strcmp(uuid, zonename));
+	}
 
 	id_seed = arc4random_uniform(255);
 
@@ -1140,10 +1172,6 @@ supervisor_main(zoneid_t zid, int ctlfd)
 
 	VERIFY0(setppriv(PRIV_SET, PRIV_PERMITTED, pset));
 	VERIFY0(setppriv(PRIV_SET, PRIV_EFFECTIVE, pset));
-
-	len = getzonenamebyid(zid, zonename, sizeof (zonename));
-	assert(len > 0);
-	zonename[len] = '\0';
 
 	bunyan_log(DEBUG, "starting supervisor for zone",
 	    "zoneid", BNY_INT, zid,
@@ -1193,7 +1221,7 @@ supervisor_main(zoneid_t zid, int ctlfd)
 		VERIFY3S(dup2(logpipe[1], 2), ==, 2);
 		bunyan_unshare();
 
-		agent_main(zid, listensock, kidpipe[1]);
+		agent_main(zid, zinfo, listensock, kidpipe[1]);
 		bunyan_log(ERROR, "agent_main returned", NULL);
 		exit(1);
 	}
@@ -1216,9 +1244,16 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	VERIFY0(setppriv(PRIV_SET, PRIV_EFFECTIVE, pset));
 	priv_freeset(pset);
 
+	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &sup_ctx);
+	VERIFY3S(rv, ==, SCARD_S_SUCCESS);
+
+	sup_tks = piv_enumerate(sup_ctx);
+	VERIFY(sup_tks != NULL);
+	VERIFY0(piv_system_token_find(sup_tks, &sup_systk));
+
 	if (zid == GLOBAL_ZONEID) {
 		VERIFY0(new_cert_global(token_slots));
 	}
 
-	supervisor_loop(zid, ctlfd, kidpipe[0], logpipe[0], listensock);
+	supervisor_loop(zid, zinfo, ctlfd, kidpipe[0], logpipe[0], listensock);
 }
