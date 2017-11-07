@@ -286,12 +286,25 @@ main(int argc, char *argv[])
 	const char *channel = "com.sun:zones:status";
 	char subid[128];
 	int rv;
+	const char *lvl;
 
 	bunyan_init();
 	bunyan_set_name("softtoken_mgr");
 	bunyan_log(INFO, "starting up", NULL);
 
 	bunyan_set_level(DEBUG);
+
+	lvl = getenv("LOG_LEVEL");
+	if (lvl != NULL) {
+		if (strcasecmp(lvl, "trace") == 0)
+			bunyan_set_level(TRACE);
+		if (strcasecmp(lvl, "info") == 0)
+			bunyan_set_level(INFO);
+		if (strcasecmp(lvl, "warn") == 0)
+			bunyan_set_level(WARN);
+		if (strcasecmp(lvl, "error") == 0)
+			bunyan_set_level(ERROR);
+	}
 
 	VERIFY0(mutex_init(&zonest_mutex,
 	    USYNC_THREAD | LOCK_ERRORCHECK, NULL));

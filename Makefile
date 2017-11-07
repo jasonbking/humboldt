@@ -65,7 +65,9 @@ _LIBSSH_SOURCES=		\
 	bcrypt-pbkdf.c		\
 	blowfish.c		\
 	rsa.c			\
-	base64.c
+	base64.c		\
+	atomicio.c		\
+	authfd.c
 LIBSSH_SOURCES=				\
 	$(_LIBSSH_SOURCES:%=libssh/%)	\
 	$(ED25519_SOURCES)		\

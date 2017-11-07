@@ -35,6 +35,7 @@
 #include "bunyan.h"
 #include "libssh/sshbuf.h"
 #include "libssh/sshkey.h"
+#include "libssh/authfd.h"
 
 #include <openssl/err.h>
 #include <openssl/x509.h>
@@ -72,42 +73,6 @@
  * a good place to cross-reference to understand the protocol and operations.
  */
 
-#define SSH_AGENTC_REQUEST_RSA_IDENTITIES	1
-#define SSH_AGENT_RSA_IDENTITIES_ANSWER		2
-#define SSH_AGENTC_RSA_CHALLENGE		3
-#define SSH_AGENT_RSA_RESPONSE			4
-#define SSH_AGENT_FAILURE			5
-#define SSH_AGENT_SUCCESS			6
-#define SSH_AGENTC_ADD_RSA_IDENTITY		7
-#define SSH_AGENTC_REMOVE_RSA_IDENTITY		8
-#define SSH_AGENTC_REMOVE_ALL_RSA_IDENTITIES	9
-
-#define SSH2_AGENTC_REQUEST_IDENTITIES		11
-#define SSH2_AGENT_IDENTITIES_ANSWER		12
-#define SSH2_AGENTC_SIGN_REQUEST		13
-#define SSH2_AGENT_SIGN_RESPONSE		14
-#define SSH2_AGENTC_ADD_IDENTITY		17
-#define SSH2_AGENTC_REMOVE_IDENTITY		18
-#define SSH2_AGENTC_REMOVE_ALL_IDENTITIES	19
-
-#define SSH_AGENTC_LOCK				22
-#define SSH_AGENTC_UNLOCK			23
-
-#define SSH_AGENTC_ADD_RSA_ID_CONSTRAINED	24
-#define SSH2_AGENTC_ADD_ID_CONSTRAINED		25
-#define SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED 26
-
-#define	SSH_AGENT_CONSTRAIN_LIFETIME		1
-#define	SSH_AGENT_CONSTRAIN_CONFIRM		2
-
-#define SSH2_AGENT_FAILURE			30
-
-#define SSH_COM_AGENT2_FAILURE			102
-
-#define	SSH_AGENT_OLD_SIGNATURE			0x01
-#define	SSH_AGENT_RSA_SHA2_256			0x02
-#define	SSH_AGENT_RSA_SHA2_512			0x04
-
 enum port_events {
 	EVENT_WANT_UNLOCK = 1,
 	EVENT_WANT_LOCK,
@@ -139,9 +104,12 @@ struct agent_slot {
 	enum as_state as_state;
 	cond_t as_stchg;
 	struct timespec as_lastused;
+	struct timespec as_renew;
 	size_t as_ref;
+	uint8_t as_renew_cookie;
 };
 
+static int acport;
 static int mport;
 static uint8_t last_cookie;
 
@@ -156,9 +124,18 @@ static nvlist_t *zone_tags;
 
 #define	N_THREADS	8
 static thread_t reactor_threads[N_THREADS];
+static thread_t acceptor_thread;
 
 extern void tspec_subtract(struct timespec *result, const struct timespec *x,
     const struct timespec *y);
+
+static inline uint8_t
+next_cookie(void)
+{
+	if (++last_cookie == 0)
+		return (++last_cookie);
+	return (last_cookie);
+}
 
 static void
 close_client(struct client_state *cl)
@@ -202,6 +179,7 @@ process_request_identities(struct client_state *cl)
 	struct sshbuf *msg;
 	struct token_slot *slot;
 	size_t n = 0;
+	char namebuf[256];
 
 	msg = sshbuf_new();
 	VERIFY3P(msg, !=, NULL);
@@ -210,6 +188,10 @@ process_request_identities(struct client_state *cl)
 		n++;
 		if (slot->ts_type == SLOT_ASYM_AUTH &&
 		    slot->ts_certdata->tsd_len > 0) {
+			n++;
+		}
+		if (slot->ts_type == SLOT_ASYM_AUTH &&
+		    slot->ts_chaindata->tsd_len > 0) {
 			n++;
 		}
 	}
@@ -232,7 +214,18 @@ process_request_identities(struct client_state *cl)
 			VERIFY0(sshbuf_put_string(msg,
 			    slot->ts_certdata->tsd_data,
 			    slot->ts_certdata->tsd_len));
-			VERIFY0(sshbuf_put_cstring(msg, slot->ts_name));
+			strlcpy(namebuf, slot->ts_name, sizeof (namebuf));
+			strlcat(namebuf, "-cert", sizeof (namebuf));
+			VERIFY0(sshbuf_put_cstring(msg, namebuf));
+		}
+		if (slot->ts_type == SLOT_ASYM_AUTH &&
+		    slot->ts_chaindata->tsd_len > 0) {
+			VERIFY0(sshbuf_put_string(msg,
+			    slot->ts_chaindata->tsd_data,
+			    slot->ts_chaindata->tsd_len));
+			strlcpy(namebuf, slot->ts_name, sizeof (namebuf));
+			strlcat(namebuf, "-parent-cert", sizeof (namebuf));
+			VERIFY0(sshbuf_put_cstring(msg, namebuf));
 		}
 	}
 	VERIFY0(sshbuf_put_stringb(cl->cs_out, msg));
@@ -258,6 +251,14 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 	const char *uuid = NULL, *hostname = NULL;
 	boolean_t issu_has_uuid = B_FALSE, subj_has_uuid = B_FALSE,
 	    subj_has_title = B_FALSE, has_basic = B_FALSE, has_ku = B_FALSE;
+
+	/*
+	 * The node-sshpk-agent code sends a "test" string to decide whether
+	 * we actually support RSA with SHA256 or not.
+	 */
+	if (dlen == 4 && bcmp(data, "test", 4) == 0) {
+		return (0);
+	}
 
 	ptr = data;
 	if (d2i_X509_CINF(&cinf, &ptr, dlen) == NULL) {
@@ -578,7 +579,7 @@ process_sign_request(struct client_state *cl)
 	 */
 	while (a->as_state != AS_UNLOCKED) {
 		if (a->as_state == AS_LOCKED) {
-			a->as_cookie = (++last_cookie);
+			a->as_cookie = next_cookie();
 			a->as_state = AS_UNLOCKING;
 			VERIFY0(port_send(mport, EVENT_WANT_UNLOCK, slot));
 			VERIFY0(cond_broadcast(&a->as_stchg));
@@ -627,6 +628,9 @@ out:
 	free(blob);
 	free(data);
 	sshkey_free(key);
+	if (sig != NULL)
+		explicit_bzero(sig, slen);
+	free(sig);
 }
 
 static int
@@ -695,6 +699,100 @@ try_process_message(struct client_state *cl)
 		send_status(cl, B_FALSE);
 	}
 	return (0);
+}
+
+struct acceptor_args {
+	zoneid_t a_zid;
+	int a_listensock;
+};
+
+static void *
+accept_reactor(void *arg)
+{
+	int rv;
+	int sockfd, listensock;
+	struct client_state *cl;
+	struct sockaddr_un raddr;
+	size_t raddrlen;
+	port_event_t ev;
+	struct acceptor_args *args;
+	zoneid_t zid, theirzid;
+
+	VERIFY(arg != NULL);
+	args = (struct acceptor_args *)arg;
+
+	listensock = args->a_listensock;
+	zid = args->a_zid;
+
+	while (1) {
+		rv = port_get(acport, &ev, NULL);
+		if (rv == -1 && errno == EINTR) {
+			continue;
+		} else {
+			assert(rv == 0);
+		}
+
+		if (ev.portev_source == PORT_SOURCE_USER) {
+			if (ev.portev_events == EVENT_STOP) {
+				return (NULL);
+			}
+			VERIFY0(ev.portev_events);
+			continue;
+		}
+
+		VERIFY3S(ev.portev_source, ==, PORT_SOURCE_FD);
+		VERIFY3S(ev.portev_object, ==, listensock);
+
+		/* A new connection has arrived. */
+		raddrlen = sizeof (raddr);
+		bzero(&raddr, sizeof (raddr));
+		sockfd = accept(listensock, (struct sockaddr *)&raddr,
+		    &raddrlen);
+		assert(sockfd > 0);
+
+		cl = calloc(1, sizeof (struct client_state));
+		assert(cl != NULL);
+		bcopy(&raddr, &cl->cs_peer, raddrlen);
+		if (getpeerucred(sockfd, &cl->cs_ucred) != 0) {
+			bunyan_log(ERROR,
+			    "failed to get peer ucred",
+			    "errno", BNY_INT, errno, NULL);
+			free(cl);
+			assert(close(sockfd) == 0);
+			goto rearmlisten;
+		}
+		theirzid = ucred_getzoneid(cl->cs_ucred);
+		if (theirzid != zid) {
+			bunyan_log(ERROR,
+			    "zoneid of client doesn't match server",
+			    "client_zoneid", BNY_INT, theirzid, NULL);
+			free(cl);
+			VERIFY0(close(sockfd));
+			goto rearmlisten;
+		}
+		cl->cs_zid = zid;
+		cl->cs_fd = sockfd;
+		cl->cs_in = sshbuf_new();
+		assert(cl->cs_in != NULL);
+		cl->cs_out = sshbuf_new();
+		assert(cl->cs_in != NULL);
+		cl->cs_req = sshbuf_new();
+		assert(cl->cs_in != NULL);
+		cl->cs_events = POLLIN;
+
+		mutex_enter(&clients_mtx);
+		if (clients != NULL)
+			clients->cs_prev = cl;
+		cl->cs_next = clients;
+		clients = cl;
+		mutex_exit(&clients_mtx);
+
+		VERIFY0(port_associate(clport,
+		    PORT_SOURCE_FD, cl->cs_fd, cl->cs_events, cl));
+rearmlisten:
+		VERIFY0(port_associate(acport,
+		    PORT_SOURCE_FD, listensock, POLLIN, NULL));
+	}
 }
 
 static void *
@@ -785,8 +883,6 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 	port_event_t ev;
 	timespec_t to;
 	int sockfd;
-	struct sockaddr_un raddr;
-	size_t raddrlen;
 	struct client_state *cl;
 	int i, rv;
 	zoneid_t theirzid;
@@ -794,6 +890,8 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 	struct agent_slot *as;
 	struct timespec tout, now, delta;
 	priv_set_t *pset;
+	boolean_t was_renew;
+	struct acceptor_args aa;
 
 	bunyan_set_name("agent");
 
@@ -808,9 +906,9 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 	VERIFY0(listen(listensock, 10));
 
 	/*
-	 * We use this port for events on this thread, including new clients
-	 * we need to accept(), messages from parent processes, and requests
-	 * to communicate with the parent (e.g. asking it to unlock a key).
+	 * We use this port for events on this thread: messages from parent
+	 * processes, and requests to communicate with the parent (e.g. asking
+	 * it to unlock a key).
 	 */
 	portfd = port_create();
 	assert(portfd > 0);
@@ -822,6 +920,10 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 	 */
 	clport = port_create();
 	assert(clport > 0);
+
+	/* This port is for accepting new sockets. */
+	acport = port_create();
+	VERIFY(acport > 0);
 
 	/* Now that we've made our ports and are listening, drop privs. */
 
@@ -893,6 +995,9 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 		    USYNC_THREAD | LOCK_ERRORCHECK, NULL));
 		VERIFY0(cond_init(&slot->ts_agent->as_stchg, USYNC_THREAD, 0));
 		slot->ts_agent->as_state = AS_LOCKED;
+		VERIFY0(clock_gettime(CLOCK_MONOTONIC,
+		    &slot->ts_agent->as_renew));
+		slot->ts_agent->as_renew.tv_sec -= 60;
 	}
 
 	/*
@@ -904,11 +1009,18 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 		    &reactor_threads[i]));
 	}
 
+	bzero(&aa, sizeof (aa));
+	aa.a_listensock = listensock;
+	aa.a_zid = zid;
+	/* The acceptor thread. */
+	VERIFY0(thr_create(NULL, 0, accept_reactor, &aa, 0,
+	    &acceptor_thread));
+
 	/* Timeout for port_get() */
 	bzero(&tout, sizeof (tout));
 	tout.tv_sec = 2;
 
-	VERIFY0(port_associate(portfd,
+	VERIFY0(port_associate(acport,
 	    PORT_SOURCE_FD, listensock, POLLIN, NULL));
 	VERIFY0(port_associate(portfd,
 	    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
@@ -964,6 +1076,7 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 				 * command, so find the slot it was for.
 				 */
 				as = NULL;
+				was_renew = B_FALSE;
 				for (slot = token_slots; slot != NULL;
 				    slot = slot->ts_next) {
 					as = slot->ts_agent;
@@ -972,9 +1085,15 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 						/* NOTE: no mutex_exit */
 						break;
 					}
+					if (as->as_renew_cookie ==
+					    cmd.cc_cookie) {
+						/* NOTE: no mutex_exit */
+						was_renew = B_TRUE;
+						break;
+					}
 					mutex_exit(&as->as_mtx);
 				}
-				if (as != NULL) {
+				if (as != NULL && !was_renew) {
 					as->as_cookie = 0;
 					VERIFY3U(cmd.cc_p1, ==, STATUS_OK);
 					switch (as->as_state) {
@@ -990,6 +1109,15 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 					VERIFY0(cond_broadcast(&as->as_stchg));
 					mutex_exit(&as->as_mtx);
 				}
+				if (as != NULL && was_renew) {
+					as->as_renew_cookie = 0;
+					if (cmd.cc_p1 == STATUS_OK) {
+						VERIFY0(clock_gettime(
+						    CLOCK_MONOTONIC,
+						    &as->as_renew));
+					}
+					mutex_exit(&as->as_mtx);
+				}
 				break;
 			case CMD_SHUTDOWN:
 				/*
@@ -997,10 +1125,12 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 				 * operation.
 				 */
 				bunyan_log(TRACE, "posting stop events", NULL);
+				VERIFY0(port_send(acport, EVENT_STOP, NULL));
 				for (i = 0; i < N_THREADS; ++i) {
 					VERIFY0(port_send(clport,
 					    EVENT_STOP, NULL));
 				}
+				VERIFY0(thr_join(acceptor_thread, NULL, NULL));
 				for (i = 0; i < N_THREADS; ++i) {
 					VERIFY0(thr_join(reactor_threads[i],
 					    NULL, NULL));
@@ -1015,57 +1145,6 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 			}
 			VERIFY0(port_associate(portfd,
 			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
-
-		} else if (ev.portev_object == listensock) {
-			/* A new connection has arrived. */
-			raddrlen = sizeof (raddr);
-			bzero(&raddr, sizeof (raddr));
-			sockfd = accept(listensock, (struct sockaddr *)&raddr,
-			    &raddrlen);
-			assert(sockfd > 0);
-
-			cl = calloc(1, sizeof (struct client_state));
-			assert(cl != NULL);
-			bcopy(&raddr, &cl->cs_peer, raddrlen);
-			if (getpeerucred(sockfd, &cl->cs_ucred) != 0) {
-				bunyan_log(ERROR,
-				    "failed to get peer ucred",
-				    "errno", BNY_INT, errno, NULL);
-				free(cl);
-				assert(close(sockfd) == 0);
-				goto rearmlisten;
-			}
-			theirzid = ucred_getzoneid(cl->cs_ucred);
-			if (theirzid != zid) {
-				bunyan_log(ERROR,
-				    "zoneid of client doesn't match server",
-				    "client_zoneid", BNY_INT, theirzid, NULL);
-				free(cl);
-				VERIFY0(close(sockfd));
-				goto rearmlisten;
-			}
-			cl->cs_zid = zid;
-			cl->cs_fd = sockfd;
-			cl->cs_in = sshbuf_new();
-			assert(cl->cs_in != NULL);
-			cl->cs_out = sshbuf_new();
-			assert(cl->cs_in != NULL);
-			cl->cs_req = sshbuf_new();
-			assert(cl->cs_in != NULL);
-			cl->cs_events = POLLIN;
-
-			mutex_enter(&clients_mtx);
-			if (clients != NULL)
-				clients->cs_prev = cl;
-			cl->cs_next = clients;
-			clients = cl;
-			mutex_exit(&clients_mtx);
-
-			VERIFY0(port_associate(clport,
-			    PORT_SOURCE_FD, cl->cs_fd, cl->cs_events, cl));
-rearmlisten:
-			VERIFY0(port_associate(portfd,
-			    PORT_SOURCE_FD, listensock, POLLIN, NULL));
 
 		} else {
 			assert(0);
@@ -1084,6 +1163,21 @@ checklock:
 		for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
 			as = slot->ts_agent;
 			mutex_enter(&as->as_mtx);
+			tspec_subtract(&delta, &now, &as->as_renew);
+			if (delta.tv_sec >= 60 && as->as_renew_cookie == 0) {
+				as->as_renew_cookie = next_cookie();
+
+				bunyan_log(INFO,
+				    "renewing certificate",
+				    "slot_name", BNY_STRING, slot->ts_name,
+				    NULL);
+
+				bzero(&cmd, sizeof (cmd));
+				cmd.cc_type = CMD_RENEW_CERT;
+				cmd.cc_cookie = as->as_renew_cookie;
+				cmd.cc_p1 = slot->ts_id;
+				VERIFY0(write_cmd(ctlfd, &cmd));
+			}
 			if (as->as_state != AS_UNLOCKED || as->as_ref > 0) {
 				mutex_exit(&as->as_mtx);
 				continue;
@@ -1095,7 +1189,7 @@ checklock:
 				    "keyname", BNY_STRING, slot->ts_name,
 				    "idle_sec", BNY_INT, (int)delta.tv_sec,
 				    NULL);
-				as->as_cookie = (++last_cookie);
+				as->as_cookie = next_cookie();
 				as->as_state = AS_LOCKING;
 				VERIFY0(port_send(mport, EVENT_WANT_LOCK,
 				    slot));

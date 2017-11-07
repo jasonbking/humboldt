@@ -191,12 +191,12 @@ bny_timers_free(struct bunyan_timers *tms)
 void
 bunyan_unshare(void)
 {
-	assert(bunyan_shmem != NULL);
+	VERIFY(bunyan_shmem != NULL);
 	VERIFY0(munmap(bunyan_shmem, sizeof (mutex_t)));
 	bunyan_shmem = NULL;
 	bunyan_shmem = mmap(0, sizeof (mutex_t), PROT_READ | PROT_WRITE,
 	    MAP_SHARED | MAP_ANON, -1, 0);
-	assert(bunyan_shmem != NULL);
+	VERIFY(bunyan_shmem != NULL);
 	bzero(bunyan_shmem, sizeof (mutex_t));
 	bunyan_wrmutex = (mutex_t *)bunyan_shmem;
 	VERIFY0(mutex_init(bunyan_wrmutex, USYNC_PROCESS | LOCK_ERRORCHECK,
@@ -206,10 +206,11 @@ bunyan_unshare(void)
 void
 bunyan_init(void)
 {
-	assert(bunyan_shmem == NULL);
+	VERIFY(bunyan_shmem == NULL);
+	bunyan_shmem = malloc(sizeof (mutex_t));
 	bunyan_shmem = mmap(0, sizeof (mutex_t), PROT_READ | PROT_WRITE,
 	    MAP_SHARED | MAP_ANON, -1, 0);
-	assert(bunyan_shmem != NULL);
+	VERIFY(bunyan_shmem != NULL);
 	bzero(bunyan_shmem, sizeof (mutex_t));
 	bunyan_wrmutex = (mutex_t *)bunyan_shmem;
 	VERIFY0(mutex_init(bunyan_wrmutex, USYNC_PROCESS | LOCK_ERRORCHECK,
@@ -232,7 +233,7 @@ static void
 bunyan_get_hostname(void)
 {
 	char *buf = calloc(1, MAXHOSTNAMELEN);
-	assert(buf != NULL);
+	VERIFY(buf != NULL);
 	VERIFY0(gethostname(buf, MAXHOSTNAMELEN));
 	if (bunyan_hostname != NULL)
 		free(bunyan_hostname);
@@ -247,7 +248,7 @@ bunyan_timestamp(char *buffer, size_t len)
 
 	VERIFY0(clock_gettime(CLOCK_REALTIME, &ts));
 	info = gmtime(&ts.tv_sec);
-	assert(info != NULL);
+	VERIFY(info != NULL);
 
 	snprintf(buffer, len, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
 	    info->tm_year + 1900, info->tm_mon + 1, info->tm_mday,
@@ -371,6 +372,7 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 			VERIFY0(nvlist_alloc(&nnvl, NV_UNIQUE_NAME, 0));
 			VERIFY0(bny_timers_to_nvl(tsval, nnvl));
 			VERIFY0(nvlist_add_nvlist(nvl, propname, nnvl));
+			nvlist_free(nnvl);
 			break;
 		case BNY_BIN_HEX:
 			binval = va_arg(ap, const uint8_t *);
@@ -380,13 +382,14 @@ bunyan_log(enum bunyan_log_level level, const char *msg, ...)
 			free(wstrval);
 			break;
 		default:
-			assert(0);
+			VERIFY(0);
 		}
 	}
 	va_end(ap);
 
 	mutex_enter(&bunyan_bmutex);
 	if (level < bunyan_min_level) {
+		nvlist_free(nvl);
 		mutex_exit(&bunyan_bmutex);
 		return;
 	}

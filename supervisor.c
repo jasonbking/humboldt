@@ -48,6 +48,7 @@
 #include "libssh/sshbuf.h"
 #include "libssh/ssherr.h"
 #include "libssh/ssh2.h"
+#include "libssh/authfd.h"
 #include "ed25519/crypto_api.h"
 
 /*
@@ -151,6 +152,7 @@ encrypt_and_write_key(struct sshkey *skey, struct piv_token *tk,
 	slot = piv_get_slot(tk, PIV_SLOT_KEY_MGMT);
 	if (slot == NULL) {
 		VERIFY0(piv_txn_begin(tk));
+		VERIFY0(piv_select(tk));
 		rv = piv_read_cert(tk, PIV_SLOT_KEY_MGMT);
 		piv_txn_end(tk);
 		VERIFY3U(rv, ==, 0);
@@ -241,6 +243,8 @@ encrypt_and_write_key(struct sshkey *skey, struct piv_token *tk,
 }
 
 struct certsign_ctx {
+	int csc_authfd;
+	struct sshkey *csc_pubkey;
 	struct piv_token *csc_tk;
 	struct piv_slot *csc_slot;
 };
@@ -307,7 +311,7 @@ new_cert_global_x509(struct token_slot *slot)
 	X509_NAME *subj, *issu;
 	X509_EXTENSION *ext;
 	X509V3_CTX x509ctx;
-	ASN1_TYPE null_parameter;
+	ASN1_TYPE *null_parameter;
 	uint8_t *tbs, *sig, *cdata;
 	size_t tbslen, siglen, cdlen;
 	uint flags;
@@ -362,27 +366,31 @@ new_cert_global_x509(struct token_slot *slot)
 
 	subj = X509_NAME_new();
 	VERIFY(subj != NULL);
-	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "T", MBSTRING_ASC,
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "title", MBSTRING_ASC,
 	    (unsigned char *)slot->ts_name, -1, -1, 0), ==, 1);
 	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
 	    (unsigned char *)hostname, -1, -1, 0), ==, 1);
 	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "UID", MBSTRING_ASC,
 	    (unsigned char *)uuid, -1, -1, 0), ==, 1);
-	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "DC", MBSTRING_ASC,
-	    (unsigned char *)getenv("SYSTEM_DC"), -1, -1, 0), ==, 1);
+	if (strlen(getenv("SYSTEM_DC")) > 0) {
+		VERIFY3S(X509_NAME_add_entry_by_txt(subj, "DC", MBSTRING_ASC,
+		    (unsigned char *)getenv("SYSTEM_DC"), -1, -1, 0), ==, 1);
+	}
 	VERIFY3S(X509_set_subject_name(cert, subj), ==, 1);
 	X509_NAME_free(subj);
 
 	issu = X509_NAME_new();
 	VERIFY(issu != NULL);
-	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "T", MBSTRING_ASC,
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "title", MBSTRING_ASC,
 	    (unsigned char *)"piv-9c", -1, -1, 0), ==, 1);
 	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
 	    (unsigned char *)hostname, -1, -1, 0), ==, 1);
 	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "UID", MBSTRING_ASC,
 	    (unsigned char *)uuid, -1, -1, 0), ==, 1);
-	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "DC", MBSTRING_ASC,
-	    (unsigned char *)getenv("SYSTEM_DC"), -1, -1, 0), ==, 1);
+	if (strlen(getenv("SYSTEM_DC")) > 0) {
+		VERIFY3S(X509_NAME_add_entry_by_txt(subj, "DC", MBSTRING_ASC,
+		    (unsigned char *)getenv("SYSTEM_DC"), -1, -1, 0), ==, 1);
+	}
 	VERIFY3S(X509_set_issuer_name(cert, issu), ==, 1);
 	X509_NAME_free(issu);
 
@@ -404,16 +412,23 @@ new_cert_global_x509(struct token_slot *slot)
 	VERIFY3S(X509_set_pubkey(cert, pkey), ==, 1);
 	EVP_PKEY_free(pkey);
 
-	cert->sig_alg->algorithm = OBJ_nid2obj(nid);
-	cert->cert_info->signature->algorithm = cert->sig_alg->algorithm;
+	cert->sig_alg->algorithm = OBJ_dup(OBJ_nid2obj(nid));
+	cert->cert_info->signature->algorithm = OBJ_dup(OBJ_nid2obj(nid));
 
-	bzero(&null_parameter, sizeof (null_parameter));
-	null_parameter.type = V_ASN1_NULL;
-	null_parameter.value.ptr = NULL;
-	cert->sig_alg->parameter = &null_parameter;
-	cert->cert_info->signature->parameter = &null_parameter;
+	null_parameter = ASN1_TYPE_new();
+	bzero(null_parameter, sizeof (*null_parameter));
+	null_parameter->type = V_ASN1_NULL;
+	null_parameter->value.ptr = NULL;
+	cert->sig_alg->parameter = null_parameter;
+
+	null_parameter = ASN1_TYPE_new();
+	bzero(null_parameter, sizeof (*null_parameter));
+	null_parameter->type = V_ASN1_NULL;
+	null_parameter->value.ptr = NULL;
+	cert->cert_info->signature->parameter = null_parameter;
 
 	cert->cert_info->enc.modified = 1;
+	tbs = NULL;
 	tbslen = i2d_X509_CINF(cert->cert_info, &tbs);
 	VERIFY(tbs != NULL);
 	VERIFY3U(tbslen, >, 0);
@@ -421,6 +436,7 @@ new_cert_global_x509(struct token_slot *slot)
 	tk = sup_systk;
 
 	VERIFY0(piv_txn_begin(tk));
+	VERIFY0(piv_select(tk));
 	sl = piv_get_slot(tk, PIV_SLOT_SIGNATURE);
 	if (sl == NULL) {
 		rv = piv_read_cert(tk, PIV_SLOT_SIGNATURE);
@@ -433,16 +449,20 @@ new_cert_global_x509(struct token_slot *slot)
 	VERIFY3U(hashalg, ==, SSH_DIGEST_SHA256);
 
 	piv_txn_end(tk);
+	OPENSSL_free(tbs);
 
 	M_ASN1_BIT_STRING_set(cert->signature, sig, siglen);
 	cert->signature->flags = ASN1_STRING_FLAG_BITS_LEFT;
 
+	cdata = NULL;
 	cdlen = i2d_X509(cert, &cdata);
 	VERIFY(cdata != NULL);
 	VERIFY3U(cdlen, >, 0);
 	VERIFY3U(cdlen, <, MAX_CERT_LEN);
 
 	X509_free(cert);
+	explicit_bzero(sig, siglen);
+	free(sig);
 
 	slot->ts_certdata->tsd_len = 0;
 	bcopy(cdata, slot->ts_certdata->tsd_data, cdlen);
@@ -498,7 +518,6 @@ new_cert_global_ssh(struct token_slot *slot)
 	cert->valid_after = now;
 	cert->valid_before = now + 300;
 
-	cert->extensions = sshbuf_new();
 	VERIFY(cert->extensions != NULL);
 
 	b = sshbuf_new();
@@ -519,6 +538,7 @@ new_cert_global_ssh(struct token_slot *slot)
 	tk = sup_systk;
 
 	VERIFY0(piv_txn_begin(tk));
+	VERIFY0(piv_select(tk));
 	sl = piv_get_slot(tk, PIV_SLOT_SIGNATURE);
 	if (sl == NULL) {
 		rv = piv_read_cert(tk, PIV_SLOT_SIGNATURE);
@@ -559,9 +579,207 @@ new_cert_global(struct token_slot *slot)
 }
 
 static int
-new_cert_zone(zoneid_t zid, struct token_slot *slot)
+agent_ssh_cert_signer(const struct sshkey *key, u_char **sigp, size_t *lenp,
+    const u_char *data, size_t datalen, const char *alg, u_int compat,
+    void *vctx)
+{
+	struct certsign_ctx *ctx;
+
+	VERIFY(vctx != NULL);
+	ctx = (struct certsign_ctx *)vctx;
+	VERIFY(ctx->csc_authfd > 0);
+	VERIFY(ctx->csc_pubkey != NULL);
+
+	VERIFY(ctx->csc_pubkey == key);
+
+	return (ssh_agent_sign(ctx->csc_authfd, key, sigp, lenp, data,
+	    datalen, alg, compat));
+}
+
+static int
+new_cert_zone_ssh(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
+    struct ssh_identitylist *idl, struct token_slot *slot)
+{
+	struct sshkey *certk;
+	struct sshkey_cert *cert;
+	struct sshbuf *b;
+	const char *uuid, *tmp;
+	time_t now;
+	int rv;
+	size_t i;
+	uint8_t *blob;
+	size_t bloblen;
+	struct sshkey *pcert = NULL;
+	nvlist_t *ztags;
+
+	VERIFY3U(slot->ts_type, ==, SLOT_ASYM_AUTH);
+	VERIFY3U(slot->ts_algo, ==, ALGO_ED_25519);
+	VERIFY3U(slot->ts_public->type, ==, KEY_ED25519);
+
+	for (i = 0; i < idl->nkeys; ++i) {
+		VERIFY(idl->keys[i] != NULL);
+		if (idl->keys[i]->type == KEY_ED25519 &&
+		    strcmp(idl->comments[i], "auth.key") == 0) {
+			csc->csc_pubkey = idl->keys[i];
+		} else if (idl->keys[i]->type == KEY_ED25519_CERT &&
+		    strcmp(idl->comments[i], "auth.key-cert") == 0) {
+			pcert = idl->keys[i];
+		}
+	}
+	VERIFY(csc->csc_pubkey != NULL);
+
+	VERIFY0(sshkey_demote(slot->ts_public, &certk));
+	VERIFY(certk != NULL);
+	VERIFY0(sshkey_to_certified(certk));
+
+	cert = certk->cert;
+	VERIFY(cert != NULL);
+
+	cert->type = SSH2_CERT_TYPE_HOST;
+	arc4random_buf(&cert->serial, sizeof (cert->serial));
+	cert->key_id = strdup(slot->ts_name);
+	VERIFY(cert->key_id != NULL);
+	cert->nprincipals = 1;
+	cert->principals = (char **)calloc(1, sizeof (char *));
+	VERIFY(cert->principals != NULL);
+
+	VERIFY0(nvlist_lookup_string(zinfo, "uuid", &uuid));
+	cert->principals[0] = strdup(uuid);
+
+	now = time(NULL);
+	cert->valid_after = now;
+	cert->valid_before = now + 300;
+
+	VERIFY(cert->extensions != NULL);
+
+	b = sshbuf_new();
+	VERIFY(b != NULL);
+
+	if (nvlist_lookup_string(zinfo, "alias", &tmp) == 0) {
+		VERIFY0(sshbuf_put_cstring(cert->extensions, "alias"));
+		VERIFY0(sshbuf_put_cstring(b, tmp));
+		VERIFY0(sshbuf_put_stringb(cert->extensions, b));
+		sshbuf_reset(b);
+	}
+
+	if (nvlist_lookup_string(zinfo, "owner_uuid", &tmp) == 0) {
+		VERIFY0(sshbuf_put_cstring(cert->extensions, "owner"));
+		VERIFY0(sshbuf_put_cstring(b, tmp));
+		VERIFY0(sshbuf_put_stringb(cert->extensions, b));
+		sshbuf_reset(b);
+	}
+
+	if (nvlist_lookup_string(zinfo, "datacenter_name", &tmp) == 0) {
+		VERIFY0(sshbuf_put_cstring(cert->extensions, "datacenter"));
+		VERIFY0(sshbuf_put_cstring(b, tmp));
+		VERIFY0(sshbuf_put_stringb(cert->extensions, b));
+		sshbuf_reset(b);
+	}
+
+	VERIFY0(nvlist_lookup_nvlist(zinfo, "tags", &ztags));
+	tmp = NULL;
+	rv = nvlist_lookup_string(ztags, "smartdc_role", &tmp);
+	if (rv != 0)
+		rv = nvlist_lookup_string(ztags, "manta_role", &tmp);
+	if (rv != 0)
+		rv = nvlist_lookup_string(ztags, "role", &tmp);
+
+	if (rv == 0) {
+		VERIFY(tmp != NULL);
+		VERIFY0(sshbuf_put_cstring(cert->extensions, "role"));
+		VERIFY0(sshbuf_put_cstring(b, tmp));
+		VERIFY0(sshbuf_put_stringb(cert->extensions, b));
+		sshbuf_reset(b);
+	}
+
+	sshbuf_free(b);
+	
+	VERIFY0(sshkey_certify_custom(certk, csc->csc_pubkey, NULL,
+	    agent_ssh_cert_signer, csc));
+
+	VERIFY0(sshkey_to_blob(certk, &blob, &bloblen));
+	VERIFY3U(bloblen, >, 0);
+	VERIFY3U(bloblen, <, MAX_CERT_LEN);
+	slot->ts_certdata->tsd_len = 0;
+	bcopy(blob, slot->ts_certdata->tsd_data, bloblen);
+	slot->ts_certdata->tsd_len = bloblen;
+
+	free(blob);
+	sshkey_free(certk);
+
+	if (pcert != NULL) {
+		VERIFY0(sshkey_to_blob(pcert, &blob, &bloblen));
+		VERIFY3U(bloblen, >, 0);
+		VERIFY3U(bloblen, <, MAX_CERT_LEN);
+		slot->ts_chaindata->tsd_len = 0;
+		bcopy(blob, slot->ts_chaindata->tsd_data, bloblen);
+		slot->ts_chaindata->tsd_len = bloblen;
+	}
+
+	return (0);
+}
+
+static int
+new_cert_zone_x509(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
+    struct ssh_identitylist *idl, struct token_slot *slot)
 {
 	return (0);
+}
+
+static int
+new_cert_zone(zoneid_t zid, nvlist_t *zinfo, struct token_slot *slot)
+{
+	struct certsign_ctx csc;
+	struct sockaddr_un sunaddr;
+	struct ssh_identitylist *idl;
+	int rv;
+
+	bzero(&csc, sizeof (csc));
+	bzero(&sunaddr, sizeof (sunaddr));
+	sunaddr.sun_family = AF_UNIX;
+	(void) snprintf(sunaddr.sun_path, sizeof (sunaddr.sun_path),
+	    TOKEN_SOCKET_PATH, "global");
+
+	csc.csc_authfd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (csc.csc_authfd < 0) {
+		bunyan_log(ERROR, "socket() failed",
+		    "errno", BNY_INT, errno,
+		    "err", BNY_STRING, strerror(errno));
+		return (errno);
+	}
+
+	if (connect(csc.csc_authfd, (struct sockaddr *)&sunaddr,
+	    sizeof (sunaddr)) < 0) {
+		bunyan_log(ERROR, "connect() failed",
+		    "errno", BNY_INT, errno,
+		    "err", BNY_STRING, strerror(errno));
+		VERIFY0(close(csc.csc_authfd));
+		return (errno);
+	}
+
+	rv = ssh_fetch_identitylist(csc.csc_authfd, &idl);
+	if (rv != 0) {
+		VERIFY0(close(csc.csc_authfd));
+		return (rv);
+	}
+
+	if (idl->nkeys < 1 || idl->keys == NULL) {
+		ssh_free_identitylist(idl);
+		VERIFY0(close(csc.csc_authfd));
+		return (ENOENT);
+	}
+
+	if (slot->ts_type == SLOT_ASYM_AUTH) {
+		rv = new_cert_zone_ssh(zid, zinfo, &csc, idl, slot);
+	} else if (slot->ts_type == SLOT_ASYM_CERT_SIGN) {
+		rv = new_cert_zone_x509(zid, zinfo, &csc, idl, slot);
+	} else {
+		VERIFY(0);
+	}
+
+	ssh_free_identitylist(idl);
+	VERIFY0(close(csc.csc_authfd));
+	return (rv);
 }
 
 /*
@@ -610,6 +828,7 @@ unlock_key(struct token_slot *slot)
 
 	VERIFY0(nvlist_lookup_byte_array(nv, "local-box", &boxd, &boxdlen));
 	VERIFY0(piv_box_from_binary(boxd, boxdlen, &box));
+
 	VERIFY0(piv_box_find_token(tks, box, &tk, &sl));
 
 	rv = piv_system_token_find(tks, &systk);
@@ -631,6 +850,7 @@ unlock_key(struct token_slot *slot)
 	attempts = 1;
 
 	VERIFY0(piv_txn_begin(tk));
+	VERIFY0(piv_select(tk));
 	if (tk == systk) {
 		VERIFY0(piv_system_token_auth(tk));
 	} else {
@@ -1033,7 +1253,7 @@ supervisor_loop(zoneid_t zid, nvlist_t *zinfo, int ctlfd, int kidfd, int logfd,
 				if (zid == GLOBAL_ZONEID) {
 					rv = new_cert_global(ts);
 				} else {
-					rv = new_cert_zone(zid, ts);
+					rv = new_cert_zone(zid, zinfo, ts);
 				}
 				if (rv == 0) {
 					bzero(&rcmd, sizeof (rcmd));
@@ -1058,7 +1278,6 @@ supervisor_loop(zoneid_t zid, nvlist_t *zinfo, int ctlfd, int kidfd, int logfd,
 			fgets(logline, MAX_LOG_LINE, logf);
 			mutex_enter(bunyan_wrmutex);
 			fputs(logline, stderr);
-			fputs("\n", stderr);
 			mutex_exit(bunyan_wrmutex);
 			VERIFY0(port_associate(portfd,
 			    PORT_SOURCE_FD, logfd, POLLIN, NULL));
@@ -1250,10 +1469,6 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	sup_tks = piv_enumerate(sup_ctx);
 	VERIFY(sup_tks != NULL);
 	VERIFY0(piv_system_token_find(sup_tks, &sup_systk));
-
-	if (zid == GLOBAL_ZONEID) {
-		VERIFY0(new_cert_global(token_slots));
-	}
 
 	supervisor_loop(zid, zinfo, ctlfd, kidpipe[0], logpipe[0], listensock);
 }

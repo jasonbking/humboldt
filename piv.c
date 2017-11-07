@@ -280,7 +280,7 @@ piv_system_token_find(struct piv_token *pks, struct piv_token **outpk)
 	struct piv_shm_state *st;
 	uchar_t *guid, *pubkey;
 	size_t guidlen, pklen;
-	struct sshkey *pkey;
+	struct sshkey *pkey = NULL;
 	struct piv_token *pk;
 	struct piv_slot *slot;
 	int rv;
@@ -333,6 +333,7 @@ piv_system_token_find(struct piv_token *pks, struct piv_token **outpk)
 	rv = 0;
 
 out:
+	sshkey_free(pkey);
 	piv_shm_free(st);
 	return (rv);
 }
@@ -848,7 +849,24 @@ piv_txn_begin(struct piv_token *key)
 {
 	assert(key->pt_intxn == B_FALSE);
 	LONG rv;
+	DWORD activeProtocol;
+retry:
 	rv = SCardBeginTransaction(key->pt_cardhdl);
+	if (rv == SCARD_W_RESET_CARD) {
+		rv = SCardReconnect(key->pt_cardhdl, SCARD_SHARE_SHARED,
+		    SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, SCARD_RESET_CARD,
+		    &activeProtocol);
+		if (rv == SCARD_S_SUCCESS) {
+			goto retry;
+		} else {
+			bunyan_log(ERROR, "SCardBeginTransaction failed, and "
+			    "attempt to ack reset failed",
+			    "reader", BNY_STRING, key->pt_rdrname,
+			    "err", BNY_STRING, pcsc_stringify_error(rv),
+			    NULL);
+			return (EIO);
+		}
+	}
 	if (rv != SCARD_S_SUCCESS) {
 		bunyan_log(ERROR, "SCardBeginTransaction failed",
 		    "reader", BNY_STRING, key->pt_rdrname,
@@ -1654,6 +1672,10 @@ piv_verify_pin(struct piv_token *pk, const char *pin, uint *retries)
 				rv = 0;
 			}
 		} else {
+			bunyan_log(DEBUG, "card did not accept INS_VERIFY"
+			    " for PIV",
+			    "reader", BNY_STRING, pk->pt_rdrname,
+			    "sw", BNY_UINT, (uint)apdu->a_sw, NULL);
 			rv = EINVAL;
 		}
 		piv_apdu_free(apdu);
@@ -2145,6 +2167,7 @@ piv_box_open_offline(struct sshkey *privkey, struct piv_ecdh_box *box)
 	key = calloc(1, dglen);
 	VERIFY3P(key, !=, NULL);
 	VERIFY0(ssh_digest_final(dgctx, key, dglen));
+	ssh_digest_free(dgctx);
 
 	explicit_bzero(sec, seclen);
 	free(sec);
@@ -2219,6 +2242,7 @@ piv_box_open(struct piv_token *tk, struct piv_slot *slot,
 	key = calloc(1, dglen);
 	VERIFY3P(key, !=, NULL);
 	VERIFY0(ssh_digest_final(dgctx, key, dglen));
+	ssh_digest_free(dgctx);
 
 	explicit_bzero(sec, seclen);
 	free(sec);
@@ -2308,6 +2332,7 @@ piv_box_seal_offline(struct sshkey *pubk, struct piv_ecdh_box *box)
 	key = calloc(1, dglen);
 	VERIFY3P(key, !=, NULL);
 	VERIFY0(ssh_digest_final(dgctx, key, dglen));
+	ssh_digest_free(dgctx);
 
 	explicit_bzero(sec, seclen);
 	free(sec);
@@ -2395,14 +2420,14 @@ piv_box_find_token(struct piv_token *tks, struct piv_ecdh_box *box,
 		for (pt = tks; pt != NULL; pt = pt->pt_next) {
 			s = piv_get_slot(pt, slotid);
 			if (s == NULL) {
-				rv = piv_txn_begin(pt);
-				if (rv != 0)
+				if (piv_txn_begin(pt) != 0)
 					continue;
-				rv = piv_read_cert(pt, slotid);
+				if (piv_select(pt) != 0 ||
+				    piv_read_cert(pt, slotid) != 0) {
+					piv_txn_end(pt);
+					continue;
+				}
 				piv_txn_end(pt);
-
-				if (rv != 0)
-					continue;
 				s = piv_get_slot(pt, slotid);
 			}
 			if (sshkey_equal_public(s->ps_pubkey, box->pdb_pub))
@@ -2414,14 +2439,14 @@ piv_box_find_token(struct piv_token *tks, struct piv_ecdh_box *box,
 
 	s = piv_get_slot(pt, box->pdb_slot);
 	if (s == NULL) {
-		rv = piv_txn_begin(pt);
-		if (rv != 0)
+		if ((rv = piv_txn_begin(pt)) != 0)
 			return (rv);
-		rv = piv_read_cert(pt, box->pdb_slot);
+		if ((rv = piv_select(pt)) != 0 ||
+		    (rv = piv_read_cert(pt, box->pdb_slot)) != 0) {
+		    	piv_txn_end(pt);
+			return (rv);
+		}
 		piv_txn_end(pt);
-
-		if (rv != 0)
-			return (rv);
 		s = piv_get_slot(pt, box->pdb_slot);
 	}
 
@@ -2560,6 +2585,7 @@ piv_box_from_binary(const uint8_t *input, size_t inplen,
 
 	*pbox = box;
 	sshbuf_free(buf);
+	sshbuf_free(kbuf);
 	return (0);
 
 out:

@@ -1,0 +1,16 @@
+#!/bin/bash
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+
+#
+# Copyright (c) 2017, Joyent, Inc.
+#
+
+export SYSTEM_UUID="$(sysinfo | json UUID)"
+export SYSTEM_HOSTNAME="$(sysinfo | json Hostname)"
+export SYSTEM_DC="$(sysinfo | json 'Datacenter Name')"
+
+/smartdc/bin/softtokend &
