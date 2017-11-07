@@ -23,12 +23,22 @@ struct ssh_identitylist {
 	char **comments;
 };
 
+struct ssh_x509chain {
+	size_t ncerts;
+	u_char **certs;
+	size_t *certlen;
+};
+
 int	ssh_fetch_identitylist(int sock, struct ssh_identitylist **idlp);
 void	ssh_free_identitylist(struct ssh_identitylist *idl);
 
 int	ssh_agent_sign(int sock, const struct sshkey *key,
 	    u_char **sigp, size_t *lenp,
 	    const u_char *data, size_t datalen, const char *alg, u_int compat);
+
+void	ssh_free_x509chain(struct ssh_x509chain *chain);
+int	ssh_agent_get_x509(int sock, const struct sshkey *key,
+    struct ssh_x509chain **pchain);
 
 /* Messages for the authentication agent connection. */
 #define SSH_AGENTC_REQUEST_RSA_IDENTITIES	1
@@ -62,6 +72,11 @@ int	ssh_agent_sign(int sock, const struct sshkey *key,
 #define SSH_AGENTC_ADD_RSA_ID_CONSTRAINED	24
 #define SSH2_AGENTC_ADD_ID_CONSTRAINED		25
 #define SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED 26
+
+#define SSH2_AGENTC_REQUEST_X509		250
+#define SSH2_AGENT_X509_RESPONSE		251
+#define SSH2_AGENTC_REQUEST_ECDH		252
+#define SSH2_AGENT_ECDH_RESPONSE		253
 
 #define	SSH_AGENT_CONSTRAIN_LIFETIME		1
 #define	SSH_AGENT_CONSTRAIN_CONFIRM		2

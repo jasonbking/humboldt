@@ -751,6 +751,46 @@ cmd_pubkey(uint slotid)
 }
 
 static void
+cmd_cert(uint slotid)
+{
+	struct piv_slot *cert;
+	char *buf;
+	int rv;
+
+	switch (slotid) {
+	case 0x9A:
+	case 0x9C:
+	case 0x9D:
+	case 0x9E:
+		break;
+	default:
+		fprintf(stderr, "error: PIV slot %02X cannot be "
+		    "used for asymmetric signing\n", slotid);
+		exit(3);
+	}
+
+	piv_txn_begin(selk);
+	assert_select(selk);
+	rv = piv_read_cert(selk, slotid);
+	piv_txn_end(selk);
+
+	cert = piv_get_slot(selk, slotid);
+
+	if (cert == NULL && rv == ENOENT) {
+		fprintf(stderr, "error: PIV slot %02X has no key present\n",
+		    slotid);
+		exit(1);
+	} else if (cert == NULL) {
+		fprintf(stderr, "error: failed to read cert in PIV slot %02X\n",
+		    slotid);
+		exit(1);
+	}
+
+	VERIFY(i2d_X509_fp(stdout, cert->ps_x509) == 1);
+	exit(0);
+}
+
+static void
 cmd_sign(uint slotid)
 {
 	struct piv_slot *cert;
@@ -1399,6 +1439,23 @@ main(int argc, char *argv[])
 
 		check_select_key();
 		cmd_pubkey(slotid);
+
+	} else if (strcmp(op, "cert") == 0) {
+		uint slotid;
+
+		if (optind >= argc) {
+			fprintf(stderr, "error: slot required\n");
+			usage();
+		}
+		slotid = strtol(argv[optind++], NULL, 16);
+
+		if (optind < argc) {
+			fprintf(stderr, "error: too many arguments\n");
+			usage();
+		}
+
+		check_select_key();
+		cmd_cert(slotid);
 
 	} else if (strcmp(op, "ecdh") == 0) {
 		uint slotid;

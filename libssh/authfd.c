@@ -38,6 +38,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/socket.h>
+#include <sys/debug.h>
 
 #include <fcntl.h>
 #include <stdlib.h>
@@ -156,6 +157,92 @@ agent_encode_alg(const struct sshkey *key, const char *alg)
 			return SSH_AGENT_RSA_SHA2_512;
 	}
 	return 0;
+}
+
+void
+ssh_free_x509chain(struct ssh_x509chain *chain)
+{
+	size_t i;
+	for (i = 0; i < chain->ncerts; ++i) {
+		explicit_bzero(chain->certs[i], chain->certlen[i]);
+		free(chain->certs[i]);
+	}
+	free(chain->certs);
+	free(chain->certlen);
+	free(chain);
+}
+
+int
+ssh_agent_get_x509(int sock, const struct sshkey *key,
+    struct ssh_x509chain **pchain)
+{
+	struct sshbuf *msg;
+	u_char *blob = NULL;
+	size_t blen = 0, len = 0;
+	u_int count, i;
+	struct ssh_x509chain *chain = NULL;
+	u_int flags = 0;
+	int r;
+	uint8_t type;
+
+	*pchain = NULL;
+
+	if ((msg = sshbuf_new()) == NULL)
+		return SSH_ERR_ALLOC_FAIL;
+	if ((r = sshkey_to_blob(key, &blob, &blen)) != 0)
+		goto out;
+
+	if ((r = sshbuf_put_u8(msg, SSH2_AGENTC_REQUEST_X509)) != 0 ||
+	    (r = sshbuf_put_string(msg, blob, blen)) != 0 ||
+	    (r = sshbuf_put_u32(msg, flags)) != 0)
+		goto out;
+
+	if ((r = ssh_request_reply(sock, msg, msg)) != 0)
+		goto out;
+	if ((r = sshbuf_get_u8(msg, &type)) != 0)
+		goto out;
+	if (agent_failed(type)) {
+		r = SSH_ERR_AGENT_FAILURE;
+		goto out;
+	} else if (type != SSH2_AGENT_X509_RESPONSE) {
+		r = SSH_ERR_INVALID_FORMAT;
+		goto out;
+	}
+
+	chain = calloc(1, sizeof (*chain));
+	if (chain == NULL) {
+		sshbuf_free(msg);
+		return (SSH_ERR_ALLOC_FAIL);
+	}
+
+	if ((r = sshbuf_get_u32(msg, &count)) != 0)
+		goto out;
+
+	chain->ncerts = count;
+	VERIFY3U(count, <, 1024);
+	chain->certs = calloc(count, sizeof (u_char *));
+	VERIFY(chain->certs != NULL);
+	chain->certlen = calloc(count, sizeof (size_t));
+	VERIFY(chain->certlen != NULL);
+
+	for (i = 0; i < count; ++i) {
+		if ((r = sshbuf_get_string(msg, &chain->certs[i], &len)) != 0)
+			goto out;
+		chain->certlen[i] = len;
+	}
+
+	*pchain = chain;
+	chain = NULL;
+	r = 0;
+out:
+	if (chain != NULL)
+		ssh_free_x509chain(chain);
+	if (blob != NULL) {
+		explicit_bzero(blob, blen);
+		free(blob);
+	}
+	sshbuf_free(msg);
+	return r;
 }
 
 /* ask agent to sign data, returns err.h code on error, 0 on success */

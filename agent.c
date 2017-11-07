@@ -232,6 +232,61 @@ process_request_identities(struct client_state *cl)
 	sshbuf_free(msg);
 }
 
+static void
+process_request_x509(struct client_state *cl)
+{
+	struct sshkey *key = NULL;
+	u_char *blob = NULL;
+	size_t blen;
+	u_int flags = 0, count = 0, i;
+	struct sshbuf *msg = NULL;
+	struct token_slot *slot;
+
+	VERIFY0(sshbuf_get_string(cl->cs_req, &blob, &blen));
+	VERIFY0(sshbuf_get_u32(cl->cs_req, &flags));
+
+	VERIFY0(sshkey_from_blob(blob, blen, &key));
+	for (slot = token_slots; slot != NULL; slot = slot->ts_next) {
+		if (sshkey_equal_public(key, slot->ts_public))
+			break;
+	}
+	if (slot == NULL) {
+		send_status(cl, B_FALSE);
+		goto out;
+	}
+	if (slot->ts_type != SLOT_ASYM_CERT_SIGN) {
+		send_status(cl, B_FALSE);
+		goto out;
+	}
+
+	if (slot->ts_certdata->tsd_len > 0)
+		++count;
+	if (slot->ts_chaindata->tsd_len > 0)
+		++count;
+
+	msg = sshbuf_new();
+	VERIFY(msg != NULL);
+
+	VERIFY0(sshbuf_put_u8(msg, SSH2_AGENT_X509_RESPONSE));
+	VERIFY0(sshbuf_put_u32(msg, count));
+
+	if (slot->ts_certdata->tsd_len > 0) {
+		VERIFY0(sshbuf_put_string(msg, slot->ts_certdata->tsd_data,
+		    slot->ts_certdata->tsd_len));
+	}
+	if (slot->ts_chaindata->tsd_len > 0) {
+		VERIFY0(sshbuf_put_string(msg, slot->ts_chaindata->tsd_data,
+		    slot->ts_chaindata->tsd_len));
+	}
+
+	VERIFY0(sshbuf_put_stringb(cl->cs_out, msg));
+
+out:
+	sshbuf_free(msg);
+	sshkey_free(key);
+	free(blob);
+}
+
 static int
 validate_cert_payload(struct client_state *cl, struct token_slot *slot,
     u_char *data, size_t dlen)
@@ -246,7 +301,7 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 	const char *d, *ou;
 	u_char *ptr;
 	size_t len;
-	int nid, i, count, kcnt, ki;
+	int nid, i, j, count, kcnt, ki;
 	char tmp[256];
 	const char *uuid = NULL, *hostname = NULL;
 	boolean_t issu_has_uuid = B_FALSE, subj_has_uuid = B_FALSE,
@@ -292,15 +347,21 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 		return (EINVAL);
 	}
 
-	if (X509_cmp_current_time(cinf->validity->notBefore) > 0)
+	if (X509_cmp_current_time(cinf->validity->notBefore) > 0) {
+		bunyan_log(TRACE, "cert notBefore after now", NULL);
 		goto err;
-	if (X509_cmp_current_time(cinf->validity->notAfter) <= 0)
+	}
+	if (X509_cmp_current_time(cinf->validity->notAfter) <= 0) {
+		bunyan_log(TRACE, "cert notAfter before now", NULL);
 		goto err;
+	}
 
 	tm = time(NULL);
 	tm += 305;
-	if (X509_cmp_time(cinf->validity->notAfter, tm) >= 0)
+	if (X509_cmp_time(cinf->validity->notAfter, &tm) >= 0) {
+		bunyan_log(TRACE, "cert expiry too long", NULL);
 		goto err;
+	}
 
 	issu = cinf->issuer;
 	subj = cinf->subject;
@@ -324,24 +385,41 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 			VERIFY(str != NULL);
 			d = ASN1_STRING_data(str);
 			VERIFY(d != NULL);
+			VERIFY3U(strlen(d), ==, ASN1_STRING_length(str));
 
 			switch (OBJ_obj2nid(obj)) {
 			case NID_commonName:
-				if (strcmp(d, hostname) != 0)
+				if (strcmp(d, hostname) != 0) {
+					bunyan_log(TRACE, "issu CN= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
 					goto err;
+				}
 				break;
 			case NID_title:
-				if (strcmp(d, slot->ts_name) != 0)
+				if (strcmp(d, slot->ts_name) != 0) {
+					bunyan_log(TRACE, "issu T= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
 					goto err;
+				}
 				break;
 			case NID_userId:
-				if (strcmp(d, uuid) != 0)
+				if (strcmp(d, uuid) != 0) {
+					bunyan_log(TRACE, "issu UID= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
 					goto err;
+				}
 				issu_has_uuid = B_TRUE;
 				break;
 			case NID_domainComponent:
-				if (strcmp(d, getenv("SYSTEM_DC")) != 0)
+				if (strcmp(d, getenv("SYSTEM_DC")) != 0) {
+					bunyan_log(TRACE, "issu DC= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
 					goto err;
+				}
 				break;
 			default:
 				goto err;
@@ -360,24 +438,49 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 			VERIFY(str != NULL);
 			d = ASN1_STRING_data(str);
 			VERIFY(d != NULL);
+			VERIFY3U(strlen(d), ==, ASN1_STRING_length(str));
 
 			switch (OBJ_obj2nid(obj)) {
 			case NID_commonName:
-				if (strcmp(d, zone_uuid) != 0)
+				if (strcmp(d, zone_uuid) != 0) {
+					bunyan_log(TRACE, "issu CN= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
 					goto err;
+				}
 				issu_has_uuid = B_TRUE;
 				break;
 			case NID_title:
-				if (strcmp(d, slot->ts_name) != 0)
+				if (strcmp(d, slot->ts_name) != 0) {
+					bunyan_log(TRACE, "issu T= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
 					goto err;
+				}
+				break;
+			case NID_givenName:
+				if (strcmp(d, zone_alias) != 0) {
+					bunyan_log(TRACE, "issu GN= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
+					goto err;
+				}
 				break;
 			case NID_userId:
-				if (strcmp(d, zone_owner) != 0)
+				if (strcmp(d, zone_owner) != 0) {
+					bunyan_log(TRACE, "issu UID= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
 					goto err;
+				}
 				break;
 			case NID_domainComponent:
-				if (strcmp(d, getenv("SYSTEM_DC")) != 0)
+				if (strcmp(d, getenv("SYSTEM_DC")) != 0) {
+					bunyan_log(TRACE, "issu DC= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
 					goto err;
+				}
 				break;
 			default:
 				goto err;
@@ -385,8 +488,10 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 		}
 	}
 
-	if (!issu_has_uuid)
+	if (!issu_has_uuid) {
+		bunyan_log(TRACE, "cert issu did not include UUID", NULL);
 		goto err;
+	}
 
 	if (cl->cs_zid == GLOBAL_ZONEID) {
 		X509_CINF_free(cinf);
@@ -404,25 +509,50 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 		VERIFY(str != NULL);
 		d = ASN1_STRING_data(str);
 		VERIFY(d != NULL);
+		VERIFY3U(strlen(d), ==, ASN1_STRING_length(str));
 
 		switch (OBJ_obj2nid(obj)) {
 		case NID_commonName:
-			if (strcmp(d, zone_uuid) != 0)
+			if (strcmp(d, zone_uuid) != 0) {
+				bunyan_log(TRACE, "subj CN= invalid",
+				    "value", BNY_STRING, d,
+				    NULL);
 				goto err;
+			}
 			subj_has_uuid = B_TRUE;
 			break;
 		case NID_title:
-			if (strcmp(d, "in-zone.key") != 0)
+			if (strcmp(d, "in-zone.key") != 0) {
+				bunyan_log(TRACE, "subj T= invalid",
+				    "value", BNY_STRING, d,
+				    NULL);
 				goto err;
+			}
 			subj_has_title = B_TRUE;
 			break;
 		case NID_userId:
-			if (strcmp(d, zone_owner) != 0)
+			if (strcmp(d, zone_owner) != 0) {
+				bunyan_log(TRACE, "subj UID= invalid",
+				    "value", BNY_STRING, d,
+				    NULL);
 				goto err;
+			}
 			break;
 		case NID_domainComponent:
-			if (strcmp(d, getenv("SYSTEM_DC")) != 0)
+			if (strcmp(d, getenv("SYSTEM_DC")) != 0) {
+				bunyan_log(TRACE, "subj DC= invalid",
+				    "value", BNY_STRING, d,
+				    NULL);
 				goto err;
+			}
+			break;
+		case NID_givenName:
+			if (strcmp(d, zone_alias) != 0) {
+				bunyan_log(TRACE, "subj GN= invalid",
+				    "value", BNY_STRING, d,
+				    NULL);
+				goto err;
+			}
 			break;
 		case NID_organizationalUnitName:
 			if (!nvlist_lookup_string(zone_tags, "sdc_role", &ou) &&
@@ -442,21 +572,32 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 					break;
 				}
 			}
+			bunyan_log(TRACE, "subj OU= invalid",
+			    "value", BNY_STRING, d,
+			    NULL);
 			goto err;
 		default:
+			bunyan_log(TRACE, "subj has unknown oid",
+			    "nid", BNY_UINT, OBJ_obj2nid(obj),
+			    NULL);
 			goto err;
 		}
 	}
 
-	if (!subj_has_uuid || !subj_has_title)
+	if (!subj_has_uuid || !subj_has_title) {
+		bunyan_log(TRACE, "cert subj missing uuid or title", NULL);
 		goto err;
+	}
 
 	count = X509v3_get_ext_count(cinf->extensions);
-	if (count < 1)
+	if (count < 1) {
+		bunyan_log(TRACE, "cert missing exts", NULL);
 		goto err;
+	}
 	for (i = 0; i < count; ++i) {
 		BASIC_CONSTRAINTS *basic;
 		ASN1_BIT_STRING *keyusage;
+		STACK_OF(GENERAL_NAME) *sans;
 
 		ext = X509v3_get_ext(cinf->extensions, i);
 		VERIFY(ext != NULL);
@@ -491,13 +632,54 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 			break;
 		case NID_ext_key_usage:
 			break;
+		case NID_subject_alt_name:
+			sans = (STACK_OF(GENERAL_NAME) *)X509V3_EXT_d2i(ext);
+			j = sk_GENERAL_NAME_num(sans);
+			for (j = j - 1; j >= 0; --j) {
+				const GENERAL_NAME *name =
+				    sk_GENERAL_NAME_value(sans, j);
+				const char *val;
+
+				switch (name->type) {
+				case GEN_DNS:
+					val = ASN1_STRING_data(name->d.dNSName);
+					VERIFY3U(strlen(val), ==,
+					    ASN1_STRING_length(
+					    name->d.dNSName));
+					if (strcmp(val, zone_uuid) != 0) {
+						sk_GENERAL_NAME_pop_free(sans,
+						    GENERAL_NAME_free);
+						goto err;
+					}
+					break;
+				case GEN_DIRNAME:
+					if (X509_NAME_cmp(name->d.directoryName,
+					    subj) != 0) {
+						sk_GENERAL_NAME_pop_free(sans,
+						    GENERAL_NAME_free);
+						goto err;
+					}
+					break;
+				default:
+					sk_GENERAL_NAME_pop_free(sans,
+					    GENERAL_NAME_free);
+					goto err;
+				}
+			}
+			sk_GENERAL_NAME_pop_free(sans, GENERAL_NAME_free);
+			break;
 		default:
+			bunyan_log(TRACE, "exts has unknown oid",
+			    "nid", BNY_UINT, OBJ_obj2nid(obj),
+			    NULL);
 			goto err;
 		}
 	}
 
-	if (!has_basic || !has_ku)
+	if (!has_basic || !has_ku) {
+		bunyan_log(TRACE, "cert missing constraints", NULL);
 		goto err;
+	}
 
 	X509_CINF_free(cinf);
 	return (0);
@@ -675,6 +857,9 @@ try_process_message(struct client_state *cl)
 		break;
 	case SSH2_AGENTC_REQUEST_IDENTITIES:
 		process_request_identities(cl);
+		break;
+	case SSH2_AGENTC_REQUEST_X509:
+		process_request_x509(cl);
 		break;
 	case SSH_AGENTC_LOCK:
 	case SSH_AGENTC_UNLOCK:
