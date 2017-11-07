@@ -714,6 +714,8 @@ new_cert_zone_ssh(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 		slot->ts_chaindata->tsd_len = 0;
 		bcopy(blob, slot->ts_chaindata->tsd_data, bloblen);
 		slot->ts_chaindata->tsd_len = bloblen;
+
+		free(blob);
 	}
 
 	return (0);
