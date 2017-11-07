@@ -26,7 +26,7 @@ extern boolean_t debug;
 
 struct tlv_state {
 	struct tlv_stack_frame *ts_stack;
-	size_t ts_stklvl;
+	int ts_stklvl;
 	uint8_t *ts_buf;
 	boolean_t ts_freebuf;
 	boolean_t ts_debug;

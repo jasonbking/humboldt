@@ -98,7 +98,6 @@ piv_shm_open(void)
 	key_t k = PIV_STATE_SHM_ID ^ zid;
 	int shmid;
 	struct piv_shm_state *st;
-	nv_alloc_t nvz;
 	int rv;
 	boolean_t newseg = B_FALSE;
 
@@ -163,7 +162,7 @@ again:
 		bunyan_log(DEBUG, "shm lock returned EOWNERDEAD");
 		if (st->pss_map->psh_len > 0 &&
 		    st->pss_map->psh_len < PIV_STATE_SHM_MAX_DATA) {
-			explicit_bzero(st->pss_map->psh_data,
+			explicit_bzero((void *)st->pss_map->psh_data,
 			    st->pss_map->psh_len);
 		}
 		st->pss_map->psh_len = 0;
@@ -176,8 +175,8 @@ again:
 
 	if (st->pss_map->psh_len > 0 &&
 	    st->pss_map->psh_len < PIV_STATE_SHM_MAX_DATA) {
-		rv = nvlist_xunpack(st->pss_map->psh_data, st->pss_map->psh_len,
-		    &st->pss_nvl, &st->pss_nva);
+		rv = nvlist_xunpack((char *)st->pss_map->psh_data,
+		    st->pss_map->psh_len, &st->pss_nvl, &st->pss_nva);
 		if (rv != 0) {
 			VERIFY0(mutex_unlock(&st->pss_map->psh_lock));
 			VERIFY0(shmdt((void *)st->pss_map));
@@ -206,7 +205,7 @@ piv_shm_update(struct piv_shm_state *st)
 	VERIFY3U(tmplen, <, PIV_STATE_SHM_MAX_DATA);
 
 	st->pss_map->psh_len = tmplen;
-	bcopy(tmp, st->pss_map->psh_data, tmplen);
+	bcopy(tmp, (void *)st->pss_map->psh_data, tmplen);
 
 	explicit_bzero(tmp, tmplen);
 	free(tmp);
@@ -279,7 +278,7 @@ piv_system_token_find(struct piv_token *pks, struct piv_token **outpk)
 {
 	struct piv_shm_state *st;
 	uchar_t *guid, *pubkey;
-	size_t guidlen, pklen;
+	uint_t guidlen, pklen;
 	struct sshkey *pkey = NULL;
 	struct piv_token *pk;
 	struct piv_slot *slot;
@@ -344,7 +343,7 @@ piv_system_token_auth(struct piv_token *pk)
 	struct piv_shm_state *st;
 	uchar_t *guid;
 	char *pin;
-	size_t guidlen;
+	uint_t guidlen;
 	int rv;
 	uint retries;
 
@@ -469,7 +468,7 @@ piv_read_chuid(struct piv_token *pk)
 	int rv;
 	struct apdu *apdu;
 	struct tlv_state *tlv;
-	uint tag, idx;
+	uint tag;
 
 	assert(pk->pt_intxn == B_TRUE);
 
@@ -650,7 +649,7 @@ piv_release(struct piv_token *pk)
 
 		ps = pk->pt_slots;
 		while (ps != NULL) {
-			OPENSSL_free(ps->ps_subj);
+			OPENSSL_free((void *)ps->ps_subj);
 			X509_free(ps->ps_x509);
 			sshkey_free(ps->ps_pubkey);
 			psnext = ps->ps_next;
@@ -1143,7 +1142,7 @@ piv_auth_admin(struct piv_token *pt, const uint8_t *key, size_t keylen)
 }
 
 int
-piv_write_file(struct piv_token *pt, uint tag, const char *data, size_t len)
+piv_write_file(struct piv_token *pt, uint tag, const uint8_t *data, size_t len)
 {
 	int rv;
 	struct apdu *apdu;
@@ -1156,7 +1155,7 @@ piv_write_file(struct piv_token *pt, uint tag, const char *data, size_t len)
 	tlv_write_uint(tlv, tag);
 	tlv_pop(tlv);
 	tlv_pushl(tlv, 0x53, len + 8);
-	tlv_write(tlv, data, 0, len);
+	tlv_write(tlv, (uint8_t *)data, 0, len);
 	tlv_pop(tlv);
 
 	apdu = piv_apdu_make(CLA_ISO, INS_PUT_DATA, 0x3F, 0xFF);
@@ -1371,7 +1370,7 @@ piv_read_cert(struct piv_token *pk, enum piv_slotid slotid)
 	int rv;
 	struct apdu *apdu;
 	struct tlv_state *tlv;
-	uint tag, idx;
+	uint tag;
 	uint8_t *ptr;
 	size_t len;
 	X509 *cert;
@@ -1471,7 +1470,7 @@ piv_read_cert(struct piv_token *pk, enum piv_slotid slotid)
 			return (ENOTSUP);
 		}
 
-		cert = d2i_X509(NULL, &ptr, len);
+		cert = d2i_X509(NULL, (const uint8_t **)&ptr, len);
 		if (cert == NULL) {
 			/* Getting error codes out of OpenSSL is weird. */
 			char errbuf[128];
@@ -1500,7 +1499,7 @@ piv_read_cert(struct piv_token *pk, enum piv_slotid slotid)
 			pc->ps_next = pk->pt_slots;
 			pk->pt_slots = pc;
 		} else {
-			OPENSSL_free(pc->ps_subj);
+			OPENSSL_free((void *)pc->ps_subj);
 			X509_free(pc->ps_x509);
 			sshkey_free(pc->ps_pubkey);
 		}
@@ -1587,16 +1586,16 @@ piv_change_pin(struct piv_token *pk, const char *pin, const char *newpin)
 {
 	int rv;
 	struct apdu *apdu;
-	char pinbuf[16];
+	uint8_t pinbuf[16];
 	size_t i;
 
 	assert(pk->pt_intxn == B_TRUE);
 
 	memset(pinbuf, 0xFF, sizeof (pinbuf));
-	for (i = 0; i < 8, pin[i] != 0; ++i)
+	for (i = 0; i < 8 && pin[i] != 0; ++i)
 		pinbuf[i] = pin[i];
 	assert(pin[i] == 0);
-	for (i = 8; i < 16, newpin[i - 8] != 0; ++i)
+	for (i = 8; i < 16 && newpin[i - 8] != 0; ++i)
 		pinbuf[i] = newpin[i - 8];
 	assert(newpin[i - 8] == 0);
 
@@ -1640,7 +1639,7 @@ piv_verify_pin(struct piv_token *pk, const char *pin, uint *retries)
 {
 	int rv;
 	struct apdu *apdu;
-	char pinbuf[8];
+	uint8_t pinbuf[8];
 	size_t i;
 
 	assert(pk->pt_intxn == B_TRUE);
@@ -1684,7 +1683,7 @@ piv_verify_pin(struct piv_token *pk, const char *pin, uint *retries)
 	}
 
 	memset(pinbuf, 0xFF, sizeof (pinbuf));
-	for (i = 0; i < 8, pin[i] != 0; ++i)
+	for (i = 0; i < 8 && pin[i] != 0; ++i)
 		pinbuf[i] = pin[i];
 	assert(pin[i] == 0);
 
@@ -1799,7 +1798,7 @@ piv_sign(struct piv_token *tk, struct piv_slot *slot, const uint8_t *data,
 		ssh_digest_free(hctx);
 	} else {
 		bunyan_log(TRACE, "doing hash on card", NULL);
-		buf = (char *)data;
+		buf = (uint8_t *)data;
 		inplen = datalen;
 	}
 
@@ -1970,7 +1969,6 @@ piv_ecdh(struct piv_token *pk, struct piv_slot *slot, struct sshkey *pubkey,
 	struct apdu *apdu;
 	struct tlv_state *tlv;
 	uint tag;
-	struct piv_slot *pc;
 	uint8_t *buf;
 	struct sshbuf *sbuf;
 	size_t len;
@@ -1984,7 +1982,7 @@ piv_ecdh(struct piv_token *pk, struct piv_slot *slot, struct sshkey *pubkey,
 	assert(rv == 0);
 	/* The buffer has the 32-bit length prefixed */
 	len = sshbuf_len(sbuf) - 4;
-	buf = sshbuf_ptr(sbuf) + 4;
+	buf = (uint8_t *)sshbuf_ptr(sbuf) + 4;
 	assert(*buf == 0x04);
 
 	tlv = tlv_init_write();
@@ -2023,7 +2021,7 @@ piv_ecdh(struct piv_token *pk, struct piv_slot *slot, struct sshkey *pubkey,
 			bunyan_log(DEBUG, "card returned invalid tag in "
 			    "PIV INS_GEN_AUTH response payload",
 			    "reader", BNY_STRING, pk->pt_rdrname,
-			    "slotid", BNY_UINT, (uint)pc->ps_slot,
+			    "slotid", BNY_UINT, (uint)slot->ps_slot,
 			    "tag", BNY_UINT, tag,
 			    "reply", BNY_BIN_HEX, apdu->a_reply.b_data +
 			    apdu->a_reply.b_offset, apdu->a_reply.b_len, NULL);
@@ -2082,8 +2080,8 @@ piv_box_free(struct piv_ecdh_box *box)
 	sshkey_free(box->pdb_ephem_pub);
 	sshkey_free(box->pdb_pub);
 	if (box->pdb_free_str) {
-		free(box->pdb_cipher);
-		free(box->pdb_kdf);
+		free((void *)box->pdb_cipher);
+		free((void *)box->pdb_kdf);
 	}
 	free(box->pdb_iv.b_data);
 	free(box->pdb_enc.b_data);
@@ -2129,14 +2127,12 @@ int
 piv_box_open_offline(struct sshkey *privkey, struct piv_ecdh_box *box)
 {
 	const struct sshcipher *cipher;
-	int rv;
 	int dgalg;
 	struct sshcipher_ctx *cctx;
 	struct ssh_digest_ctx *dgctx;
-	uint8_t *iv, *key, *dg, *sec, *enc, *plain;
+	uint8_t *iv, *key, *sec, *enc, *plain;
 	size_t ivlen, authlen, blocksz, keylen, dglen, seclen;
 	size_t fieldsz, plainlen, enclen;
-	size_t i, j;
 
 	VERIFY3P(box->pdb_cipher, !=, NULL);
 	VERIFY3P(box->pdb_kdf, !=, NULL);
@@ -2209,10 +2205,9 @@ piv_box_open(struct piv_token *tk, struct piv_slot *slot,
 	int dgalg;
 	struct sshcipher_ctx *cctx;
 	struct ssh_digest_ctx *dgctx;
-	uint8_t *iv, *key, *dg, *sec, *enc, *plain;
+	uint8_t *iv, *key, *sec, *enc, *plain;
 	size_t ivlen, authlen, blocksz, keylen, dglen, seclen;
-	size_t fieldsz, plainlen, enclen;
-	size_t i, j;
+	size_t plainlen, enclen;
 
 	VERIFY3P(box->pdb_cipher, !=, NULL);
 	VERIFY3P(box->pdb_kdf, !=, NULL);
@@ -2288,7 +2283,7 @@ piv_box_seal_offline(struct sshkey *pubk, struct piv_ecdh_box *box)
 	struct sshkey *pkey;
 	struct sshcipher_ctx *cctx;
 	struct ssh_digest_ctx *dgctx;
-	uint8_t *iv, *key, *dg, *sec, *enc, *plain;
+	uint8_t *iv, *key, *sec, *enc, *plain;
 	size_t ivlen, authlen, blocksz, keylen, dglen, seclen;
 	size_t fieldsz, plainlen, enclen;
 	size_t i, j;
@@ -2573,8 +2568,8 @@ piv_box_from_binary(const uint8_t *input, size_t inplen,
 	}
 
 	box->pdb_free_str = B_TRUE;
-	if (sshbuf_get_cstring(buf, &box->pdb_cipher, &len) ||
-	    sshbuf_get_cstring(buf, &box->pdb_kdf, &len) ||
+	if (sshbuf_get_cstring(buf, (char **)&box->pdb_cipher, &len) ||
+	    sshbuf_get_cstring(buf, (char **)&box->pdb_kdf, &len) ||
 	    sshbuf_get_string(buf, &box->pdb_iv.b_data, &box->pdb_iv.b_size) ||
 	    sshbuf_get_string(buf, &box->pdb_enc.b_data,
 	    &box->pdb_enc.b_size)) {
@@ -2593,8 +2588,8 @@ out:
 	sshbuf_free(kbuf);
 	sshkey_free(box->pdb_ephem_pub);
 	sshkey_free(box->pdb_pub);
-	free(box->pdb_cipher);
-	free(box->pdb_kdf);
+	free((void *)box->pdb_cipher);
+	free((void *)box->pdb_kdf);
 	free(box->pdb_iv.b_data);
 	free(box->pdb_enc.b_data);
 	free(box);

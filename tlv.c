@@ -184,7 +184,7 @@ tlv_read_tag(struct tlv_state *ts)
 	++ts->ts_stklvl;
 
 	if (ts->ts_debug) {
-		fprintf(stderr, "%*stag at +%d: 0x%x (%d bytes)\n",
+		fprintf(stderr, "%*stag at +%lu: 0x%x (%u bytes)\n",
 		    ts->ts_stklvl, "", origin, tag, len);
 	}
 
@@ -199,7 +199,7 @@ tlv_end(struct tlv_state *ts)
 {
 	struct tlv_stack_frame *sf = ts->ts_stack;
 	if (ts->ts_debug) {
-		fprintf(stderr, "%*send tag from +%d (%d bytes left)\n",
+		fprintf(stderr, "%*send tag from +%lu (%lu bytes left)\n",
 		    ts->ts_stklvl + 1, "", ts->ts_ptr, ts->ts_len);
 	}
 	assert(ts->ts_len == 0);
@@ -219,7 +219,7 @@ tlv_skip(struct tlv_state *ts)
 	struct tlv_stack_frame *sf = ts->ts_stack;
 	uint lvl;
 	if (ts->ts_debug) {
-		fprintf(stderr, "%*sskip tag from +%d (%d bytes left)\n",
+		fprintf(stderr, "%*sskip tag from +%lu (%lu bytes left)\n",
 		    ts->ts_stklvl + 1, "", ts->ts_ptr, ts->ts_len);
 	}
 	ts->ts_offset += ts->ts_len;

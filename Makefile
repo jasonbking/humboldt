@@ -9,9 +9,9 @@ CC=		$(STRAP_AREA)/usr/bin/gcc
 LD=		/usr/bin/ld
 CSTYLE=		$(KERNEL_SOURCE)/usr/src/tools/scripts/cstyle
 
-BASE_CFLAGS=	-gdwarf-2 -I$(PROTO_AREA)/usr/include
+BASE_CFLAGS=	-gdwarf-2 -I$(PROTO_AREA)/usr/include -Wall
 CFLAGS+=	$(BASE_CFLAGS)
-CFLAGS64=	-m64 -msave-args
+CFLAGS64=	-m64 -msave-args -Wall
 LDFLAGS+=	-L$(PROTO_AREA)/usr/lib
 
 YBENCH_SOURCES=			\
