@@ -394,20 +394,9 @@ new_cert_global_x509(struct token_slot *slot)
 	VERIFY3S(X509_set_subject_name(cert, subj), ==, 1);
 	X509_NAME_free(subj);
 
-	issu = X509_NAME_new();
+	issu = X509_get_subject_name(sl->ps_x509);
 	VERIFY(issu != NULL);
-	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "title", MBSTRING_ASC,
-	    (unsigned char *)"piv-9c", -1, -1, 0), ==, 1);
-	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
-	    (unsigned char *)hostname, -1, -1, 0), ==, 1);
-	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "UID", MBSTRING_ASC,
-	    (unsigned char *)uuid, -1, -1, 0), ==, 1);
-	if (strlen(getenv("SYSTEM_DC")) > 0) {
-		VERIFY3S(X509_NAME_add_entry_by_txt(subj, "DC", MBSTRING_ASC,
-		    (unsigned char *)getenv("SYSTEM_DC"), -1, -1, 0), ==, 1);
-	}
 	VERIFY3S(X509_set_issuer_name(cert, issu), ==, 1);
-	X509_NAME_free(issu);
 
 	X509V3_set_ctx_nodb(&x509ctx);
 	X509V3_set_ctx(&x509ctx, cert, cert, NULL, NULL, 0);
@@ -430,17 +419,19 @@ new_cert_global_x509(struct token_slot *slot)
 	cert->sig_alg->algorithm = OBJ_dup(OBJ_nid2obj(nid));
 	cert->cert_info->signature->algorithm = OBJ_dup(OBJ_nid2obj(nid));
 
-	null_parameter = ASN1_TYPE_new();
-	bzero(null_parameter, sizeof (*null_parameter));
-	null_parameter->type = V_ASN1_NULL;
-	null_parameter->value.ptr = NULL;
-	cert->sig_alg->parameter = null_parameter;
+	if (pub->type == KEY_RSA) {
+		null_parameter = ASN1_TYPE_new();
+		bzero(null_parameter, sizeof (*null_parameter));
+		null_parameter->type = V_ASN1_NULL;
+		null_parameter->value.ptr = NULL;
+		cert->sig_alg->parameter = null_parameter;
 
-	null_parameter = ASN1_TYPE_new();
-	bzero(null_parameter, sizeof (*null_parameter));
-	null_parameter->type = V_ASN1_NULL;
-	null_parameter->value.ptr = NULL;
-	cert->cert_info->signature->parameter = null_parameter;
+		null_parameter = ASN1_TYPE_new();
+		bzero(null_parameter, sizeof (*null_parameter));
+		null_parameter->type = V_ASN1_NULL;
+		null_parameter->value.ptr = NULL;
+		cert->cert_info->signature->parameter = null_parameter;
+	}
 
 	cert->cert_info->enc.modified = 1;
 	tbs = NULL;
@@ -741,13 +732,14 @@ new_cert_zone_x509(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 	X509_EXTENSION *ext;
 	X509V3_CTX x509ctx;
 	ASN1_TYPE *null_parameter;
-	uint8_t *tbs, *sig, *cdata, *ptr;
-	size_t tbslen, siglen, cdlen;
+	uint8_t *tbs, *sig, *sigdata, *cdata, *ptr;
+	size_t tbslen, siglen, sigdlen, cdlen;
 	int rv;
 	u_int i;
 	struct sshkey *pubk;
 	char *uuid, *tmp;
 	struct ssh_x509chain *chain = NULL;
+	struct sshbuf *sigbuf;
 
 	VERIFY3U(slot->ts_type, ==, SLOT_ASYM_CERT_SIGN);
 	VERIFY3U(slot->ts_algo, ==, ALGO_RSA_2048);
@@ -891,7 +883,15 @@ new_cert_zone_x509(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 
 	OPENSSL_free(tbs);
 
-	M_ASN1_BIT_STRING_set(cert->signature, sig, siglen);
+	sigbuf = sshbuf_from(sig, siglen);
+	VERIFY(sigbuf != NULL);
+	VERIFY0(sshbuf_get_cstring(sigbuf, &tmp, NULL));
+	VERIFY(tmp != NULL);
+	VERIFY3S(strcmp(tmp, "rsa-sha2-256"), ==, 0);
+	free(tmp);
+	VERIFY0(sshbuf_get_string(sigbuf, &sigdata, &sigdlen));
+
+	M_ASN1_BIT_STRING_set(cert->signature, sigdata, sigdlen);
 	cert->signature->flags = ASN1_STRING_FLAG_BITS_LEFT;
 
 	cdata = NULL;
@@ -901,8 +901,11 @@ new_cert_zone_x509(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 	VERIFY3U(cdlen, <, MAX_CERT_LEN);
 
 	X509_free(cert);
+	sshbuf_free(sigbuf);
 	explicit_bzero(sig, siglen);
 	free(sig);
+	explicit_bzero(sigdata, sigdlen);
+	free(sigdata);
 
 	slot->ts_certdata->tsd_len = 0;
 	bcopy(cdata, (void *)slot->ts_certdata->tsd_data, cdlen);
