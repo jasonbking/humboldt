@@ -1493,10 +1493,10 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	struct sockaddr_un addr;
 	int listensock;
 	ssize_t len;
-	pid_t kid;
+	pid_t kid, w;
 	int kidpipe[2], logpipe[2], vmpipe[2];
 	priv_set_t *pset;
-	int rv;
+	int rv, stat;
 	int32_t v;
 	nvlist_t *zinfo = NULL;
 	char *zinfbuf;
@@ -1527,6 +1527,12 @@ supervisor_main(zoneid_t zid, int ctlfd)
 			    "get", zonename, (char *)0));
 		}
 		VERIFY0(close(vmpipe[1]));
+
+		do {
+			w = waitpid(kid, &stat, 0);
+		} while (w == -1 && errno == EINTR);
+		assert(WIFEXITED(stat));
+		assert(WEXITSTATUS(stat) == 0);
 
 		vmpipef = fdopen(vmpipe[0], "r");
 		VERIFY(vmpipef != NULL);

@@ -24,6 +24,10 @@
 #include <sys/types.h>
 #include <sys/errno.h>
 #include <sys/debug.h>
+#include <sys/fork.h>
+#include <sys/wait.h>
+
+#include <libnvpair.h>
 
 #include "libssh/sshkey.h"
 #include "libssh/sshbuf.h"
@@ -36,6 +40,7 @@
 #include "tlv.h"
 #include "piv.h"
 #include "bunyan.h"
+#include "json.h"
 
 boolean_t debug = B_FALSE;
 static boolean_t parseable = B_FALSE;
@@ -50,6 +55,7 @@ static const uint8_t DEFAULT_ADMIN_KEY[] = {
 	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 };
 static const uint8_t *admin_key = DEFAULT_ADMIN_KEY;
+static nvlist_t *sysinfo;
 
 static struct piv_token *ks = NULL;
 static struct piv_token *selk = NULL;
@@ -57,6 +63,68 @@ static struct piv_token *sysk = NULL;
 static struct piv_slot *override = NULL;
 
 extern char *buf_to_hex(const uint8_t *buf, size_t len, boolean_t spaces);
+
+#define	MAX_SYSINF_LEN		16384
+
+static int
+fetch_sysinfo(void)
+{
+	pid_t kid, w;
+	int stat;
+	int vmpipe[2];
+	FILE *vmpipef;
+	char *zinfbuf;
+	size_t zinflen;
+	nvlist_parse_json_error_t jsonerr;
+
+	VERIFY0(pipe(vmpipe));
+
+	kid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
+	VERIFY(kid != -1);
+	if (kid == 0) {
+		VERIFY0(close(vmpipe[0]));
+
+		VERIFY3S(dup2(vmpipe[1], 1), ==, 1);
+		VERIFY3S(dup2(vmpipe[1], 2), ==, 2);
+
+		VERIFY0(execlp("sysinfo", "sysinfo", "-f", (char *)0));
+	}
+	VERIFY0(close(vmpipe[1]));
+
+	do {
+		w = waitpid(kid, &stat, 0);
+	} while (w == -1 && errno == EINTR);
+	VERIFY(WIFEXITED(stat));
+	if (WEXITSTATUS(stat) != 0) {
+		VERIFY0(close(vmpipe[0]));
+		return (ENOENT);
+	}
+
+	vmpipef = fdopen(vmpipe[0], "r");
+	VERIFY(vmpipef != NULL);
+	zinfbuf = calloc(1, MAX_SYSINF_LEN);
+	VERIFY(zinfbuf != NULL);
+	zinflen = fread(zinfbuf, 1, MAX_SYSINF_LEN, vmpipef);
+	VERIFY3U(zinflen, >, 0);
+	VERIFY3U(zinflen, <, MAX_SYSINF_LEN);
+	VERIFY(feof(vmpipef));
+	VERIFY0(fclose(vmpipef));
+
+	zinfbuf[zinflen] = '\0';
+
+	if (nvlist_parse_json(zinfbuf, zinflen, &sysinfo,
+	    NVJSON_FORCE_INTEGER, &jsonerr) != 0) {
+		bunyan_log(ERROR, "sysinfo json parse failure",
+		    "errno", BNY_INT, jsonerr.nje_errno,
+		    "pos", BNY_INT, jsonerr.nje_pos,
+		    "err", BNY_STRING, jsonerr.nje_message,
+		    "json", BNY_STRING, zinfbuf,
+		    NULL);
+		return (EINVAL);
+	}
+
+	return (0);
+}
 
 static uint8_t *
 parse_hex(const char *str, uint *outlen)
@@ -531,7 +599,8 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	X509 *cert;
 	EVP_PKEY *pkey;
 	X509_NAME *subj;
-	const char *name;
+	const char *name, *ku, *basic;
+	char *uuid, *hostname;
 	enum sshdigest_types wantalg, hashalg;
 	int nid;
 	ASN1_TYPE null_parameter;
@@ -541,19 +610,34 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	uint i;
 	BIGNUM *serial;
 	ASN1_INTEGER *serial_asn1;
+	X509_EXTENSION *ext;
+	X509V3_CTX x509ctx;
+
+	VERIFY0(fetch_sysinfo());
+	VERIFY0(nvlist_lookup_string(sysinfo, "Hostname", &hostname));
+	VERIFY0(nvlist_lookup_string(sysinfo, "UUID", &uuid));
 
 	switch (slotid) {
 	case 0x9A:
-		name = "PIV Authentication";
+		name = "piv-auth";
+		basic = "critical,CA:FALSE";
+		ku = "critical,digitalSignature,nonRepudiation";
 		break;
 	case 0x9C:
-		name = "Digital Signature";
+		name = "piv-sign";
+		basic = "critical,CA:TRUE";
+		ku = "critical,digitalSignature,nonRepudiation,"
+		    "keyCertSign,cRLSign";
 		break;
 	case 0x9D:
-		name = "Key Management";
+		name = "piv-key-mgmt";
+		basic = "critical,CA:FALSE";
+		ku = "critical,keyAgreement,keyEncipherment,dataEncipherment";
 		break;
 	case 0x9E:
-		name = "Card Authentication";
+		name = "piv-card-auth";
+		basic = "critical,CA:FALSE";
+		ku = "critical,digitalSignature,nonRepudiation";
 		break;
 	default:
 		fprintf(stderr, "error: PIV slot %02X cannot be "
@@ -627,10 +711,28 @@ cmd_generate(uint slotid, enum piv_alg alg)
 
 	subj = X509_NAME_new();
 	assert(subj != NULL);
-	assert(X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
+	assert(X509_NAME_add_entry_by_NID(subj, NID_title, MBSTRING_ASC,
 	    (unsigned char *)name, -1, -1, 0) == 1);
+	assert(X509_NAME_add_entry_by_NID(subj, NID_commonName, MBSTRING_ASC,
+	    (unsigned char *)hostname, -1, -1, 0) == 1);
+	assert(X509_NAME_add_entry_by_NID(subj, NID_userId, MBSTRING_ASC,
+	    (unsigned char *)uuid, -1, -1, 0) == 1);
 	assert(X509_set_subject_name(cert, subj) == 1);
 	assert(X509_set_issuer_name(cert, subj) == 1);
+
+	X509V3_set_ctx_nodb(&x509ctx);
+	X509V3_set_ctx(&x509ctx, cert, cert, NULL, NULL, 0);
+
+	ext = X509V3_EXT_conf_nid(NULL, &x509ctx, NID_basic_constraints,
+	    (char *)basic);
+	VERIFY(ext != NULL);
+	X509_add_ext(cert, ext, -1);
+	X509_EXTENSION_free(ext);
+
+	ext = X509V3_EXT_conf_nid(NULL, &x509ctx, NID_key_usage, (char *)ku);
+	VERIFY(ext != NULL);
+	X509_add_ext(cert, ext, -1);
+	X509_EXTENSION_free(ext);
 
 	assert(X509_set_pubkey(cert, pkey) == 1);
 

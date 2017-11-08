@@ -114,6 +114,8 @@ PIVTOOL_SOURCES=		\
 	tlv.c			\
 	piv.c			\
 	bunyan.c		\
+	json.c			\
+	custr.c			\
 	$(LIBSSH_SOURCES)
 PIVTOOL_HEADERS=		\
 	tlv.h			\
