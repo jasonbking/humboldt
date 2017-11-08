@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <sys/debug.h>
 #include <sys/param.h>
+#include <sys/stat.h>
 #include <dirent.h>
 #include <port.h>
 
@@ -212,7 +213,7 @@ process_request_identities(struct client_state *cl)
 		if (slot->ts_type == SLOT_ASYM_AUTH &&
 		    slot->ts_certdata->tsd_len > 0) {
 			VERIFY0(sshbuf_put_string(msg,
-			    slot->ts_certdata->tsd_data,
+			    (const void *)slot->ts_certdata->tsd_data,
 			    slot->ts_certdata->tsd_len));
 			strlcpy(namebuf, slot->ts_name, sizeof (namebuf));
 			strlcat(namebuf, "-cert", sizeof (namebuf));
@@ -221,7 +222,7 @@ process_request_identities(struct client_state *cl)
 		if (slot->ts_type == SLOT_ASYM_AUTH &&
 		    slot->ts_chaindata->tsd_len > 0) {
 			VERIFY0(sshbuf_put_string(msg,
-			    slot->ts_chaindata->tsd_data,
+			    (const void *)slot->ts_chaindata->tsd_data,
 			    slot->ts_chaindata->tsd_len));
 			strlcpy(namebuf, slot->ts_name, sizeof (namebuf));
 			strlcat(namebuf, "-parent-cert", sizeof (namebuf));
@@ -238,7 +239,7 @@ process_request_x509(struct client_state *cl)
 	struct sshkey *key = NULL;
 	u_char *blob = NULL;
 	size_t blen;
-	u_int flags = 0, count = 0, i;
+	u_int flags = 0, count = 0;
 	struct sshbuf *msg = NULL;
 	struct token_slot *slot;
 
@@ -271,11 +272,13 @@ process_request_x509(struct client_state *cl)
 	VERIFY0(sshbuf_put_u32(msg, count));
 
 	if (slot->ts_certdata->tsd_len > 0) {
-		VERIFY0(sshbuf_put_string(msg, slot->ts_certdata->tsd_data,
+		VERIFY0(sshbuf_put_string(msg,
+		    (const void *)slot->ts_certdata->tsd_data,
 		    slot->ts_certdata->tsd_len));
 	}
 	if (slot->ts_chaindata->tsd_len > 0) {
-		VERIFY0(sshbuf_put_string(msg, slot->ts_chaindata->tsd_data,
+		VERIFY0(sshbuf_put_string(msg,
+		    (const void *)slot->ts_chaindata->tsd_data,
 		    slot->ts_chaindata->tsd_len));
 	}
 
@@ -292,17 +295,15 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
     u_char *data, size_t dlen)
 {
 	X509_CINF *cinf = NULL;
-	X509_NAME *issu, *subj, *nm;
+	X509_NAME *issu, *subj;
 	X509_NAME_ENTRY *ent;
 	ASN1_OBJECT *obj;
 	X509_EXTENSION *ext;
-	time_t *tm;
+	time_t tm;
 	ASN1_STRING *str;
 	const char *d, *ou;
 	u_char *ptr;
-	size_t len;
-	int nid, i, j, count, kcnt, ki;
-	char tmp[256];
+	int i, j, count;
 	const char *uuid = NULL, *hostname = NULL;
 	boolean_t issu_has_uuid = B_FALSE, subj_has_uuid = B_FALSE,
 	    subj_has_title = B_FALSE, has_basic = B_FALSE, has_ku = B_FALSE;
@@ -316,7 +317,7 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 	}
 
 	ptr = data;
-	if (d2i_X509_CINF(&cinf, &ptr, dlen) == NULL) {
+	if (d2i_X509_CINF(&cinf, (const u_char **)&ptr, dlen) == NULL) {
 		char errbuf[128];
 		unsigned long err = ERR_peek_last_error();
 		ERR_load_crypto_strings();
@@ -383,7 +384,7 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 			VERIFY(obj != NULL);
 			str = X509_NAME_ENTRY_get_data(ent);
 			VERIFY(str != NULL);
-			d = ASN1_STRING_data(str);
+			d = (const char *)ASN1_STRING_data(str);
 			VERIFY(d != NULL);
 			VERIFY3U(strlen(d), ==, ASN1_STRING_length(str));
 
@@ -436,7 +437,7 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 			VERIFY(obj != NULL);
 			str = X509_NAME_ENTRY_get_data(ent);
 			VERIFY(str != NULL);
-			d = ASN1_STRING_data(str);
+			d = (const char *)ASN1_STRING_data(str);
 			VERIFY(d != NULL);
 			VERIFY3U(strlen(d), ==, ASN1_STRING_length(str));
 
@@ -507,7 +508,7 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 		VERIFY(obj != NULL);
 		str = X509_NAME_ENTRY_get_data(ent);
 		VERIFY(str != NULL);
-		d = ASN1_STRING_data(str);
+		d = (const char *)ASN1_STRING_data(str);
 		VERIFY(d != NULL);
 		VERIFY3U(strlen(d), ==, ASN1_STRING_length(str));
 
@@ -555,15 +556,16 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 			}
 			break;
 		case NID_organizationalUnitName:
-			if (!nvlist_lookup_string(zone_tags, "sdc_role", &ou) &&
-			    strcmp(d, ou) == 0) {
+			if (nvlist_lookup_string(zone_tags, "sdc_role",
+			    (char **)&ou) == 0 && strcmp(d, ou) == 0) {
 				break;
 			}
-			if (!nvlist_lookup_string(zone_tags, "manta_role",
-			    &ou) && strcmp(d, ou) == 0) {
+			if (nvlist_lookup_string(zone_tags, "manta_role",
+			    (char **)&ou) == 0 && strcmp(d, ou) == 0) {
 				break;
 			}
-			if (!nvlist_lookup_string(zone_tags, "role", &ou)) {
+			if (nvlist_lookup_string(zone_tags, "role",
+			    (char **)&ou) == 0) {
 				const size_t rlen = strlen(d);
 				const char *ptr = strstr(ou, d);
 				if (ptr != NULL && (ptr == ou ||
@@ -642,7 +644,8 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 
 				switch (name->type) {
 				case GEN_DNS:
-					val = ASN1_STRING_data(name->d.dNSName);
+					val = (const char *)ASN1_STRING_data(
+					    name->d.dNSName);
 					VERIFY3U(strlen(val), ==,
 					    ASN1_STRING_length(
 					    name->d.dNSName));
@@ -750,7 +753,8 @@ process_sign_request(struct client_state *cl)
 	 * process.
 	 */
 	if (++a->as_ref == 1) {
-		VERIFY0(mprotect(slot->ts_data, slot->ts_datasize, PROT_READ));
+		VERIFY0(mprotect((caddr_t)slot->ts_data, slot->ts_datasize,
+		    PROT_READ));
 	}
 
 	VERIFY0(clock_gettime(CLOCK_MONOTONIC, &a->as_lastused));
@@ -785,7 +789,8 @@ process_sign_request(struct client_state *cl)
 	/* We're done with the shared memory now, so we can release it. */
 	mutex_enter(&a->as_mtx);
 	if (--a->as_ref == 0) {
-		VERIFY0(mprotect(slot->ts_data, slot->ts_datasize, PROT_NONE));
+		VERIFY0(mprotect((caddr_t)slot->ts_data, slot->ts_datasize,
+		    PROT_NONE));
 	}
 	mutex_exit(&a->as_mtx);
 
@@ -822,7 +827,6 @@ try_process_message(struct client_state *cl)
 	size_t len;
 	int rv;
 	uint8_t type;
-	pid_t clientpid;
 
 	if (sshbuf_len(cl->cs_in) < 5)
 		return (ERR_INCOMPLETE);
@@ -984,7 +988,6 @@ static void *
 client_reactor(void *arg)
 {
 	port_event_t ev;
-	timespec_t to;
 	struct client_state *cl;
 	size_t len;
 	char *buf = calloc(1, 4096);
@@ -1066,11 +1069,7 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 	struct ctl_cmd cmd;
 	enum ctl_cmd_type cmdtype;
 	port_event_t ev;
-	timespec_t to;
-	int sockfd;
-	struct client_state *cl;
 	int i, rv;
-	zoneid_t theirzid;
 	struct token_slot *slot;
 	struct agent_slot *as;
 	struct timespec tout, now, delta;
@@ -1142,9 +1141,12 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 	priv_freeset(pset);
 
 	if (zinfo != NULL) {
-		VERIFY0(nvlist_lookup_string(zinfo, "uuid", &zone_uuid));
-		VERIFY0(nvlist_lookup_string(zinfo, "alias", &zone_alias));
-		VERIFY0(nvlist_lookup_string(zinfo, "owner_uuid", &zone_owner));
+		VERIFY0(nvlist_lookup_string(zinfo, "uuid",
+		    (char **)&zone_uuid));
+		VERIFY0(nvlist_lookup_string(zinfo, "alias",
+		    (char **)&zone_alias));
+		VERIFY0(nvlist_lookup_string(zinfo, "owner_uuid",
+		    (char **)&zone_owner));
 		VERIFY0(nvlist_lookup_nvlist(zinfo, "tags", &zone_tags));
 	}
 
@@ -1161,13 +1163,14 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 		 * Set all the shared pages to PROT_NONE until we unlock the
 		 * keys.
 		 */
-		VERIFY0(mprotect(slot->ts_data,
+		VERIFY0(mprotect((caddr_t)slot->ts_data,
 		    slot->ts_datasize + sizeof (struct token_slot_data),
 		    PROT_NONE));
 
 		/* Reading certs is ok */
-		VERIFY0(mprotect(slot->ts_certdata, MAX_CERT_LEN, PROT_READ));
-		VERIFY0(mprotect(slot->ts_chaindata, MAX_CHAIN_LEN,
+		VERIFY0(mprotect((caddr_t)slot->ts_certdata, MAX_CERT_LEN,
+		    PROT_READ));
+		VERIFY0(mprotect((caddr_t)slot->ts_chaindata, MAX_CHAIN_LEN,
 		    PROT_READ));
 
 		/*

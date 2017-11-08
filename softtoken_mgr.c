@@ -19,6 +19,7 @@
 #include <synch.h>
 #include <thread.h>
 #include <strings.h>
+#include <signal.h>
 
 #include <zone.h>
 #include <libsysevent.h>
@@ -285,7 +286,6 @@ main(int argc, char *argv[])
 {
 	const char *channel = "com.sun:zones:status";
 	char subid[128];
-	int rv;
 	const char *lvl;
 
 	bunyan_init();
@@ -312,7 +312,7 @@ main(int argc, char *argv[])
 	(void) signal(SIGCHLD, sigchld_handler);
 
 	VERIFY0(sysevent_evc_bind(channel, &evchan, 0));
-	snprintf(subid, sizeof (subid), "softtoken%ld", getpid());
+	snprintf(subid, sizeof (subid), "softtoken%u", getpid());
 	VERIFY0(sysevent_evc_subscribe(evchan, subid, EC_ALL, sysevc_handler,
 	    (void *)channel, 0));
 

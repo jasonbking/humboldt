@@ -153,7 +153,6 @@ int
 bny_timer_next(struct bunyan_timers *tms, const char *name)
 {
 	struct timespec now;
-	size_t idx;
 	struct timer_block *b;
 
 	if (clock_gettime(CLOCK_MONOTONIC, &now))
@@ -250,7 +249,7 @@ bunyan_timestamp(char *buffer, size_t len)
 	info = gmtime(&ts.tv_sec);
 	VERIFY(info != NULL);
 
-	snprintf(buffer, len, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+	snprintf(buffer, len, "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
 	    info->tm_year + 1900, info->tm_mon + 1, info->tm_mday,
 	    info->tm_hour, info->tm_min, info->tm_sec, ts.tv_nsec / 1000000);
 }
@@ -288,6 +287,8 @@ bunyan_set(const char *name1, enum bunyan_arg_type typ1, ...)
 			VERIFY0(nvlist_add_nvlist(nvl, propname, nvlval));
 			mutex_exit(&bunyan_bmutex);
 			break;
+		default:
+			VERIFY(0);
 		}
 
 		propname = va_arg(ap, const char *);

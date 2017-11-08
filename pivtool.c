@@ -108,13 +108,13 @@ read_stdin(size_t limit, size_t *outlen)
 
 	n = fread(buf, 1, limit * 3 - 1, stdin);
 	if (!feof(stdin)) {
-		fprintf(stderr, "error: input too long (max %d bytes)\n",
+		fprintf(stderr, "error: input too long (max %lu bytes)\n",
 		    limit);
 		exit(1);
 	}
 
 	if (n > limit) {
-		fprintf(stderr, "error: input too long (max %d bytes)\n",
+		fprintf(stderr, "error: input too long (max %lu bytes)\n",
 		    limit);
 		exit(1);
 	}
@@ -230,7 +230,6 @@ cmd_list(SCARDCONTEXT ctx)
 {
 	struct piv_token *pk;
 	struct piv_slot *slot;
-	int rv;
 	uint i;
 	char *buf = NULL;
 
@@ -451,7 +450,7 @@ cmd_set_system(void)
 		exit(4);
 	} else if (rv == EAGAIN) {
 		fprintf(stderr, "error: PIN code only has %d retries "
-		    "remaining, refusing to attempt unlock\n");
+		    "remaining, refusing to attempt unlock\n", retries);
 		exit(5);
 	} else if (rv != 0) {
 		fprintf(stderr, "error: failed to set system token (rv = %d)\n",
@@ -526,7 +525,6 @@ again:
 static void
 cmd_generate(uint slotid, enum piv_alg alg)
 {
-	struct piv_slot *slot;
 	char *buf;
 	int rv;
 	struct sshkey *pub;
@@ -754,7 +752,6 @@ static void
 cmd_cert(uint slotid)
 {
 	struct piv_slot *cert;
-	char *buf;
 	int rv;
 
 	switch (slotid) {
@@ -796,8 +793,7 @@ cmd_sign(uint slotid)
 	struct piv_slot *cert;
 	uint8_t *buf, *sig;
 	enum sshdigest_types hashalg;
-	struct ssh_digest_ctx *hctx;
-	size_t nread, dglen, inplen, siglen;
+	size_t inplen, siglen;
 	int rv;
 
 	switch (slotid) {
@@ -979,13 +975,10 @@ again:
 static void
 cmd_box_info(void)
 {
-	struct piv_token *tk;
-	struct piv_slot *sl;
 	struct piv_ecdh_box *box;
-	int rv;
 	size_t len;
 	uint8_t *buf;
-	char *guid;
+	char *hex;
 
 	buf = read_stdin(8192, &len);
 	assert(buf != NULL);
@@ -997,9 +990,9 @@ cmd_box_info(void)
 	}
 	free(buf);
 
-	buf = buf_to_hex(box->pdb_guid, sizeof (box->pdb_guid), B_FALSE);
-	printf("guid:         %s\n", buf);
-	free(buf);
+	hex = buf_to_hex(box->pdb_guid, sizeof (box->pdb_guid), B_FALSE);
+	printf("guid:         %s\n", hex);
+	free(hex);
 	printf("slot:         %02X\n", box->pdb_slot);
 
 	printf("pubkey:       ");
@@ -1012,8 +1005,8 @@ cmd_box_info(void)
 
 	printf("cipher:       %s\n", box->pdb_cipher);
 	printf("kdf:          %s\n", box->pdb_kdf);
-	printf("ivsize:       %d\n", box->pdb_iv.b_size);
-	printf("encsize:      %d\n", box->pdb_enc.b_size);
+	printf("ivsize:       %lu\n", box->pdb_iv.b_size);
+	printf("encsize:      %lu\n", box->pdb_enc.b_size);
 
 	exit(0);
 }
@@ -1023,8 +1016,9 @@ cmd_auth(uint slotid)
 {
 	struct piv_slot *cert;
 	struct sshkey *pubkey;
-	uint8_t *buf, *ptr;
-	size_t nread, boff;
+	uint8_t *buf;
+	char *ptr;
+	size_t boff;
 	int rv;
 
 	switch (slotid) {
@@ -1066,7 +1060,7 @@ cmd_auth(uint slotid)
 
 	pubkey = sshkey_new(cert->ps_pubkey->type);
 	assert(pubkey != NULL);
-	ptr = buf;
+	ptr = (char *)buf;
 	rv = sshkey_read(pubkey, &ptr);
 	if (rv != 0) {
 		fprintf(stderr, "error: failed to parse public key: %d\n",
@@ -1105,8 +1099,9 @@ cmd_ecdh(uint slotid)
 {
 	struct piv_slot *cert;
 	struct sshkey *pubkey;
-	uint8_t *buf, *ptr, *secret;
-	size_t nread, boff, seclen;
+	uint8_t *buf, *secret;
+	char *ptr;
+	size_t boff, seclen;
 	int rv;
 
 	switch (slotid) {
@@ -1158,7 +1153,7 @@ cmd_ecdh(uint slotid)
 
 	pubkey = sshkey_new(cert->ps_pubkey->type);
 	assert(pubkey != NULL);
-	ptr = buf;
+	ptr = (char *)buf;
 	rv = sshkey_read(pubkey, &ptr);
 	if (rv != 0) {
 		fprintf(stderr, "error: failed to parse public key: %d\n",
@@ -1238,7 +1233,6 @@ static void
 check_select_key(void)
 {
 	struct piv_token *t;
-	int rv;
 
 	if (ks == NULL) {
 		fprintf(stderr, "error: no PIV cards present\n");
@@ -1288,10 +1282,10 @@ main(int argc, char *argv[])
 	LONG rv;
 	SCARDCONTEXT ctx;
 	extern char *optarg;
-	extern int optind, optopt, opterr;
+	extern int optind;
 	int c;
 	uint len;
-	uint8_t *ptr;
+	char *ptr;
 
 	bunyan_init();
 	bunyan_set_name("pivtool");
@@ -1352,7 +1346,7 @@ main(int argc, char *argv[])
 			rv = sshkey_read(opubkey, &ptr);
 			if (rv != 0) {
 				fprintf(stderr, "error: failed to parse public "
-				    "key: %d\n", rv);
+				    "key: %ld\n", rv);
 				exit(3);
 			}
 			break;

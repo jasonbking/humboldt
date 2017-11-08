@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 #include <sys/debug.h>
 #include <sys/param.h>
+#include <sys/stat.h>
 #include <dirent.h>
 #include <port.h>
 
@@ -37,6 +38,8 @@
 
 #include <librename.h>
 #include <libnvpair.h>
+
+#include <openssl/err.h>
 
 #include "softtoken.h"
 #include "bunyan.h"
@@ -80,27 +83,6 @@ static SCARDCONTEXT sup_ctx;
 static struct piv_token *sup_tks, *sup_systk;
 
 #define	MAX_ZINF_LEN	(32*1024)
-
-static inline char
-hex_digit(char nybble)
-{
-	if (nybble >= 0xA)
-		return ('a' + (nybble - 0xA));
-	return ('0' + nybble);
-}
-
-static char *
-hex_buffer(const char *buf, size_t len)
-{
-	char *obuf = calloc(1, len * 2 + 1);
-	size_t i, j;
-	for (i = 0, j = 0; i < len; ++i) {
-		obuf[j++] = hex_digit((buf[i] & 0xf0) >> 4);
-		obuf[j++] = hex_digit(buf[i] & 0x0f);
-	}
-	obuf[j++] = 0;
-	return (obuf);
-}
 
 static void
 encrypt_and_write_key(struct sshkey *skey, struct piv_token *tk,
@@ -314,7 +296,6 @@ new_cert_global_x509(struct token_slot *slot)
 	ASN1_TYPE *null_parameter;
 	uint8_t *tbs, *sig, *cdata;
 	size_t tbslen, siglen, cdlen;
-	uint flags;
 	struct sshkey *pub;
 	int rv;
 	u_int i;
@@ -489,7 +470,7 @@ new_cert_global_x509(struct token_slot *slot)
 	free(sig);
 
 	slot->ts_certdata->tsd_len = 0;
-	bcopy(cdata, slot->ts_certdata->tsd_data, cdlen);
+	bcopy(cdata, (void *)slot->ts_certdata->tsd_data, cdlen);
 	slot->ts_certdata->tsd_len = cdlen;
 
 	OPENSSL_free(cdata);
@@ -582,7 +563,7 @@ new_cert_global_ssh(struct token_slot *slot)
 	VERIFY3U(bloblen, >, 0);
 	VERIFY3U(bloblen, <, MAX_CERT_LEN);
 	slot->ts_certdata->tsd_len = 0;
-	bcopy(blob, slot->ts_certdata->tsd_data, bloblen);
+	bcopy(blob, (void *)slot->ts_certdata->tsd_data, bloblen);
 	slot->ts_certdata->tsd_len = bloblen;
 
 	sshkey_free(certk);
@@ -600,6 +581,7 @@ new_cert_global(struct token_slot *slot)
 		return (new_cert_global_x509(slot));
 	}
 	VERIFY(0);
+	return (EIO);
 }
 
 static int
@@ -627,7 +609,7 @@ new_cert_zone_ssh(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 	struct sshkey *certk;
 	struct sshkey_cert *cert;
 	struct sshbuf *b;
-	const char *uuid, *tmp;
+	char *uuid, *tmp;
 	time_t now;
 	int rv;
 	size_t i;
@@ -725,7 +707,7 @@ new_cert_zone_ssh(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 	VERIFY3U(bloblen, >, 0);
 	VERIFY3U(bloblen, <, MAX_CERT_LEN);
 	slot->ts_certdata->tsd_len = 0;
-	bcopy(blob, slot->ts_certdata->tsd_data, bloblen);
+	bcopy(blob, (void *)slot->ts_certdata->tsd_data, bloblen);
 	slot->ts_certdata->tsd_len = bloblen;
 
 	free(blob);
@@ -736,7 +718,7 @@ new_cert_zone_ssh(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 		VERIFY3U(bloblen, >, 0);
 		VERIFY3U(bloblen, <, MAX_CERT_LEN);
 		slot->ts_chaindata->tsd_len = 0;
-		bcopy(blob, slot->ts_chaindata->tsd_data, bloblen);
+		bcopy(blob, (void *)slot->ts_chaindata->tsd_data, bloblen);
 		slot->ts_chaindata->tsd_len = bloblen;
 
 		free(blob);
@@ -761,11 +743,10 @@ new_cert_zone_x509(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 	ASN1_TYPE *null_parameter;
 	uint8_t *tbs, *sig, *cdata, *ptr;
 	size_t tbslen, siglen, cdlen;
-	uint flags;
 	int rv;
 	u_int i;
 	struct sshkey *pubk;
-	const char *uuid, *tmp;
+	char *uuid, *tmp;
 	struct ssh_x509chain *chain = NULL;
 
 	VERIFY3U(slot->ts_type, ==, SLOT_ASYM_CERT_SIGN);
@@ -786,7 +767,8 @@ new_cert_zone_x509(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 	VERIFY3U(chain->ncerts, >=, 1);
 
 	ptr = chain->certs[0];
-	if (d2i_X509(&pcert, &ptr, chain->certlen[0]) == NULL) {
+	if (d2i_X509(&pcert, (const uint8_t **)&ptr,
+	    chain->certlen[0]) == NULL) {
 		char errbuf[128];
 		unsigned long err = ERR_peek_last_error();
 		ERR_load_crypto_strings();
@@ -923,12 +905,12 @@ new_cert_zone_x509(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 	free(sig);
 
 	slot->ts_certdata->tsd_len = 0;
-	bcopy(cdata, slot->ts_certdata->tsd_data, cdlen);
+	bcopy(cdata, (void *)slot->ts_certdata->tsd_data, cdlen);
 	slot->ts_certdata->tsd_len = cdlen;
 
 	slot->ts_chaindata->tsd_len = 0;
 	VERIFY3U(chain->certlen[0], <, MAX_CERT_LEN);
-	bcopy(chain->certs[0], slot->ts_chaindata->tsd_data,
+	bcopy(chain->certs[0], (void *)slot->ts_chaindata->tsd_data,
 	    chain->certlen[0]);
 	slot->ts_chaindata->tsd_len = chain->certlen[0];
 
@@ -1020,13 +1002,14 @@ unlock_key(struct token_slot *slot)
 	struct piv_slot *sl;
 	struct piv_ecdh_box *box;
 	nvlist_t *nv = slot->ts_nvl;
-	int rv, i;
+	int rv;
 
 	uchar_t *boxd, *key, *iv, *encdata;
-	uint_t boxdlen, keylen, ivlen, authlen, blocksz, enclen;
+	uint_t boxdlen, ivlen, authlen, blocksz, enclen;
+	size_t keylen;
 	const struct sshcipher *cipher;
 	struct sshbuf *buf;
-	struct sshkey *pkey, *pubkey;
+	struct sshkey *pkey;
 	struct sshcipher_ctx *cctx;
 	char *ciphername;
 	struct bunyan_timers *tms;
@@ -1129,7 +1112,7 @@ generate_keys(const char *zonename, const char *keydir)
 	struct sshkey *authkey;
 	struct sshkey *certkey;
 	struct piv_token *tk = NULL;
-	int rv, i;
+	int rv;
 	struct token_slot tpl;
 	bzero(&tpl, sizeof (tpl));
 
@@ -1352,9 +1335,7 @@ supervisor_loop(zoneid_t zid, nvlist_t *zinfo, int ctlfd, int kidfd, int logfd,
 	timespec_t to;
 	int rv;
 	struct ctl_cmd cmd, rcmd;
-	size_t len;
 	enum ctl_cmd_type cmdtype;
-	int idx;
 	struct token_slot *ts;
 	pid_t w;
 	FILE *logf;
@@ -1511,7 +1492,6 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	ssize_t len;
 	pid_t kid;
 	int kidpipe[2], logpipe[2], vmpipe[2];
-	struct token_slot *slot;
 	priv_set_t *pset;
 	int rv;
 	int32_t v;
@@ -1541,7 +1521,7 @@ supervisor_main(zoneid_t zid, int ctlfd)
 			VERIFY3S(dup2(vmpipe[1], 2), ==, 2);
 
 			VERIFY0(execlp("/usr/sbin/vmadm", "vmadm",
-			    "get", zonename, NULL));
+			    "get", zonename, (char *)0));
 		}
 		VERIFY0(close(vmpipe[1]));
 
@@ -1571,7 +1551,7 @@ supervisor_main(zoneid_t zid, int ctlfd)
 
 		VERIFY0(nvlist_lookup_int32(zinfo, "v", &v));
 		VERIFY3S(v, ==, 1);
-		VERIFY0(nvlist_lookup_string(zinfo, "uuid", &uuid));
+		VERIFY0(nvlist_lookup_string(zinfo, "uuid", (char **)&uuid));
 		VERIFY0(strcmp(uuid, zonename));
 	}
 
