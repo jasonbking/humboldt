@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <errno.h>
 #include <strings.h>
+#include <limits.h>
 
 #include <sys/types.h>
 #include <sys/errno.h>
@@ -126,14 +127,44 @@ fetch_sysinfo(void)
 	return (0);
 }
 
+static boolean_t
+sniff_hex(uint8_t *buf, uint len)
+{
+	uint i, count = 0;
+	len = len > 16 ? 16 : len;
+	for (i = 0; i < len; ++i) {
+		char c;
+		if (buf[i] > CHAR_MAX)
+			return (B_FALSE);
+		c = buf[i];
+		if (c >= '0' && c <= '9') {
+			++count;
+			continue;
+		}
+		if (c >= 'a' && c <= 'f') {
+			++count;
+			continue;
+		}
+		if (c == ':' || c == ' ' || c == '\t' || c == '\n' ||
+		    c == '\r') {
+			++count;
+			continue;
+		}
+		return (B_FALSE);
+	}
+	if (count >= 8)
+		return (B_TRUE);
+	return (B_FALSE);
+}
+
 static uint8_t *
 parse_hex(const char *str, uint *outlen)
 {
-	const int len = strlen(str);
+	const uint len = strlen(str);
 	uint8_t *data = calloc(1, len / 2 + 1);
-	int idx = 0;
-	int shift = 4;
-	int i;
+	uint idx = 0;
+	uint shift = 4;
+	uint i;
 	for (i = 0; i < len; ++i) {
 		const char c = str[i];
 		boolean_t skip = B_FALSE;
@@ -166,6 +197,42 @@ parse_hex(const char *str, uint *outlen)
 	}
 	*outlen = idx;
 	return (data);
+}
+
+#define	MAX_KEYFILE_LEN		(1024)
+
+static uint8_t *
+read_key_file(const char *fname, uint *outlen)
+{
+	FILE *f;
+	uint len;
+	uint8_t *buf;
+
+	f = fopen(fname, "r");
+	if (f == NULL) {
+		fprintf(stderr, "error: failed to open %s: %s\n", fname,
+		    strerror(errno));
+		exit(2);
+	}
+
+	buf = calloc(1, MAX_KEYFILE_LEN);
+	VERIFY(buf != NULL);
+
+	len = fread(buf, 1, MAX_KEYFILE_LEN, f);
+	if (len <= 0) {
+		fprintf(stderr, "error: keyfile %s is too short\n", fname);
+		exit(2);
+	}
+	if (!feof(f)) {
+		fprintf(stderr, "error: keyfile %s is too long\n", fname);
+		exit(2);
+	}
+
+	*outlen = len;
+
+	fclose(f);
+
+	return (buf);
 }
 
 static uint8_t *
@@ -1323,6 +1390,10 @@ usage(void)
 	    "  --guid|-g              GUID of the PIV token to use\n"
 	    "  --algorithm|-a <algo>  Override algorithm for the slot and\n"
 	    "                         don't use the certificate\n"
+	    "  --admin-key|-K <hex|@file>\n"
+	    "                         Provides the admin 3DES key to use for\n"
+	    "                         auth to the card with admin ops (e.g.\n"
+	    "                         generate or init)\n"
 	    "  --key|-k <pubkey>      Use a public key for box operation\n"
 	    "                         instead of a slot\n"
 	    "  --force|-f             Attempt to unlock with PIN code even\n"
@@ -1376,6 +1447,7 @@ const char *optstring =
     "P:(pin)"
     "a:(algorithm)"
     "f(force)"
+    "K:(admin-key)"
     "k:(key)";
 
 int
@@ -1388,6 +1460,7 @@ main(int argc, char *argv[])
 	int c;
 	uint len;
 	char *ptr;
+	uint8_t *buf;
 
 	bunyan_init();
 	bunyan_set_name("pivtool");
@@ -1397,11 +1470,21 @@ main(int argc, char *argv[])
 		case 'd':
 			bunyan_set_level(TRACE);
 			break;
-		case 'c':
-			/*acc_code = parse_hex(optarg, &len);*/
-			if (len != 6) {
-				fprintf(stderr, "error: acc code must be "
-				    "6 bytes in length (you gave %d)\n", len);
+		case 'K':
+			if (optarg[0] == '@') {
+				buf = read_key_file(&optarg[1], &len);
+				if (len > 24 && sniff_hex(buf, len)) {
+					admin_key = parse_hex(
+					    (const char *)buf, &len);
+				} else {
+					admin_key = buf;
+				}
+			} else {
+				admin_key = parse_hex(optarg, &len);
+			}
+			if (len != 24) {
+				fprintf(stderr, "error: admin key must be "
+				    "24 bytes in length (you gave %d)\n", len);
 				exit(3);
 			}
 			break;
