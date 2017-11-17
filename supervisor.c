@@ -1119,6 +1119,13 @@ generate_keys(const char *zonename, const char *keydir)
 	struct token_slot tpl;
 	bzero(&tpl, sizeof (tpl));
 
+	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &sup_ctx);
+	VERIFY3S(rv, ==, SCARD_S_SUCCESS);
+
+	sup_tks = piv_enumerate(sup_ctx);
+	VERIFY(sup_tks != NULL);
+	VERIFY0(piv_system_token_find(sup_tks, &sup_systk));
+
 	tk = sup_systk;
 	VERIFY3P(tk, !=, NULL);
 
