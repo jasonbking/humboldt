@@ -1374,7 +1374,7 @@ usage(void)
 	    "  sign <slot>            Signs data on stdin\n"
 	    "  ecdh <slot>            Do ECDH with pubkey on stdin\n"
 	    "  auth <slot>            Does a round-trip signature test to\n"
-	    "                         verify that a the pubkey on stdin\n"
+	    "                         verify that the pubkey on stdin\n"
 	    "                         matches the one in the slot\n"
 	    "  generate <slot>        Generate a new private key and a\n"
 	    "                         self-signed cert\n"
