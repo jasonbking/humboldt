@@ -9,10 +9,36 @@ CC=		$(STRAP_AREA)/usr/bin/gcc
 LD=		/usr/bin/ld
 CSTYLE=		$(KERNEL_SOURCE)/usr/src/tools/scripts/cstyle
 
-BASE_CFLAGS=	-gdwarf-2 -I$(PROTO_AREA)/usr/include -Wall
+BASE_CFLAGS=	-gdwarf-2 -isystem $(PROTO_AREA)/usr/include -Wall
 CFLAGS+=	$(BASE_CFLAGS)
 CFLAGS64=	-m64 -msave-args -Wall
 LDFLAGS+=	-L$(PROTO_AREA)/usr/lib
+
+#
+# Conditional logic to allow one to toggle between pcsc and the platform
+# implementation.
+#
+PRE_POUND=		pre\#
+POUND_SIGN=		$(PRE_POUND:pre\%=%)
+
+USE_PCSCLITE=
+USE_SYSTEM_PCSC=			$(POUND_SIGN)
+#
+# Uncomment this line to use the system PCSC implementation.
+#
+#USE_SYSTEM_PCSC=
+$(USE_SYSTEM_PCSC)USE_PCSCLITE=		$(POUND_SIGN)
+
+$(USE_PCSCLITE)PCSC_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC
+$(USE_PCSCLITE)PCSC_LDLIBS=		-lpcsclite
+$(USE_PCSCLITE)PCSC_DEPS=		pcsclite
+$(USE_PCSCLITE)PCSC_DEPS64=		pcsclite64
+
+$(USE_SYSTEM_PCSC)PCSC_CFLAGS=
+$(USE_SYSTEM_PCSC)PCSC_LDLIBS=		-lpcsc
+$(USE_SYSTEM_PCSC)PCSC_DEPS=
+$(USE_SYSTEM_PCSC)PCSC_DEPS64=
+
 
 YBENCH_SOURCES=			\
 	yubihmac-bench.c
@@ -20,11 +46,11 @@ YBENCH_HEADERS=
 
 YBENCH_OBJS=		$(YBENCH_SOURCES:%.c=%.o)
 
-YBENCH_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC
-YBENCH_LIBS=		-lpcsclite
+YBENCH_CFLAGS=		$(PCSC_CFLAGS)
+YBENCH_LIBS=		$(PCSC_LDLIBS)
 YBENCH_LDFLAGS=		-L$(PROTO_AREA)/usr/lib
 
-YBENCH_DEPS=		pcsclite
+YBENCH_DEPS=		$(PCSC_DEPS)
 
 
 YKTOOL_SOURCES=			\
@@ -33,11 +59,11 @@ YKTOOL_HEADERS=
 
 YKTOOL_OBJS=		$(YKTOOL_SOURCES:%.c=%.o)
 
-YKTOOL_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC
-YKTOOL_LIBS=		-lpcsclite -lumem
+YKTOOL_CFLAGS=		$(PCSC_CFLAGS)
+YKTOOL_LIBS=		$(PCSC_LDLIBS) -lumem
 YKTOOL_LDFLAGS=		-L$(PROTO_AREA)/usr/lib
 
-YKTOOL_DEPS=		pcsclite
+YKTOOL_DEPS=		$(PCSC_DEPDS)
 
 
 _ED25519_SOURCES=		\
@@ -94,9 +120,9 @@ TOKEN_HEADERS=			\
 
 TOKEN_OBJS=		$(TOKEN_SOURCES:%.c=%.o)
 
-TOKEN_DEPS=		pcsclite64 libressl
+TOKEN_DEPS=		$(PCSC_DEPS64) libressl
 
-TOKEN_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
+TOKEN_CFLAGS=		$(PCSC_CFLAGS) \
 			-I$(DEPS)/libressl/include/ \
 			-fstack-protector-all \
 			-D_REENTRANT \
@@ -104,8 +130,8 @@ TOKEN_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
 TOKEN_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
 			-Wl,-z -Wl,aslr \
 			-D_REENTRANT
-TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket -lpcsclite -lssp \
-			-lumem -lrename \
+TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket $(PCSC_LDLIBS) \
+			-lssp -lumem -lrename \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
 
@@ -122,8 +148,8 @@ PIVTOOL_HEADERS=		\
 	bunyan.h		\
 	piv.h
 PIVTOOL_OBJS=		$(PIVTOOL_SOURCES:%.c=%.o)
-PIVTOOL_DEPS=		pcsclite64 libressl
-PIVTOOL_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
+PIVTOOL_DEPS=		$(PCSC_DEPS64) libressl
+PIVTOOL_CFLAGS=		$(PCSC_CFLAGS) \
 			-I$(DEPS)/libressl/include/ \
 			-fstack-protector-all \
 			-D_REENTRANT \
@@ -131,13 +157,16 @@ PIVTOOL_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC \
 PIVTOOL_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
 			-Wl,-z -Wl,aslr \
 			-D_REENTRANT
-PIVTOOL_LIBS= 		-lpcsclite -lssp -lumem -lnvpair \
+PIVTOOL_LIBS= 		$(PCSC_LDLIBS) -lssp -lumem -lnvpair \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
 yubihmac-bench :	CFLAGS+=	$(YBENCH_CFLAGS)
 yubihmac-bench :	LIBS+=		$(YBENCH_LIBS)
 yubihmac-bench :	LDFLAGS+=	$(YBENCH_LDFLAGS)
 yubihmac-bench :	HEADERS=	$(YBENCH_HEADERS)
+
+
+$(YBENCH_OBJS): $(YBENCH_DEPS:%=deps/%/.ac.install.stamp)
 
 yubihmac-bench: $(YBENCH_OBJS) $(YBENCH_DEPS:%=deps/%/.ac.install.stamp)
 	$(CC) $(LDFLAGS) -o $@ $(YBENCH_OBJS) $(LIBS)
@@ -148,6 +177,8 @@ yktool :		LIBS+=		$(YKTOOL_LIBS)
 yktool :		LDFLAGS+=	$(YKTOOL_LDFLAGS)
 yktool :		HEADERS=	$(YKTOOL_HEADERS)
 
+$(YKTOOL_DEPS): $(YKTOOL_DEPS:%=deps/%/.ac.install.stamp)
+
 yktool: $(YKTOOL_OBJS) $(YKTOOL_DEPS:%=deps/%/.ac.install.stamp)
 	$(CC) $(LDFLAGS) -o $@ $(YKTOOL_OBJS) $(LIBS)
 	$(ALTCTFCONVERT) $@
@@ -156,6 +187,8 @@ softtokend :		CFLAGS=		$(TOKEN_CFLAGS)
 softtokend :		LIBS+=		$(TOKEN_LIBS)
 softtokend :		LDFLAGS+=	$(TOKEN_LDFLAGS)
 softtokend :		HEADERS=	$(TOKEN_HEADERS)
+
+$(TOKEN_OBJS):	$(TOKEN_DEPS:%=deps/%/.ac.install.stamp)
 
 softtokend: $(TOKEN_OBJS) $(TOKEN_DEPS:%=deps/%/.ac.install.stamp)
 	$(CC) $(LDFLAGS) -o $@ $(TOKEN_OBJS) $(LIBS)
@@ -166,6 +199,8 @@ pivtool :		LIBS+=		$(PIVTOOL_LIBS)
 pivtool :		LDFLAGS+=	$(PIVTOOL_LDFLAGS)
 pivtool :		HEADERS=	$(PIVTOOL_HEADERS)
 
+$(PIVTOOL_OBJS): $(PIVTOOL_DEPS:%=deps/%/.ac.install.stamp)
+
 pivtool: $(PIVTOOL_OBJS) $(PIVTOOL_DEPS:%=deps/%/.ac.install.stamp)
 	$(CC) $(LDFLAGS) -o $@ $(PIVTOOL_OBJS) $(LIBS)
 	$(ALTCTFCONVERT) $@
@@ -173,20 +208,23 @@ pivtool: $(PIVTOOL_OBJS) $(PIVTOOL_DEPS:%=deps/%/.ac.install.stamp)
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ -c $<
 
-DEPS_BUILT=				\
+$(USE_PCSCLITE)DEPS_BUILT=				\
 	deps/libusb/.ac.all.stamp	\
 	deps/libusb64/.ac.all.stamp	\
 	deps/pcsclite/.ac.all.stamp	\
 	deps/pcsclite64/.ac.all.stamp	\
 	deps/ccid/.ac.all.stamp		\
 	deps/libressl/.ac.all.stamp
+$(USE_SYSTEM_PCSC)DEPS_BUILT=		\
+	deps/libressl/.ac.all.stamp
 
-DEPS_INSTALLED=					\
+$(USE_PCSCLITE)DEPS_INSTALLED=					\
 	deps/libusb/.ac.install.stamp		\
 	deps/libusb64/.ac.install.stamp		\
 	deps/pcsclite/.ac.install.stamp		\
 	deps/pcsclite64/.ac.install.stamp	\
 	deps/ccid/.ac.install.stamp
+$(USE_SYSTEM_PCSC)DEPS_INSTALLED=
 
 LIBUSB_CONFIG_ARGS=		\
 	--prefix=/usr		\
