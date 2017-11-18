@@ -95,6 +95,7 @@ fetch_sysinfo(void)
 	do {
 		w = waitpid(kid, &stat, 0);
 	} while (w == -1 && errno == EINTR);
+	VERIFY3S(w, !=, -1);
 	VERIFY(WIFEXITED(stat));
 	if (WEXITSTATUS(stat) != 0) {
 		VERIFY0(close(vmpipe[0]));
