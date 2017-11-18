@@ -1,4 +1,5 @@
 d usr 0755 root sys
+#ifdef USE_PCSLITE
 d usr/bin 0755 root sys
 f usr/bin/pcsc-spy 0755 root sys
 d usr/bin/amd64 0755 root sys
@@ -13,15 +14,19 @@ f usr/include/PCSC/pcsclite.h 0644 root sys
 f usr/include/PCSC/reader.h 0644 root sys
 f usr/include/PCSC/winscard.h 0644 root sys
 f usr/include/PCSC/wintypes.h 0644 root sys
+#endif
 d usr/sbin 0755 root sys
 d usr/sbin/amd64 0755 root sys
+#ifdef USE_PCSCLITE
 f usr/sbin/amd64/pcscd 0755 root sys
 f usr/sbin/pcscd 0755 root sys
+#endif
 f usr/sbin/yktool 0755 root sys
 f usr/sbin/rfd77-zpool-create 0755 root sys
 f usr/sbin/yubihmac-bench 0755 root sys
 f usr/sbin/amd64/pivtool 0755 root sys
 h usr/sbin/pivtool=usr/lib/isaexec
+#ifdef USE_PCSCLITE
 d usr/lib 0755 root sys
 f usr/lib/libusb-1.0.so.0.1.0 0755 root sys
 s usr/lib/libusb-1.0.so.0=libusb-1.0.so.0.1.0
@@ -47,18 +52,23 @@ d usr/lib/amd64/pcsc/drivers/ifd-ccid.bundle/Contents 0755 root sys
 f usr/lib/amd64/pcsc/drivers/ifd-ccid.bundle/Contents/Info.plist 0644 root sys
 d usr/lib/amd64/pcsc/drivers/ifd-ccid.bundle/Contents/Solaris 0755 root sys
 f usr/lib/amd64/pcsc/drivers/ifd-ccid.bundle/Contents/Solaris/libccid.so 0755 root sys
+#endif
 d lib 0755 root bin
 d lib/svc 0755 root bin
 d lib/svc/manifest 0755 root sys
 d lib/svc/manifest/system 0755 root sys
+#ifdef USE_PCSCLITE
 f lib/svc/manifest/system/pcscd.xml 0644 root sys
+#endif
 f lib/svc/manifest/system/soft-token.xml 0644 root sys
 f lib/svc/manifest/system/piv-system-token.xml 0644 root sys
 d lib/svc/manifest/system/filesystem 0755 root sys
 f lib/svc/manifest/system/filesystem/unlock-rfd77-zfs.xml 0644 root sys
 d lib/svc/method 0755 root sys
 f lib/svc/method/unlock-rfd77-zfs 0755 root sys
+#ifdef USE_PCSCLITE
 f lib/svc/method/system-pcscd 0755 root sys
+#endif
 f lib/svc/method/piv-system-token 0755 root sys
 f lib/svc/method/system-soft-token 0755 root sys
 d smartdc 0755 root bin

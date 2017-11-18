@@ -24,7 +24,7 @@ POUND_SIGN=		$(PRE_POUND:pre\%=%)
 USE_PCSCLITE=
 USE_SYSTEM_PCSC=			$(POUND_SIGN)
 #
-# Uncomment this line to use the system PCSC implementation.
+# Uncomment the next line _only_ to use the system PCSC implementation.
 #
 #USE_SYSTEM_PCSC=
 $(USE_SYSTEM_PCSC)USE_PCSCLITE=		$(POUND_SIGN)
@@ -33,11 +33,13 @@ $(USE_PCSCLITE)PCSC_CFLAGS=		-I$(PROTO_AREA)/usr/include/PCSC
 $(USE_PCSCLITE)PCSC_LDLIBS=		-lpcsclite
 $(USE_PCSCLITE)PCSC_DEPS=		pcsclite
 $(USE_PCSCLITE)PCSC_DEPS64=		pcsclite64
+$(USE_PCSCLITE)PCSC_MANIFEST_FLAGS=	-DUSE_PCSLITE
 
 $(USE_SYSTEM_PCSC)PCSC_CFLAGS=
 $(USE_SYSTEM_PCSC)PCSC_LDLIBS=		-lpcsc
 $(USE_SYSTEM_PCSC)PCSC_DEPS=
 $(USE_SYSTEM_PCSC)PCSC_DEPS64=
+$(USE_PCSCLITE)PCSC_MANIFEST_FLAGS=	-DUSE_SYSTEM_PCSC
 
 
 YBENCH_SOURCES=			\
@@ -394,7 +396,7 @@ clean:
 
 .PHONY: manifest
 manifest:
-	cp manifest $(DESTDIR)/$(DESTNAME)
+	cpp $@ $(PCSC_MANIFEST_FLAGS) > $(DESTDIR)/$(DESTNAME)
 
 mancheck_conf:
 	cp mancheck.conf $(DESTDIR)/$(DESTNAME)
