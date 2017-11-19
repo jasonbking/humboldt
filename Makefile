@@ -401,3 +401,6 @@ manifest:
 mancheck_conf:
 	cp mancheck.conf $(DESTDIR)/$(DESTNAME)
 
+cscope:
+	find . -type f -name '*.[chs]' > cscope.files'
+	cscope-fast -bq
