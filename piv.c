@@ -2103,6 +2103,8 @@ piv_box_set_data(struct piv_ecdh_box *box, const uint8_t *data, size_t len)
 		return (ENOMEM);
 	box->pdb_plain.b_data = buf;
 	box->pdb_plain.b_size = len;
+	box->pdb_plain.b_len = len;
+	box->pdb_plain.b_offset = 0;
 
 	bcopy(data, buf, len);
 
@@ -2115,10 +2117,17 @@ piv_box_take_data(struct piv_ecdh_box *box, uint8_t **data, size_t *len)
 	if (box->pdb_plain.b_data == NULL)
 		return (EINVAL);
 
-	*data = box->pdb_plain.b_data;
-	*len = box->pdb_plain.b_size;
+	*data = calloc(1, box->pdb_plain.b_len);
+	VERIFY(*data != NULL);
+	*len = box->pdb_plain.b_len;
+	bcopy(box->pdb_plain.b_data + box->pdb_plain.b_offset, *data, *len);
+
+	explicit_bzero(box->pdb_plain.b_data, box->pdb_plain.b_size);
+	free(box->pdb_plain.b_data);
 	box->pdb_plain.b_data = NULL;
 	box->pdb_plain.b_size = 0;
+	box->pdb_plain.b_len = 0;
+	box->pdb_plain.b_offset = 0;
 
 	return (0);
 }
@@ -2133,6 +2142,7 @@ piv_box_open_offline(struct sshkey *privkey, struct piv_ecdh_box *box)
 	uint8_t *iv, *key, *sec, *enc, *plain;
 	size_t ivlen, authlen, blocksz, keylen, dglen, seclen;
 	size_t fieldsz, plainlen, enclen;
+	size_t reallen, padding, i;
 
 	VERIFY3P(box->pdb_cipher, !=, NULL);
 	VERIFY3P(box->pdb_kdf, !=, NULL);
@@ -2169,12 +2179,13 @@ piv_box_open_offline(struct sshkey *privkey, struct piv_ecdh_box *box)
 	free(sec);
 
 	iv = box->pdb_iv.b_data;
-	VERIFY3U(box->pdb_iv.b_size, ==, ivlen);
+	VERIFY3U(box->pdb_iv.b_len, ==, ivlen);
+	VERIFY3U(box->pdb_iv.b_offset, ==, 0);
 	VERIFY3P(iv, !=, NULL);
 
-	enc = box->pdb_enc.b_data;
-	VERIFY3P(enc, !=, NULL);
-	enclen = box->pdb_enc.b_size;
+	enc = box->pdb_enc.b_data + box->pdb_enc.b_offset;
+	VERIFY3P(box->pdb_enc.b_data, !=, NULL);
+	enclen = box->pdb_enc.b_len;
 	VERIFY3U(enclen, >=, authlen + blocksz);
 
 	plainlen = enclen - authlen;
@@ -2189,9 +2200,19 @@ piv_box_open_offline(struct sshkey *privkey, struct piv_ecdh_box *box)
 	explicit_bzero(key, dglen);
 	free(key);
 
+	/* Strip off the pkcs#7 padding and verify it. */
+	padding = plain[plainlen - 1];
+	VERIFY3U(padding, <=, blocksz);
+	VERIFY3U(padding, >, 0);
+	reallen = plainlen - padding;
+	for (i = reallen; i < plainlen; ++i)
+		VERIFY3U(plain[i], ==, padding);
+
 	free(box->pdb_plain.b_data);
 	box->pdb_plain.b_data = plain;
 	box->pdb_plain.b_size = plainlen;
+	box->pdb_plain.b_len = reallen;
+	box->pdb_plain.b_offset = 0;
 
 	return (0);
 }
@@ -2208,6 +2229,7 @@ piv_box_open(struct piv_token *tk, struct piv_slot *slot,
 	uint8_t *iv, *key, *sec, *enc, *plain;
 	size_t ivlen, authlen, blocksz, keylen, dglen, seclen;
 	size_t plainlen, enclen;
+	size_t reallen, padding, i;
 
 	VERIFY3P(box->pdb_cipher, !=, NULL);
 	VERIFY3P(box->pdb_kdf, !=, NULL);
@@ -2267,9 +2289,19 @@ piv_box_open(struct piv_token *tk, struct piv_slot *slot,
 		return (EBADMSG);
 	}
 
+	/* Strip off the pkcs#7 padding and verify it. */
+	padding = plain[plainlen - 1];
+	VERIFY3U(padding, <=, blocksz);
+	VERIFY3U(padding, >, 0);
+	reallen = plainlen - padding;
+	for (i = reallen; i < plainlen; ++i)
+		VERIFY3U(plain[i], ==, padding);
+
 	free(box->pdb_plain.b_data);
 	box->pdb_plain.b_data = plain;
+	box->pdb_plain.b_offset = 0;
 	box->pdb_plain.b_size = plainlen;
+	box->pdb_plain.b_len = reallen;
 
 	return (0);
 }
@@ -2286,7 +2318,7 @@ piv_box_seal_offline(struct sshkey *pubk, struct piv_ecdh_box *box)
 	uint8_t *iv, *key, *sec, *enc, *plain;
 	size_t ivlen, authlen, blocksz, keylen, dglen, seclen;
 	size_t fieldsz, plainlen, enclen;
-	size_t i, j;
+	size_t padding, i;
 
 	rv = sshkey_generate(KEY_ECDSA, 256, &pkey);
 	VERIFY0(rv);
@@ -2338,26 +2370,34 @@ piv_box_seal_offline(struct sshkey *pubk, struct piv_ecdh_box *box)
 
 	free(box->pdb_iv.b_data);
 	box->pdb_iv.b_size = ivlen;
+	box->pdb_iv.b_len = ivlen;
 	box->pdb_iv.b_data = iv;
+	box->pdb_iv.b_offset = 0;
 
 	plainlen = box->pdb_plain.b_size;
 	VERIFY3U(plainlen, >, 0);
 
-	if (plainlen % blocksz == 0) {
-		plain = box->pdb_plain.b_data;
-		VERIFY3P(plain, !=, NULL);
-	} else {
-		plainlen += blocksz - (plainlen % blocksz);
-		plain = calloc(1, plainlen);
-		VERIFY3P(plain, !=, NULL);
-		bcopy(box->pdb_plain.b_data, plain, box->pdb_plain.b_size);
-		for (j = 0, i = box->pdb_plain.b_size; i < plainlen; ++i)
-			plain[i] = ++j & 0xFF;
-		explicit_bzero(box->pdb_plain.b_data, box->pdb_plain.b_size);
-	}
+	/*
+	 * We add PKCS#7 style padding, consisting of up to a block of bytes,
+	 * all set to the number of padding bytes added. This is easy to strip
+	 * off after decryption and avoids the need to include and validate the
+	 * real length of the payload separately.
+	 */
+	padding = blocksz - (plainlen % blocksz);
+	VERIFY3U(padding, <=, blocksz);
+	VERIFY3U(padding, >, 0);
+	plainlen += padding;
+	plain = calloc(1, plainlen);
+	VERIFY3P(plain, !=, NULL);
+	bcopy(box->pdb_plain.b_data, plain, box->pdb_plain.b_len);
+	for (i = box->pdb_plain.b_size; i < plainlen; ++i)
+		plain[i] = padding;
 
+	explicit_bzero(box->pdb_plain.b_data, box->pdb_plain.b_size);
+	free(box->pdb_plain.b_data);
 	box->pdb_plain.b_data = NULL;
 	box->pdb_plain.b_size = 0;
+	box->pdb_plain.b_len = 0;
 
 	VERIFY0(cipher_init(&cctx, cipher, key, keylen, iv, ivlen, 1));
 	enclen = plainlen + authlen;
@@ -2369,12 +2409,15 @@ piv_box_seal_offline(struct sshkey *pubk, struct piv_ecdh_box *box)
 	explicit_bzero(plain, plainlen);
 	explicit_bzero(key, dglen);
 	free(key);
+	free(plain);
 
 	VERIFY0(sshkey_demote(pubk, &box->pdb_pub));
 
 	free(box->pdb_enc.b_data);
 	box->pdb_enc.b_data = enc;
 	box->pdb_enc.b_size = enclen;
+	box->pdb_enc.b_len = enclen;
+	box->pdb_enc.b_offset = 0;
 
 	return (0);
 }
@@ -2478,9 +2521,9 @@ piv_box_to_binary(struct piv_ecdh_box *box, uint8_t **output, size_t *len)
 
 	VERIFY0(sshbuf_put_cstring(buf, box->pdb_cipher));
 	VERIFY0(sshbuf_put_cstring(buf, box->pdb_kdf));
-	VERIFY0(sshbuf_put_string(buf, box->pdb_iv.b_data, box->pdb_iv.b_size));
+	VERIFY0(sshbuf_put_string(buf, box->pdb_iv.b_data, box->pdb_iv.b_len));
 	VERIFY0(sshbuf_put_string(buf, box->pdb_enc.b_data,
-	    box->pdb_enc.b_size));
+	    box->pdb_enc.b_len));
 
 	*len = sshbuf_len(buf);
 	*output = calloc(1, *len);
@@ -2577,6 +2620,11 @@ piv_box_from_binary(const uint8_t *input, size_t inplen,
 		rv = EINVAL;
 		goto out;
 	}
+
+	box->pdb_iv.b_len = box->pdb_iv.b_size;
+	box->pdb_enc.b_len = box->pdb_enc.b_size;
+	box->pdb_iv.b_offset = 0;
+	box->pdb_enc.b_offset = 0;
 
 	*pbox = box;
 	sshbuf_free(buf);
