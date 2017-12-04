@@ -1159,6 +1159,8 @@ read_key_file(const char *nm, const char *fn)
 	char *buf, *name;
 	uint8_t val;
 	int rv;
+	size_t pgs;
+	const size_t pgsz = getpagesize();
 
 	bunyan_log(TRACE, "unpacking key file",
 	    "filename", BNY_STRING, nm, NULL);
@@ -1209,12 +1211,20 @@ read_key_file(const char *nm, const char *fn)
 	/*
 	 * The decrypted key data is always smaller than the nvlist was, so
 	 * we'll just allocate that much shared memory for it.
+	 *
+	 * We add two pages (one at the beginning and end of the mapping) and
+	 * set them to PROT_NONE with mprotect, to try to catch various kinds
+	 * of overflow bugs that might otherwise reach into the key data.
 	 */
-	shm = mmap(0, sz + sizeof (struct token_slot_data),
-	    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+	pgs = (sz + sizeof (struct token_slot_data)) / pgsz;
+	pgs += 3;	/* 2 extra + round-up from division */
+	shm = mmap(0, pgs * pgsz, PROT_READ | PROT_WRITE,
+	    MAP_SHARED | MAP_ANON, -1, 0);
 	VERIFY(shm != NULL);
-	explicit_bzero(shm, sz);
-	VERIFY0(mlock(shm, sz));
+	explicit_bzero(shm, pgs * pgsz);
+	VERIFY0(mlock(shm + pgsz, (pgs - 2) * pgsz));
+	VERIFY0(mprotect(shm, pgsz, PROT_NONE));
+	VERIFY0(mprotect(shm + (pgs - 1) * pgsz, pgsz, PROT_NONE));
 
 	ts = calloc(1, sizeof (struct token_slot));
 	VERIFY(ts != NULL);
@@ -1223,7 +1233,7 @@ read_key_file(const char *nm, const char *fn)
 	strcpy(name, nm);
 	ts->ts_name = name;
 	ts->ts_nvl = nvl;
-	ts->ts_data = (struct token_slot_data *)shm;
+	ts->ts_data = (struct token_slot_data *)(shm + pgsz);
 	ts->ts_datasize = sz;
 
 	shm = mmap(0, MAX_CERT_LEN, PROT_READ | PROT_WRITE,
