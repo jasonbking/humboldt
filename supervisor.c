@@ -690,7 +690,7 @@ new_cert_zone_ssh(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 	}
 
 	sshbuf_free(b);
-	
+
 	VERIFY0(sshkey_certify_custom(certk, csc->csc_pubkey, NULL,
 	    agent_ssh_cert_signer, csc));
 
@@ -756,6 +756,12 @@ new_cert_zone_x509(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 	VERIFY(pubk != NULL);
 
 	VERIFY0(ssh_agent_get_x509(csc->csc_authfd, pubk, &chain));
+
+	if (chain->ncerts == 0) {
+		bunyan_log(WARN, "gz token does not contain any certs; cannot "
+		    "renew zone cert (no issuer known)", NULL);
+		return (ENOENT);
+	}
 	VERIFY3U(chain->ncerts, >=, 1);
 
 	ptr = chain->certs[0];
