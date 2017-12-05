@@ -50,7 +50,7 @@ fi
 # So instead we start one just for unlocking here and then kill it when we
 # exit.
 #
-/usr/sbin/amd64/pcscd --force-reader-polling
+/usr/sbin/amd64/pcscd --force-reader-polling || fatal "omg what"
 while [[ ! -f /var/run/pcscd/pcscd.pid ]]; do
 	sleep 0.1
 done
