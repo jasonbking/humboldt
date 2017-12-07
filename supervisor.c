@@ -1425,7 +1425,9 @@ supervisor_loop(zoneid_t zid, nvlist_t *zinfo, int ctlfd, int kidfd, int logfd,
 			    PORT_SOURCE_FD, ctlfd, POLLIN, NULL));
 
 		} else if (ev.portev_object == kidfd) {
-			VERIFY0(read_cmd(kidfd, &cmd));
+			if (read_cmd(kidfd, &cmd) != 0) {
+				supervisor_panic();
+			}
 			cmdtype = cmd.cc_type;
 			switch (cmdtype) {
 			case CMD_UNLOCK_KEY:
