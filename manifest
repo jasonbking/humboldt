@@ -1,5 +1,5 @@
 d usr 0755 root sys
-#ifdef USE_PCSLITE
+#ifdef USE_PCSCLITE
 d usr/bin 0755 root sys
 f usr/bin/pcsc-spy 0755 root sys
 d usr/bin/amd64 0755 root sys
