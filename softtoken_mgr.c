@@ -39,6 +39,7 @@ struct zone_state {
 	int zs_pipe[2];
 	uint8_t zs_cookie;
 	boolean_t zs_unwanted;
+	boolean_t zs_need_restart;
 };
 static struct zone_state *zonest = NULL;
 static mutex_t zonest_mutex;
@@ -58,8 +59,14 @@ static void
 start_supervisor(struct zone_state *forzone)
 {
 	struct zone_state *zs;
+	struct sigaction sa;
+
 	VERIFY0(sysevent_evc_unbind(evchan));
-	(void) signal(SIGCHLD, SIG_DFL);
+
+	bzero(&sa, sizeof (sa));
+	sa.sa_handler = SIG_DFL;
+	sa.sa_flags = SA_NOCLDSTOP;
+	VERIFY0(sigaction(SIGCHLD, &sa, NULL));
 
 	for (zs = zonest; zs != NULL; zs = zs->zs_next) {
 		VERIFY0(close(zs->zs_pipe[0]));
@@ -231,7 +238,7 @@ sysevc_handler(sysevent_t *ev, void *cookie)
 }
 
 static void
-sigchld_handler(int signo)
+sigchld_handler(int signo, siginfo_t *info, void *ctx)
 {
 	pid_t kid;
 	int kid_status;
@@ -247,29 +254,29 @@ sigchld_handler(int signo)
 		}
 		if (zs != NULL) {
 			zid = zs->zs_id;
-			bunyan_log(TRACE,
+
+			bunyan_log(INFO,
 			    "zone supervisor stopped",
 			    "zoneid", BNY_INT, (int)zid,
 			    "pid", BNY_INT, (int)kid,
 			    "exit_status", BNY_INT,
 			    (int)WEXITSTATUS(kid_status),
 			    NULL);
-			if (zsp != NULL) {
-				zsp->zs_next = zs->zs_next;
-			} else {
-				VERIFY3P(zonest, ==, zs);
-				zonest = zs->zs_next;
-			}
+
 			VERIFY0(close(zs->zs_pipe[0]));
-			if (!zs->zs_unwanted) {
-				bunyan_log(WARN,
-				    "restarting zone supervisor",
-				    "zoneid", BNY_INT, (int)zid,
-				    "pid", BNY_INT, (int)kid,
-				    NULL);
-				add_zone_unlocked(zid);
+			zs->zs_child = 0;
+
+			if (zs->zs_unwanted) {
+				if (zsp != NULL) {
+					zsp->zs_next = zs->zs_next;
+				} else {
+					VERIFY3P(zonest, ==, zs);
+					zonest = zs->zs_next;
+				}
+				free(zs);
+			} else {
+				zs->zs_need_restart = B_TRUE;
 			}
-			free(zs);
 		}
 		mutex_exit(&zonest_mutex);
 	}
@@ -287,6 +294,9 @@ main(int argc, char *argv[])
 	const char *channel = "com.sun:zones:status";
 	char subid[128];
 	const char *lvl;
+	struct sigaction sa;
+	struct zone_state *zsp = NULL, *zs;
+	zoneid_t zid;
 
 	bunyan_init();
 	bunyan_set_name("softtoken_mgr");
@@ -309,7 +319,10 @@ main(int argc, char *argv[])
 	VERIFY0(mutex_init(&zonest_mutex,
 	    USYNC_THREAD | LOCK_ERRORCHECK, NULL));
 
-	(void) signal(SIGCHLD, sigchld_handler);
+	bzero(&sa, sizeof (sa));
+	sa.sa_sigaction = sigchld_handler;
+	sa.sa_flags = SA_NOCLDSTOP | SA_SIGINFO;
+	VERIFY0(sigaction(SIGCHLD, &sa, NULL));
 
 	VERIFY0(sysevent_evc_bind(channel, &evchan, 0));
 	snprintf(subid, sizeof (subid), "softtoken%u", getpid());
@@ -320,5 +333,26 @@ main(int argc, char *argv[])
 
 	for (;;) {
 		pause();
+
+		mutex_enter(&zonest_mutex);
+		for (zs = zonest; zs != NULL; zsp = zs, zs = zs->zs_next) {
+			if (zs->zs_need_restart) {
+				zid = zs->zs_id;
+				if (zsp != NULL) {
+					zsp->zs_next = zs->zs_next;
+				} else {
+					VERIFY3P(zonest, ==, zs);
+					zonest = zs->zs_next;
+				}
+				free(zs);
+
+				bunyan_log(WARN,
+				    "restarting zone supervisor",
+				    "zoneid", BNY_INT, (int)zid,
+				    NULL);
+				add_zone_unlocked(zid);
+			}
+		}
+		mutex_exit(&zonest_mutex);
 	}
 }

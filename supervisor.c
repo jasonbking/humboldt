@@ -1484,6 +1484,11 @@ supervisor_loop(zoneid_t zid, nvlist_t *zinfo, int ctlfd, int kidfd, int logfd,
 					    &rcmd));
 					break;
 				}
+				bzero(&rcmd, sizeof (rcmd));
+				rcmd.cc_cookie = cmd.cc_cookie;
+				rcmd.cc_type = CMD_STATUS;
+				rcmd.cc_p1 = STATUS_ERROR;
+				VERIFY0(write_cmd(kidfd, &rcmd));
 				break;
 			default:
 				bunyan_log(ERROR,
