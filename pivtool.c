@@ -56,7 +56,6 @@ static const uint8_t DEFAULT_ADMIN_KEY[] = {
 	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 };
 static const uint8_t *admin_key = DEFAULT_ADMIN_KEY;
-static nvlist_t *sysinfo;
 
 static struct piv_token *ks = NULL;
 static struct piv_token *selk = NULL;
@@ -64,69 +63,6 @@ static struct piv_token *sysk = NULL;
 static struct piv_slot *override = NULL;
 
 extern char *buf_to_hex(const uint8_t *buf, size_t len, boolean_t spaces);
-
-#define	MAX_SYSINF_LEN		16384
-
-static int
-fetch_sysinfo(void)
-{
-	pid_t kid, w;
-	int stat;
-	int vmpipe[2];
-	FILE *vmpipef;
-	char *zinfbuf;
-	size_t zinflen;
-	nvlist_parse_json_error_t jsonerr;
-
-	VERIFY0(pipe(vmpipe));
-
-	kid = forkx(FORK_WAITPID | FORK_NOSIGCHLD);
-	VERIFY(kid != -1);
-	if (kid == 0) {
-		VERIFY0(close(vmpipe[0]));
-
-		VERIFY3S(dup2(vmpipe[1], 1), ==, 1);
-		VERIFY3S(dup2(vmpipe[1], 2), ==, 2);
-
-		VERIFY0(execlp("sysinfo", "sysinfo", "-f", (char *)0));
-	}
-	VERIFY0(close(vmpipe[1]));
-
-	do {
-		w = waitpid(kid, &stat, 0);
-	} while (w == -1 && errno == EINTR);
-	VERIFY3S(w, !=, -1);
-	VERIFY(WIFEXITED(stat));
-	if (WEXITSTATUS(stat) != 0) {
-		VERIFY0(close(vmpipe[0]));
-		return (ENOENT);
-	}
-
-	vmpipef = fdopen(vmpipe[0], "r");
-	VERIFY(vmpipef != NULL);
-	zinfbuf = calloc(1, MAX_SYSINF_LEN);
-	VERIFY(zinfbuf != NULL);
-	zinflen = fread(zinfbuf, 1, MAX_SYSINF_LEN, vmpipef);
-	VERIFY3U(zinflen, >, 0);
-	VERIFY3U(zinflen, <, MAX_SYSINF_LEN);
-	VERIFY(feof(vmpipef));
-	VERIFY0(fclose(vmpipef));
-
-	zinfbuf[zinflen] = '\0';
-
-	if (nvlist_parse_json(zinfbuf, zinflen, &sysinfo,
-	    NVJSON_FORCE_INTEGER, &jsonerr) != 0) {
-		bunyan_log(ERROR, "sysinfo json parse failure",
-		    "errno", BNY_INT, jsonerr.nje_errno,
-		    "pos", BNY_INT, jsonerr.nje_pos,
-		    "err", BNY_STRING, jsonerr.nje_message,
-		    "json", BNY_STRING, zinfbuf,
-		    NULL);
-		return (EINVAL);
-	}
-
-	return (0);
-}
 
 static boolean_t
 sniff_hex(uint8_t *buf, uint len)
@@ -668,7 +604,6 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	EVP_PKEY *pkey;
 	X509_NAME *subj;
 	const char *name, *ku, *basic;
-	char *uuid, *hostname;
 	enum sshdigest_types wantalg, hashalg;
 	int nid;
 	ASN1_TYPE null_parameter;
@@ -680,10 +615,9 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	ASN1_INTEGER *serial_asn1;
 	X509_EXTENSION *ext;
 	X509V3_CTX x509ctx;
+	char *guid;
 
-	VERIFY0(fetch_sysinfo());
-	VERIFY0(nvlist_lookup_string(sysinfo, "Hostname", &hostname));
-	VERIFY0(nvlist_lookup_string(sysinfo, "UUID", &uuid));
+	guid = buf_to_hex(selk->pt_guid, sizeof (selk->pt_guid), B_FALSE);
 
 	switch (slotid) {
 	case 0x9A:
@@ -782,9 +716,11 @@ cmd_generate(uint slotid, enum piv_alg alg)
 	assert(X509_NAME_add_entry_by_NID(subj, NID_title, MBSTRING_ASC,
 	    (unsigned char *)name, -1, -1, 0) == 1);
 	assert(X509_NAME_add_entry_by_NID(subj, NID_commonName, MBSTRING_ASC,
-	    (unsigned char *)hostname, -1, -1, 0) == 1);
-	assert(X509_NAME_add_entry_by_NID(subj, NID_userId, MBSTRING_ASC,
-	    (unsigned char *)uuid, -1, -1, 0) == 1);
+	    (unsigned char *)guid, -1, -1, 0) == 1);
+	assert(X509_NAME_add_entry_by_NID(subj, NID_organizationalUnitName,
+	    MBSTRING_ASC, (unsigned char *)"tokens", -1, -1, 0) == 1);
+	assert(X509_NAME_add_entry_by_NID(subj, NID_organizationName,
+	    MBSTRING_ASC, (unsigned char *)"triton", -1, -1, 0) == 1);
 	assert(X509_set_subject_name(cert, subj) == 1);
 	assert(X509_set_issuer_name(cert, subj) == 1);
 
@@ -866,6 +802,8 @@ signagain:
 	buf = buf_to_hex(selk->pt_guid, sizeof (selk->pt_guid), B_FALSE);
 	fprintf(stdout, " PIV_slot_%02X@%s\n", slotid, buf);
 	free(buf);
+
+	free(guid);
 
 	exit(0);
 }

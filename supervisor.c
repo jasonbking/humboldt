@@ -391,6 +391,10 @@ new_cert_global_x509(struct token_slot *slot)
 		VERIFY3S(X509_NAME_add_entry_by_txt(subj, "DC", MBSTRING_ASC,
 		    (unsigned char *)getenv("SYSTEM_DC"), -1, -1, 0), ==, 1);
 	}
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "OU", MBSTRING_ASC,
+	    (unsigned char *)"nodes", -1, -1, 0), ==, 1);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "O", MBSTRING_ASC,
+	    (unsigned char *)"triton", -1, -1, 0), ==, 1);
 	VERIFY3S(X509_set_subject_name(cert, subj), ==, 1);
 	X509_NAME_free(subj);
 
@@ -837,6 +841,11 @@ new_cert_zone_x509(zoneid_t zid, nvlist_t *zinfo, struct certsign_ctx *csc,
 		VERIFY3S(X509_NAME_add_entry_by_txt(subj, "DC", MBSTRING_ASC,
 		    (unsigned char *)tmp, -1, -1, 0), ==, 1);
 	}
+
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "OU", MBSTRING_ASC,
+	    (unsigned char *)"instances", -1, -1, 0), ==, 1);
+	VERIFY3S(X509_NAME_add_entry_by_txt(subj, "O", MBSTRING_ASC,
+	    (unsigned char *)"triton", -1, -1, 0), ==, 1);
 
 	VERIFY3S(X509_set_subject_name(cert, subj), ==, 1);
 	X509_NAME_free(subj);

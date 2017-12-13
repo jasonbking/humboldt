@@ -306,7 +306,9 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 	int i, j, count;
 	const char *uuid = NULL, *hostname = NULL;
 	boolean_t issu_has_uuid = B_FALSE, subj_has_uuid = B_FALSE,
-	    subj_has_title = B_FALSE, has_basic = B_FALSE, has_ku = B_FALSE;
+	    subj_has_title = B_FALSE, has_basic = B_FALSE, has_ku = B_FALSE,
+	    issu_has_ou = B_FALSE, issu_has_o = B_FALSE, subj_has_ou = B_FALSE,
+	    subj_has_o = B_FALSE;
 
 	/*
 	 * The node-sshpk-agent code sends a "test" string to decide whether
@@ -422,6 +424,24 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 					goto err;
 				}
 				break;
+			case NID_organizationalUnitName:
+				if (strcmp(d, "nodes") != 0) {
+					bunyan_log(TRACE, "issu OU= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
+					goto err;
+				}
+				issu_has_ou = B_TRUE;
+				break;
+			case NID_organizationName:
+				if (strcmp(d, "triton") != 0) {
+					bunyan_log(TRACE, "issu O= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
+					goto err;
+				}
+				issu_has_o = B_TRUE;
+				break;
 			default:
 				goto err;
 			}
@@ -483,6 +503,24 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 					goto err;
 				}
 				break;
+			case NID_organizationalUnitName:
+				if (strcmp(d, "instances") != 0) {
+					bunyan_log(TRACE, "issu OU= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
+					goto err;
+				}
+				issu_has_ou = B_TRUE;
+				break;
+			case NID_organizationName:
+				if (strcmp(d, "triton") != 0) {
+					bunyan_log(TRACE, "issu O= invalid",
+					    "value", BNY_STRING, d,
+					    NULL);
+					goto err;
+				}
+				issu_has_o = B_TRUE;
+				break;
 			default:
 				goto err;
 			}
@@ -491,6 +529,11 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 
 	if (!issu_has_uuid) {
 		bunyan_log(TRACE, "cert issu did not include UUID", NULL);
+		goto err;
+	}
+
+	if (!issu_has_ou || !issu_has_o) {
+		bunyan_log(TRACE, "cert issu did not include O,OU", NULL);
 		goto err;
 	}
 
@@ -556,6 +599,24 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 			}
 			break;
 		case NID_organizationalUnitName:
+			if (strcmp(d, "delegated") != 0) {
+				bunyan_log(TRACE, "subj OU= invalid",
+				    "value", BNY_STRING, d,
+				    NULL);
+				goto err;
+			}
+			subj_has_ou = B_TRUE;
+			break;
+		case NID_organizationName:
+			if (strcmp(d, "triton") != 0) {
+				bunyan_log(TRACE, "subj O= invalid",
+				    "value", BNY_STRING, d,
+				    NULL);
+				goto err;
+			}
+			subj_has_o = B_TRUE;
+			break;
+		case NID_role:
 			if (nvlist_lookup_string(zone_tags, "sdc_role",
 			    (char **)&ou) == 0 && strcmp(d, ou) == 0) {
 				break;
@@ -574,7 +635,7 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 					break;
 				}
 			}
-			bunyan_log(TRACE, "subj OU= invalid",
+			bunyan_log(TRACE, "subj ROLE= invalid",
 			    "value", BNY_STRING, d,
 			    NULL);
 			goto err;
@@ -588,6 +649,11 @@ validate_cert_payload(struct client_state *cl, struct token_slot *slot,
 
 	if (!subj_has_uuid || !subj_has_title) {
 		bunyan_log(TRACE, "cert subj missing uuid or title", NULL);
+		goto err;
+	}
+
+	if (!subj_has_ou || !subj_has_o) {
+		bunyan_log(TRACE, "cert subj missing ou/o", NULL);
 		goto err;
 	}
 

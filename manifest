@@ -23,7 +23,6 @@ f usr/sbin/pcscd 0755 root sys
 #endif
 f usr/sbin/yktool 0755 root sys
 f usr/sbin/rfd77-zpool-create 0755 root sys
-f usr/sbin/yubihmac-bench 0755 root sys
 f usr/sbin/amd64/pivtool 0755 root sys
 h usr/sbin/pivtool=usr/lib/isaexec
 #ifdef USE_PCSCLITE

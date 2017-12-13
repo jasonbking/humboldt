@@ -42,19 +42,6 @@ $(USE_SYSTEM_PCSC)PCSC_DEPS64=
 $(USE_SYSTEM_PCSC)PCSC_MANIFEST_FLAGS=	-DUSE_SYSTEM_PCSC
 
 
-YBENCH_SOURCES=			\
-	yubihmac-bench.c
-YBENCH_HEADERS=
-
-YBENCH_OBJS=		$(YBENCH_SOURCES:%.c=%.o)
-
-YBENCH_CFLAGS=		$(PCSC_CFLAGS)
-YBENCH_LIBS=		$(PCSC_LDLIBS)
-YBENCH_LDFLAGS=		-L$(PROTO_AREA)/usr/lib
-
-YBENCH_DEPS=		$(PCSC_DEPS)
-
-
 YKTOOL_SOURCES=			\
 	yktool.c
 YKTOOL_HEADERS=
@@ -161,18 +148,6 @@ PIVTOOL_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
 			-D_REENTRANT
 PIVTOOL_LIBS= 		$(PCSC_LDLIBS) -lssp -lumem -lnvpair \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
-
-yubihmac-bench :	CFLAGS+=	$(YBENCH_CFLAGS)
-yubihmac-bench :	LIBS+=		$(YBENCH_LIBS)
-yubihmac-bench :	LDFLAGS+=	$(YBENCH_LDFLAGS)
-yubihmac-bench :	HEADERS=	$(YBENCH_HEADERS)
-
-
-$(YBENCH_OBJS): $(YBENCH_DEPS:%=deps/%/.ac.install.stamp)
-
-yubihmac-bench: $(YBENCH_OBJS) $(YBENCH_DEPS:%=deps/%/.ac.install.stamp)
-	$(CC) $(LDFLAGS) -o $@ $(YBENCH_OBJS) $(LIBS)
-	$(ALTCTFCONVERT) $@
 
 yktool :		CFLAGS+=	$(YKTOOL_CFLAGS)
 yktool :		LIBS+=		$(YKTOOL_LIBS)
@@ -360,11 +335,10 @@ deps/libressl/configure: deps/libressl/.dirstamp deps/libressl/configure.ac
 deps/libressl/.ac.install.stamp: deps/libressl/.dirstamp deps/libressl/.ac.all.stamp
 	touch $@
 
-world: $(DEPS_BUILT) yubihmac-bench softtokend yktool pivtool
+world: $(DEPS_BUILT) softtokend yktool pivtool
 
 install: $(DEPS_INSTALLED) world
 	mkdir -p $(DESTDIR)/usr/sbin
-	cp yubihmac-bench $(DESTDIR)/usr/sbin
 	cp yktool $(DESTDIR)/usr/sbin
 	cp rfd77-zpool-create $(DESTDIR)/usr/sbin
 	mkdir -p $(DESTDIR)/usr/sbin/amd64
@@ -391,7 +365,7 @@ check:
 	echo check
 
 clean:
-	rm -f *.o yubihmac-bench softtokend yktool pivtool
+	rm -f *.o softtokend yktool pivtool
 	rm -fr deps
 
 .PHONY: manifest
