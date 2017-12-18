@@ -88,4 +88,6 @@ void agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd);
 int read_cmd(int fd, struct ctl_cmd *cmd);
 int write_cmd(int fd, const struct ctl_cmd *cmd);
 
+void unshare_code(void);
+
 #endif

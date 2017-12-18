@@ -1145,6 +1145,8 @@ agent_main(zoneid_t zid, nvlist_t *zinfo, int listensock, int ctlfd)
 
 	bunyan_set_name("agent");
 
+	unshare_code();
+
 	/*
 	 * Lock all our memory into RAM so it can't be swapped out. We're
 	 * going to be doing crypto operations and dealing with key material,

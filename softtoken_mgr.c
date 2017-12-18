@@ -69,7 +69,8 @@ start_supervisor(struct zone_state *forzone)
 	VERIFY0(sigaction(SIGCHLD, &sa, NULL));
 
 	for (zs = zonest; zs != NULL; zs = zs->zs_next) {
-		VERIFY0(close(zs->zs_pipe[0]));
+		if (!zs->zs_need_restart)
+			VERIFY0(close(zs->zs_pipe[0]));
 	}
 	VERIFY0(fdwalk(fdwalk_assert_fd, forzone));
 

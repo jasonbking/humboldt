@@ -32,6 +32,8 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <port.h>
+#include <dlfcn.h>
+#include <link.h>
 
 #include <wintypes.h>
 #include <winscard.h>
@@ -1524,6 +1526,62 @@ supervisor_loop(zoneid_t zid, nvlist_t *zinfo, int ctlfd, int kidfd, int logfd,
 	}
 }
 
+/*
+ * Since we've forked off a single parent process, we currently share text
+ * pages both with it and with all other children who have forked off the same
+ * way. This is dangerous, as cache timing side-channel attacks will be able to
+ * easily observe the execution of one zone's soft-token from a different zone
+ * (many of these attacks are only possible, or at least are vastly easier,
+ * with shared text/code pages).
+ *
+ * So, our solution here is to walk around all of the mapped pages in
+ * RTLD_SELF (this will include text as well as bss and static data) and
+ * "unshare" them (make ourselves a private copy). We do this by briefly
+ * changing their permissions to RWX, writing a byte in each page, and then
+ * changing them back to R-X.
+ *
+ * We should really add this as a feature to the linker, but for now, le hack.
+ */
+void
+unshare_code(void)
+{
+	Dl_mapinfo_t mi;
+	uint cnt;
+	volatile char *ptr, *base, *limit;
+	size_t sz;
+	char tmp;
+	intptr_t pgsz = sysconf(_SC_PAGE_SIZE);
+	intptr_t pgmask = ~(pgsz - 1);
+
+	bzero(&mi, sizeof (mi));
+	VERIFY0(dlinfo(RTLD_SELF, RTLD_DI_MMAPCNT, &mi.dlm_acnt));
+	mi.dlm_maps = calloc(mi.dlm_acnt, sizeof (mmapobj_result_t));
+	VERIFY(mi.dlm_maps != NULL);
+	VERIFY0(dlinfo(RTLD_SELF, RTLD_DI_MMAPS, &mi));
+
+	for (cnt = 0; cnt < mi.dlm_rcnt; ++cnt) {
+		if ((mi.dlm_maps[cnt].mr_prot & PROT_EXEC) == PROT_EXEC) {
+			ptr = mi.dlm_maps[cnt].mr_addr;
+			sz = mi.dlm_maps[cnt].mr_msize;
+			limit = ptr + sz;
+			base = (volatile char *)((intptr_t)ptr & pgmask);
+
+			VERIFY0(mprotect((caddr_t)base, sz,
+			    PROT_READ | PROT_WRITE | PROT_EXEC));
+
+			for (; ptr < limit; ptr += pgsz) {
+				tmp = *ptr;
+				*ptr = tmp;
+			}
+
+			VERIFY0(mprotect((caddr_t)base, sz,
+			    mi.dlm_maps[cnt].mr_prot));
+		}
+	}
+
+	free(mi.dlm_maps);
+}
+
 void
 supervisor_main(zoneid_t zid, int ctlfd)
 {
@@ -1545,6 +1603,8 @@ supervisor_main(zoneid_t zid, int ctlfd)
 	const char *uuid;
 
 	bunyan_set_name("supervisor");
+
+	unshare_code();
 
 	len = getzonenamebyid(zid, zonename, sizeof (zonename));
 	VERIFY3U(len, >, 0);
