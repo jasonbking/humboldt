@@ -1363,6 +1363,11 @@ check_select_key(void)
 				}
 			}
 		}
+		if (selk == NULL) {
+			fprintf(stderr, "error: no PIV card present "
+			    "matching given GUID\n");
+			exit(3);
+		}
 	}
 
 	if (selk == NULL)
