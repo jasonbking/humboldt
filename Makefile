@@ -123,6 +123,39 @@ TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket $(PCSC_LDLIBS) \
 			-lssp -lumem -lrename \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
+GOSSIP_SOURCES=			\
+	gossip.c		\
+	trustchain.c		\
+	bunyan.c		\
+	piv.c			\
+	tlv.c			\
+	custr.c			\
+	json.c			\
+	$(LIBSSH_SOURCES)
+GOSSIP_HEADERS=			\
+	trustchain.h		\
+	bunyan.h		\
+	piv.h			\
+	custr.h			\
+	json.h			\
+	tlv.h
+
+GOSSIP_OBJS=		$(GOSSIP_SOURCES:%.c=%.o)
+
+GOSSIP_DEPS=		$(PCSC_DEPS64) libressl
+
+GOSSIP_CFLAGS=		$(PCSC_CFLAGS) \
+			-I$(DEPS)/libressl/include/ \
+			-fstack-protector-all \
+			-D_REENTRANT \
+			$(BASE_CFLAGS) $(CFLAGS64)
+GOSSIP_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
+			-Wl,-z -Wl,aslr \
+			-D_REENTRANT
+GOSSIP_LIBS= 		-lnvpair -lnsl -lsocket $(PCSC_LDLIBS) \
+			-lssp -lumem -lrename \
+			$(DEPS)/libressl/crypto/.libs/libcrypto.a
+
 
 PIVTOOL_SOURCES=		\
 	pivtool.c		\
