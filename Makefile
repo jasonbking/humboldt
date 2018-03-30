@@ -120,7 +120,7 @@ TOKEN_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
 			-Wl,-z -Wl,aslr \
 			-D_REENTRANT
 TOKEN_LIBS= 		-lsysevent -lnvpair -lnsl -lsocket $(PCSC_LDLIBS) \
-			-lssp -lumem -lrename \
+			-lssp -lumem -lrename -lz \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
 GOSSIP_SOURCES=			\
@@ -153,7 +153,7 @@ GOSSIP_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
 			-Wl,-z -Wl,aslr \
 			-D_REENTRANT
 GOSSIP_LIBS= 		-lnvpair -lnsl -lsocket $(PCSC_LDLIBS) \
-			-lssp -lumem -lrename \
+			-lssp -lumem -lrename -lz \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
 
@@ -179,7 +179,7 @@ PIVTOOL_CFLAGS=		$(PCSC_CFLAGS) \
 PIVTOOL_LDFLAGS=		-m64 -L$(PROTO_AREA)/usr/lib/amd64 \
 			-Wl,-z -Wl,aslr \
 			-D_REENTRANT
-PIVTOOL_LIBS= 		$(PCSC_LDLIBS) -lssp -lumem -lnvpair \
+PIVTOOL_LIBS= 		$(PCSC_LDLIBS) -lssp -lumem -lnvpair -lz \
 			$(DEPS)/libressl/crypto/.libs/libcrypto.a
 
 yktool :		CFLAGS+=	$(YKTOOL_CFLAGS)
