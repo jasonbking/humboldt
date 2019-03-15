@@ -3,10 +3,10 @@
 	url = https://github.com/arekinath/libusb
 [submodule "deps/pcsclite"]
 	path = deps/pcsclite
-	url = https://anonscm.debian.org/git/pcsclite/PCSC.git
+	url = https://github.com/LudovicRousseau/PCSC.git
 [submodule "deps/ccid"]
 	path = deps/ccid
-	url = https://anonscm.debian.org/git/pcsclite/CCID.git
+	url = https://github.com/LudovicRousseau/CCID.git
 [submodule "deps/libressl"]
 	path = deps/libressl
 	url = https://github.com/arekinath/libressl-portable
