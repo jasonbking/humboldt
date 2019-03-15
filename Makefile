@@ -52,7 +52,7 @@ YKTOOL_CFLAGS=		$(PCSC_CFLAGS)
 YKTOOL_LIBS=		$(PCSC_LDLIBS) -lumem
 YKTOOL_LDFLAGS=		-L$(PROTO_AREA)/usr/lib
 
-YKTOOL_DEPS=		$(PCSC_DEPDS)
+YKTOOL_DEPS=		$(PCSC_DEPS)
 
 
 _ED25519_SOURCES=		\
@@ -328,6 +328,7 @@ deps/%/.dirstamp: .gitmodules
 
 deps/%64/.dirstamp: deps/%/.dirstamp
 	cd deps && \
+		rm -rf $(shell basename $(shell dirname $@)) && \
 		git clone \
 		    $(shell basename $(shell dirname $<)) \
 		    $(shell basename $(shell dirname $@))
