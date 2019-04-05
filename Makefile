@@ -412,3 +412,6 @@ mancheck_conf:
 cscope:
 	find . -type f -name '*.[chs]' > cscope.files'
 	cscope-fast -bq
+
+update:
+	git pull --rebase

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -x
 #
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -6,10 +6,11 @@
 #
 
 #
-# Copyright (c) 2017, Joyent, Inc.
+# Copyright (c) 2019, Joyent, Inc.
 #
 
 set -o pipefail
+set -o xtrace
 
 . /lib/svc/share/smf_include.sh
 
@@ -107,6 +108,31 @@ if [[ -f /system/boot/piv-config.json ]]; then
 	exit $SMF_EXIT_OK
 fi
 
+try_kbmapi() {
+	local uuid
+	local kbmapi
+	local url
+	local l_guid="$1"
+	local pin
+
+	uuid=$(sysinfo -p | grep '^UUID=' | sed -e 's/^UUID=//' -e "s/'//g")
+
+	# XXX: Hack
+	kbmapi=$(bootparams | \
+	    awk -F: '$1 ~ /^rabbitmq_dns/ { print $3 }' | \
+	    sed 's/rabbitmq/kbmapi/')
+
+	url="http://$kbmapi/pivtokens/$l_guid/pin"
+	pin=$(curl -sS "$url" | json pin)
+	[[ -z "$pin" ]] && return 1
+
+	if ! pivtool -g "$l_guid" -P "$pin" set-system; then
+		fatal "Failure while running 'set-system' command"
+	fi
+
+    return 0
+}
+
 #
 # If that didn't work, look in the ZFS pool to see if we have a local-box
 # set at the pool root. If we do, we're using pool-wide encryption and we can
@@ -140,6 +166,12 @@ if [[ ! -z "$health" && "$health" != "-" ]]; then
 			fi
 		else
 			echo "warning: no card public key pinned in zfs props"
+		fi
+
+		if try_kbmapi "$rguid"; then
+			exit $SMF_EXIT_OK
+		else
+			smf_console "Could not obtain PIN for token $guid from KBMAPI"
 		fi
 
 		/smartdc/lib/sdc-on-tty -d /dev/console \

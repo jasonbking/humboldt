@@ -5,12 +5,16 @@ usage() {
 	exit 1
 }
 
+force=""
 guid=""
 pool="zones"
 slot="9d"
 
-while getopts ":g:p:" opt; do
+while getopts ":g:p:f" opt; do
 	case $opt in
+    f)
+        force="-f"
+        ;;
 	g)
 		guid="$OPTARG"
 		;;
@@ -51,9 +55,4 @@ echo "$box" | openssl enc -d -base64 | pivtool unbox | \
     -O rfd77:local-box="$box" \
     -O rfd77:piv-guid="$pguid" \
     -O rfd77:piv-9e="$pub9e" \
-    $pool "$@"
-if [[ $? -eq 0 ]]; then
-	ramsize=$(sysinfo | json 'MiB of Memory')
-	zfs create -V "${ramsize}M" -o encryption=off -o checksum=noparity \
-	    ${pool}/dump
-fi
+    $force $pool "$@"
